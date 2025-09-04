@@ -29,9 +29,9 @@ dp = Dispatcher()
 USERS: dict[int, dict] = {}
 DEFAULTS = {
     "preset": "intraday",
-    "mode": "active",        # "passive" → автолента каждые N минут
-    "quiet": False,          # тихие часы
-    "exchange": "binance",   # можно переключать в Настройках
+    "mode": "active",     # "passive" → автолента каждые N минут
+    "quiet": False,       # тихие часы
+    # Биржа зафиксирована: Bybit
 }
 
 def ensure_user(user_id: int) -> dict:
@@ -53,22 +53,15 @@ def cache_set(key: str, val: str):
     CACHE[key] = (time(), val)
 
 # ------------------ CONSTANTS ------------------
-# Списки тикеров можно расширить после стабилизации
-SYMBOLS_BINANCE = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT",
-    "TONUSDT","BNBUSDT","ADAUSDT","LINKUSDT","TRXUSDT",
-]
+# Список тикеров Bybit (linear USDT)
 SYMBOLS_BYBIT = [
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT",
     "TONUSDT","ARBUSDT","OPUSDT","TRXUSDT","LINKUSDT","BNBUSDT","ADAUSDT",
 ]
 
-BINANCE_FAPI = "https://fapi.binance.com"          # фьючерсы USDT-M
-BINANCE_SPOT = "https://api.binance.com"            # спот на случай фолбэка
-BYBIT_API    = "https://api.bybit.com"              # v5
-
-SEM_LIMIT = 6           # Параллель на биржу (не поднимать >8–10)
-REQUEST_TIMEOUT = 15    # Увеличили таймаут
+BYBIT_API = "https://api.bybit.com"  # v5
+SEM_LIMIT = 6
+REQUEST_TIMEOUT = 15
 HTTP_HEADERS = {"User-Agent": "InnertradeScreener/1.0 (+render.com)"}
 
 # ------------------ MARKET HEADER (stub) ------------------
@@ -110,50 +103,6 @@ async def http_get_json(session: ClientSession, url: str, params: dict | None = 
             print(f"[REQ ERR] {url} {params} -> {e}", file=sys.stderr)
             await asyncio.sleep(0.6)
     return None
-
-# ------------------ BINANCE PROVIDERS ------------------
-async def binance_klines(session: ClientSession, symbol: str, interval: str, limit: int):
-    # USDT-M futures klines
-    url = f"{BINANCE_FAPI}/fapi/v1/klines"
-    return await http_get_json(session, url, {"symbol": symbol, "interval": interval, "limit": limit})
-
-async def binance_spot_klines(session: ClientSession, symbol: str, interval: str, limit: int):
-    # SPOT klines (fallback)
-    url = f"{BINANCE_SPOT}/api/v3/klines"
-    return await http_get_json(session, url, {"symbol": symbol, "interval": interval, "limit": limit})
-
-def parse_binance_row(row):
-    # [open_time, open, high, low, close, volume, close_time, quote_vol, trades, ...]
-    o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
-    v = float(row[5]); n_trades = int(row[8])
-    return o, h, l, c, v, n_trades
-
-def parse_any_binance_row(row):
-    # структура у спота и фьючей одинаковая по индексам для нужных полей
-    return parse_binance_row(row)
-
-async def fetch_binance_5m_1h(session: ClientSession, sym: str):
-    # пробуем фьючи; при пустоте — фолбэк на спот
-    sem = asyncio.Semaphore(SEM_LIMIT)
-    async with sem:
-        try:
-            k5, k1h = await asyncio.wait_for(asyncio.gather(
-                binance_klines(session, sym, "5m", 200),
-                binance_klines(session, sym, "1h", 168)
-            ), timeout=REQUEST_TIMEOUT)
-            if not k5 or not k1h:
-                s5, s1h = await asyncio.gather(
-                    binance_spot_klines(session, sym, "5m", 200),
-                    binance_spot_klines(session, sym, "1h", 168)
-                )
-                return sym, (k5 or s5), (k1h or s1h)
-            return sym, k5, k1h
-        except Exception:
-            s5, s1h = await asyncio.gather(
-                binance_spot_klines(session, sym, "5m", 200),
-                binance_spot_klines(session, sym, "1h", 168)
-            )
-            return sym, s5, s1h
 
 # ------------------ BYBIT PROVIDERS ------------------
 # Bybit v5 kline, category=linear (USDT-perps)
@@ -210,44 +159,6 @@ def slope(values, lookback: int = 10):
     return mean(values[-lookback:]) - mean(values[-2*lookback:-lookback])
 
 # ------------------ BUILDERS: ACTIVITY / VOLATILITY / TREND ------------------
-async def build_activity_binance(session: ClientSession) -> list[dict]:
-    tasks = [fetch_binance_5m_1h(session, sym) for sym in SYMBOLS_BINANCE]
-    raw = await asyncio.gather(*tasks)
-
-    out = []
-    for sym, k5, k1h in raw:
-        if not k5 or not k1h or len(k5) < 30 or len(k1h) < 25:
-            continue
-        rows5 = [parse_any_binance_row(r) for r in k5]
-        vols5 = [r[4] for r in rows5]
-        trades5 = [r[5] for r in rows5]
-        vol_ma = moving_average(vols5[:-1], 20)
-        tr_ma  = moving_average(trades5[:-1], 20) if all(t is not None for t in trades5[:-1]) else None
-        if not vol_ma:
-            continue
-        vol_mult = vols5[-1] / vol_ma
-        if tr_ma and tr_ma > 0:
-            tr_mult = (trades5[-1] / tr_ma) if trades5[-1] is not None else 1.0
-            tr_flag = "↑" if tr_mult >= 1.5 else ("→" if tr_mult >= 0.9 else "↓")
-        else:
-            tr_mult = None
-            tr_flag = "—"
-
-        rows1h = [parse_any_binance_row(r) for r in k1h]
-        vols1h = [r[4] for r in rows1h]
-        vol_24h = sum(vols1h[-24:])
-        vol_7d  = sum(vols1h[-168:])
-        share24 = int(round((vol_24h / vol_7d) * 100)) if vol_7d > 0 else 0
-
-        heatscore = vol_mult if tr_mult is None else (0.6 * vol_mult + 0.4 * tr_mult)
-        out.append({
-            "symbol": sym, "venue": "Binance",
-            "vol_mult": vol_mult, "tr_mult": tr_mult, "tr_flag": tr_flag,
-            "share24": share24, "heatscore": heatscore
-        })
-    out.sort(key=lambda x: x["heatscore"], reverse=True)
-    return out[:10]
-
 async def build_activity_bybit(session: ClientSession) -> list[dict]:
     tasks = [fetch_bybit_5m_1h(session, sym) for sym in SYMBOLS_BYBIT]
     raw = await asyncio.gather(*tasks)
@@ -282,28 +193,6 @@ async def build_activity_bybit(session: ClientSession) -> list[dict]:
     out.sort(key=lambda x: x["heatscore"], reverse=True)
     return out[:10]
 
-async def build_volatility_binance(session: ClientSession) -> list[dict]:
-    tasks = [asyncio.create_task(binance_klines(session, sym, "5m", 400)) for sym in SYMBOLS_BINANCE]
-    raws = await asyncio.gather(*tasks)
-
-    out = []
-    for sym, k5 in zip(SYMBOLS_BINANCE, raws):
-        if not k5 or len(k5) < 100:
-            continue
-        rows5 = [parse_any_binance_row(r) for r in k5]
-        closes = [r[3] for r in rows5]
-        vols = [r[4] for r in rows5]
-        atr_val = compute_atr(rows5, 14)
-        last_close = closes[-1]
-        if not atr_val or last_close <= 0:
-            continue
-        atr_pct = (atr_val / last_close) * 100.0
-        vol_ma = moving_average(vols[:-1], 20)
-        vol_mult = (vols[-1] / vol_ma) if vol_ma else 0
-        out.append({"symbol": sym, "venue": "Binance", "atr_pct": atr_pct, "vol_mult": vol_mult})
-    out.sort(key=lambda x: x["atr_pct"], reverse=True)
-    return out[:10]
-
 async def build_volatility_bybit(session: ClientSession) -> list[dict]:
     tasks = [asyncio.create_task(bybit_klines(session, sym, 5, 400)) for sym in SYMBOLS_BYBIT]
     raws = await asyncio.gather(*tasks)
@@ -328,31 +217,6 @@ async def build_volatility_bybit(session: ClientSession) -> list[dict]:
         out.append({"symbol": sym, "venue": "Bybit", "atr_pct": atr_pct, "vol_mult": vol_mult})
     out.sort(key=lambda x: x["atr_pct"], reverse=True)
     return out[:10]
-
-async def build_trend_binance(session: ClientSession) -> list[dict]:
-    tasks = [asyncio.create_task(binance_klines(session, sym, "5m", 400)) for sym in SYMBOLS_BINANCE]
-    raws = await asyncio.gather(*tasks)
-
-    res = []
-    for sym, k5 in zip(SYMBOLS_BINANCE, raws):
-        if not k5 or len(k5) < 380:
-            continue
-        rows5 = [parse_any_binance_row(r) for r in k5]
-        closes = [r[3] for r in rows5]
-        ma200 = moving_average(closes, 200)
-        ma360 = moving_average(closes, 360)
-        if ma200 is None or ma360 is None:
-            continue
-        last_close = closes[-1]
-        above200 = last_close > ma200
-        above360 = last_close > ma360
-        slope200 = slope(closes[-220:], 10)
-        atr_now = compute_atr(rows5, 14)
-        atr_prev = compute_atr(rows5[-60:-15], 14) if len(rows5) > 75 else None
-        vol_change = "↑" if (atr_prev and atr_now and atr_now > atr_prev) else ("↓" if atr_prev else "≈")
-        res.append({"symbol": sym, "venue": "Binance", "above200": above200, "above360": above360, "slope200": slope200, "vol_change": vol_change})
-    res.sort(key=lambda x: (x["above200"], x["above360"], x["slope200"]), reverse=True)
-    return res[:10]
 
 async def build_trend_bybit(session: ClientSession) -> list[dict]:
     tasks = [asyncio.create_task(bybit_klines(session, sym, 5, 400)) for sym in SYMBOLS_BYBIT]
@@ -383,52 +247,45 @@ async def build_trend_bybit(session: ClientSession) -> list[dict]:
     return res[:10]
 
 # ------------------ RENDER SECTIONS ------------------
-async def render_activity(exchange: str) -> str:
-    key = f"activity:{exchange}"
+async def render_activity() -> str:
+    key = "activity:bybit"
     cached = cache_get(key, ttl=60)
     if cached:
         return cached
 
     async with ClientSession() as s:
-        if exchange == "binance":
-            items = await build_activity_binance(s)
-        else:
-            items = await build_activity_bybit(s)
+        items = await build_activity_bybit(s)
 
     if not items:
         text = "\n🔥 <b>Активность</b>\nНет данных (лимиты API/таймаут или рынок тихий)."
         cache_set(key, text)
         return text
 
-    lines = ["\n🔥 <b>Активность</b>"]
+    lines = ["\n🔥 <b>Активность</b> (Bybit)"]
     for i, r in enumerate(items, start=1):
-        tr_part = f" | Trades {r['tr_flag']}" if r.get("tr_flag") is not None else ""
         lines.append(
             f"{i}) {r['symbol']} ({r['venue']}) "
-            f"Vol x{r['vol_mult']:.1f}{tr_part} | 24h vs 7d: {r['share24']}%"
+            f"Vol x{r['vol_mult']:.1f} | 24h vs 7d: {r['share24']}%"
         )
     text = "\n".join(lines)
     cache_set(key, text)
     return text
 
-async def render_volatility(exchange: str) -> str:
-    key = f"vol:{exchange}"
+async def render_volatility() -> str:
+    key = "vol:bybit"
     cached = cache_get(key, ttl=60)
     if cached:
         return cached
 
     async with ClientSession() as s:
-        if exchange == "binance":
-            items = await build_volatility_binance(s)
-        else:
-            items = await build_volatility_bybit(s)
+        items = await build_volatility_bybit(s)
 
     if not items:
         text = "\n⚡ <b>Волатильность</b>\nНет данных."
         cache_set(key, text)
         return text
 
-    lines = ["\n⚡ <b>Волатильность</b>  (ATR%, 5m)"]
+    lines = ["\n⚡ <b>Волатильность</b>  (ATR%, 5m, Bybit)"]
     for i, r in enumerate(items, start=1):
         lines.append(
             f"{i}) {r['symbol']} ({r['venue']}) ATR {r['atr_pct']:.2f}% | Vol x{r['vol_mult']:.1f}"
@@ -437,24 +294,21 @@ async def render_volatility(exchange: str) -> str:
     cache_set(key, text)
     return text
 
-async def render_trend(exchange: str) -> str:
-    key = f"trend:{exchange}"
+async def render_trend() -> str:
+    key = "trend:bybit"
     cached = cache_get(key, ttl=60)
     if cached:
         return cached
 
     async with ClientSession() as s:
-        if exchange == "binance":
-            items = await build_trend_binance(s)
-        else:
-            items = await build_trend_bybit(s)
+        items = await build_trend_bybit(s)
 
     if not items:
         text = "\n📈 <b>Тренд</b>\nНет данных."
         cache_set(key, text)
         return text
 
-    lines = ["\n📈 <b>Тренд</b>  (5m, MA200/MA360)"]
+    lines = ["\n📈 <b>Тренд</b>  (5m, MA200/MA360, Bybit)"]
     for i, r in enumerate(items, start=1):
         pos = []
         pos.append(">MA200" if r["above200"] else "<MA200")
@@ -489,14 +343,12 @@ def main_menu_kb(settings: dict) -> InlineKeyboardMarkup:
 def settings_kb(settings: dict) -> InlineKeyboardMarkup:
     mode  = settings.get("mode", "active")
     quiet = settings.get("quiet", False)
-    ex    = settings.get("exchange", "binance")
 
     b = InlineKeyboardBuilder()
     b.button(text=("🔔 Пассивный (лента)" if mode == "passive" else "🔕 Активный (по запросу)"), callback_data="set:mode")
     b.button(text=("🌙 Тихие часы: ON" if quiet else "🌙 Тихие часы: OFF"), callback_data="set:quiet")
-    b.button(text=("Биржа: Bybit" if ex == "bybit" else "Биржа: Binance"), callback_data="set:exchange")
     b.button(text="⬅️ Назад", callback_data="menu:back")
-    b.adjust(1, 1, 1, 1)
+    b.adjust(1, 1, 1)
     return b.as_markup()
 
 # ------------------ COMMANDS ------------------
@@ -506,7 +358,7 @@ async def cmd_start(m: Message):
     header = await render_header_text()
     await m.answer(
         header + "\n\n"
-        "Добро пожаловать в <b>Innertrade Screener</b> — интрадэй-скринер.\n"
+        "Добро пожаловать в <b>Innertrade Screener</b> — интрадэй-скринер (Bybit).\n"
         "Выберите раздел или откройте настройки.",
         reply_markup=main_menu_kb(u)
     )
@@ -518,9 +370,8 @@ async def cmd_menu(m: Message):
 
 @dp.message(Command("hot"))
 async def cmd_hot(m: Message):
-    u = ensure_user(m.from_user.id)
     header = await render_header_text()
-    body = await render_activity(u["exchange"])
+    body = await render_activity()
     await m.answer(header + "\n" + body)
 
 @dp.message(Command("news"))
@@ -544,8 +395,8 @@ async def cmd_status(m: Message):
     await m.answer(
         "<b>Status</b>\n"
         f"Time: {now} ({TIMEZONE})\n"
-        f"Mode: {u['mode']} | Quiet: {u['quiet']} | Exchange: {u['exchange']}\n"
-        "Sources: Binance OK; Bybit OK\n"
+        f"Mode: {u['mode']} | Quiet: {u['quiet']}\n"
+        "Source: Bybit (linear USDT)\n"
         "Latency: depends on API & cache\n"
     )
 
@@ -570,64 +421,63 @@ async def cmd_filters(m: Message):
 # ------------------ CALLBACKS ------------------
 @dp.callback_query(F.data.startswith("menu:"))
 async def on_menu(cb: CallbackQuery):
-    u = ensure_user(cb.from_user.id)
     key = cb.data.split(":", 1)[1]
 
     try:
         if key == "activity":
             header = await render_header_text()
-            body = await render_activity(u["exchange"])
-            await cb.message.edit_text(header + "\n" + body, reply_markup=main_menu_kb(u))
+            body = await render_activity()
+            await cb.message.edit_text(header + "\n" + body, reply_markup=main_menu_kb(ensure_user(cb.from_user.id)))
             await cb.answer()
 
         elif key == "volatility":
             header = await render_header_text()
-            body = await render_volatility(u["exchange"])
-            await cb.message.edit_text(header + "\n" + body, reply_markup=main_menu_kb(u))
+            body = await render_volatility()
+            await cb.message.edit_text(header + "\n" + body, reply_markup=main_menu_kb(ensure_user(cb.from_user.id)))
             await cb.answer()
 
         elif key == "trend":
             header = await render_header_text()
-            body = await render_trend(u["exchange"])
-            await cb.message.edit_text(header + "\n" + body, reply_markup=main_menu_kb(u))
+            body = await render_trend()
+            await cb.message.edit_text(header + "\n" + body, reply_markup=main_menu_kb(ensure_user(cb.from_user.id)))
             await cb.answer()
 
         elif key == "news":
             header = await render_header_text()
             items = await get_news_digest()
             news = "\n".join([f"• {x}" for x in items])
-            await cb.message.edit_text(header + "\n\n📰 <b>Макро (последний час)</b>\n" + news, reply_markup=main_menu_kb(u))
+            await cb.message.edit_text(header + "\n\n📰 <b>Макро (последний час)</b>\n" + news, reply_markup=main_menu_kb(ensure_user(cb.from_user.id)))
             await cb.answer()
 
         elif key == "settings":
-            await cb.message.edit_text("Настройки:", reply_markup=settings_kb(u))
+            await cb.message.edit_text("Настройки:", reply_markup=settings_kb(ensure_user(cb.from_user.id)))
             await cb.answer()
 
         elif key == "back":
-            await cb.message.edit_text("Главное меню:", reply_markup=main_menu_kb(u))
+            await cb.message.edit_text("Главное меню:", reply_markup=main_menu_kb(ensure_user(cb.from_user.id)))
             await cb.answer()
 
         else:
             await cb.answer("Неизвестный раздел", show_alert=True)
 
     except Exception:
-        # fallback: если edit_text не сработал (например, message is not modified)
+        # fallback: если edit_text не сработал
         try:
             if key in ("activity", "volatility", "trend"):
                 header = await render_header_text()
                 if key == "activity":
-                    body = await render_activity(u["exchange"])
+                    body = await render_activity()
                 elif key == "volatility":
-                    body = await render_volatility(u["exchange"])
+                    body = await render_volatility()
                 else:
-                    body = await render_trend(u["exchange"])
-                await cb.message.answer(header + "\n" + body, reply_markup=main_menu_kb(u))
+                    body = await render_trend()
+                await cb.message.answer(header + "\n" + body, reply_markup=main_menu_kb(ensure_user(cb.from_user.id)))
                 await cb.answer()
             elif key == "news":
                 header = await render_header_text()
                 items = await get_news_digest()
                 news = "\n".join([f"• {x}" for x in items])
-                await cb.message.answer(header + "\n\n📰 <b>Макро (последний час)</b>\n" + news, reply_markup=main_menu_kb(u))
+                await cb.message.answer(header + "\n\n📰 <b>Макро (последний час)</b>\n" + news, reply_markup=main_menu_kb(ensure_user(cb.from_user.id)))
                 await cb.answer()
         except Exception:
             with contextlib.suppress(Exception):
@@ -647,11 +497,6 @@ async def on_set(cb: CallbackQuery):
         u["quiet"] = not u.get("quiet", False)
         await cb.message.edit_reply_markup(reply_markup=settings_kb(u))
         await cb.answer(f"Тихие часы: {'ON' if u['quiet'] else 'OFF'}")
-
-    elif key == "exchange":
-        u["exchange"] = "binance" if u.get("exchange") == "bybit" else "bybit"
-        await cb.message.edit_reply_markup(reply_markup=settings_kb(u))
-        await cb.answer(f"Биржа: {u['exchange'].title()}")
 
     else:
         await cb.answer("Неизвестный параметр", show_alert=True)
@@ -675,7 +520,7 @@ async def passive_stream_worker():
                 if 0 <= now.hour <= 7:  # пример тихих часов
                     continue
             header = await render_header_text()
-            body = await render_activity(st.get("exchange", "binance"))
+            body = await render_activity()
             try:
                 await bot.send_message(user_id, header + "\n" + body)
             except Exception:
@@ -696,9 +541,16 @@ async def start_http_server():
 
 # ------------------ ENTRYPOINT ------------------
 async def main():
+    # Чистый старт: убираем возможный webhook и сбрасываем очереди,
+    # чтобы не ловить TelegramConflictError при polling
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
     asyncio.create_task(start_http_server())
     asyncio.create_task(passive_stream_worker())
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=None)
 
 if __name__ == "__main__":
     asyncio.run(main())
