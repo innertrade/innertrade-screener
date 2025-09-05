@@ -33,7 +33,7 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 TZ = os.getenv("TZ", "Europe/Stockholm")
-VERSION = "v0.7.2-webhook"
+VERSION = "v0.7.3-webhook"
 
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -317,7 +317,8 @@ async def render_volatility_text() -> str:
         return txt
     lines = ["""⚡ <b>Волатильность</b> (ATR%, 5m, Bybit)"""]
     for i, r in enumerate(items, 1):
-        lines.append(f"{i}) {r['symbol']} ({r['venue']}) ATR {r['atr_pct']:.2f}% | Vol x{r['vol_mult']):.1f}")
+        # FIX: правильная f-строка без лишней скобки
+        lines.append(f"{i}) {r['symbol']} ({r['venue']}) ATR {r['atr_pct']:.2f}% | Vol x{r['vol_mult']:.1f}")
     txt = "\n".join(lines)
     cache_set(key, txt)
     return txt
@@ -411,7 +412,10 @@ async def build_risk_excel_template()->bytes:
     ws["K2"]='=IF(UPPER(C2)="LONG",D2+G2,D2-G2)'; ws["L2"]='=IF(UPPER(C2)="LONG",D2+2*G2,D2-2*G2)'; ws["M2"]='=IF(UPPER(C2)="LONG",D2+3*G2,D2-3*G2)'
     fill = PatternFill("solid", fgColor="1f2937"); white = Font(color="FFFFFF", bold=True)
     thin = Side(style="thin", color="404040"); border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for cell in ws[1]: cell.font = white; cell.fill = fill; cell.alignment = Alignment(horizontal="center", vertical="center"); cell.border = border
+    for cell in ws[1]:
+        cell.font = white; cell.fill = fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
     for col in "ABCDEFGHIJKLM": ws.column_dimensions[col].width = 14
     ws.column_dimensions["C"].width = 18; ws.column_dimensions["A"].width = 16
     bio = BytesIO(); wb.save(bio); return bio.getvalue()
