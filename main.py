@@ -1,3 +1,4 @@
+# main.py — Innertrade Screener v0.7.4-webhook
 import os
 import asyncio
 import logging
@@ -32,8 +33,8 @@ from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-TZ = os.getenv("TZ", "Europe/Stockholm")
-VERSION = "v0.7.3-webhook"
+TZ = os.getenv("TZ", "Europe/Moscow")
+VERSION = "v0.7.4-webhook"
 
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -46,8 +47,11 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ---------------- CONSTANTS ----------------
-BYBIT_API = "https://api.bybit.com"
-REQUEST_TIMEOUT = 25
+BYBIT_HOSTS = [
+    "https://api.bytick.com",   # зеркало — обычно проходит, когда api.bybit.com заблокирован
+    "https://api.bybit.com",
+]
+REQUEST_TIMEOUT = 20
 HTTP_HEADERS = {"User-Agent": "InnertradeScreener/1.0 (+render.com)"}
 
 SYMBOLS_BYBIT = [
@@ -65,6 +69,9 @@ DEFAULT_USER = {
     "alerts": {"vol_mult": 1.5, "pct24_abs": 3.0, "cooldown_min": 20},
     "last_alert": {}
 }
+
+ACTIVE_BYBIT_HOST = BYBIT_HOSTS[0]
+LAST_HTTP_ERROR = ""  # для /diagnet
 
 def ensure_user(uid: int) -> dict:
     if uid not in USERS:
@@ -90,60 +97,68 @@ def cache_set(key: str, val: str):
 
 # ---------------- MARKET HEADER (stub) ----------------
 async def render_header_text() -> str:
-    return """🧭 <b>Market mood</b>
-BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)"""
+    return (
+        "🧭 <b>Market mood</b>\n"
+        "BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)"
+    )
 
 # ---------------- HTTP HELPERS ----------------
-async def http_get_raw(session: aiohttp.ClientSession, url: str, params: dict | None = None):
-    """Возвращает (status:int, text:str) с ретраями — для диагностики."""
-    for attempt in range(4):
-        try:
-            async with session.get(url, params=params, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT) as r:
-                txt = await r.text()
-                if r.status != 200:
-                    logging.warning(f"[HTTP {r.status}] {url} {params} -> {txt[:200]}")
-                    await asyncio.sleep(0.8 + 0.3*attempt)
-                    continue
-                return r.status, txt
-        except Exception as e:
-            logging.warning(f"[REQ ERR] {url} {params} -> {e}")
-            await asyncio.sleep(0.9 + 0.2*attempt)
-    return None, None
-
 async def http_get_json(session: aiohttp.ClientSession, url: str, params: dict | None = None):
-    for attempt in range(4):
+    """Ретраи + фиксация последней ошибки для диагностики."""
+    global LAST_HTTP_ERROR
+    for attempt in range(3):
         try:
             async with session.get(url, params=params, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT) as r:
                 text = await r.text()
                 if r.status != 200:
-                    logging.warning(f"[HTTP {r.status}] {url} {params} -> {text[:200]}")
-                    await asyncio.sleep(0.8 + 0.3*attempt)
+                    msg = f"[HTTP {r.status}] {url} {params} -> {text[:200]}"
+                    LAST_HTTP_ERROR = msg
+                    logging.warning(msg)
+                    await asyncio.sleep(0.6 + 0.4*attempt)
                     continue
                 try:
-                    js = await r.json()
-                    if isinstance(js, dict) and "retCode" in js and js.get("retCode") != 0:
-                        logging.warning(f"[BYBIT retCode] {url} {params} -> retCode={js.get('retCode')} retMsg={js.get('retMsg')}")
-                    return js
+                    return await r.json()
                 except Exception as e:
-                    logging.warning(f"[JSON ERR] {url} -> {e} | body[:200]={text[:200]}")
-                    await asyncio.sleep(0.5)
+                    msg = f"[JSON ERR] {url} -> {e}"
+                    LAST_HTTP_ERROR = msg
+                    logging.warning(msg)
+                    await asyncio.sleep(0.4)
         except Exception as e:
-            logging.warning(f"[REQ ERR] {url} {params} -> {e}")
-            await asyncio.sleep(0.9 + 0.2*attempt)
+            msg = f"[REQ ERR] {url} {params} -> {repr(e)}"
+            LAST_HTTP_ERROR = msg
+            logging.warning(msg)
+            await asyncio.sleep(0.8 + 0.4*attempt)
+    return None
+
+async def bybit_get(session: aiohttp.ClientSession, path: str, params: dict):
+    """Ротация хостов Bybit: сначала зеркало, затем основной домен."""
+    global ACTIVE_BYBIT_HOST
+    last_err = None
+    for host in [ACTIVE_BYBIT_HOST] + [h for h in BYBIT_HOSTS if h != ACTIVE_BYBIT_HOST]:
+        url = f"{host}{path}"
+        data = await http_get_json(session, url, params)
+        if data is not None:
+            ACTIVE_BYBIT_HOST = host  # зафиксировали рабочий
+            return data
+        last_err = LAST_HTTP_ERROR
+    # ничего не дали
+    if last_err:
+        logging.warning(f"[BYBIT ROTATION FAIL] {last_err}")
     return None
 
 # ---------------- BYBIT PROVIDERS ----------------
 async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval_minutes: int, limit: int):
     interval = str(interval_minutes) if interval_minutes in (1,3,5,15,30,60,120,240,360,720) else "5"
-    url = f"{BYBIT_API}/v5/market/kline"
+    path = "/v5/market/kline"
     params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": str(limit)}
-    return await http_get_json(session, url, params)
+    return await bybit_get(session, path, params)
 
 async def bybit_ticker(session: aiohttp.ClientSession, symbol: str):
-    url = f"{BYBIT_API}/v5/market/tickers"
+    path = "/v5/market/tickers"
     params = {"category": "linear", "symbol": symbol}
-    return await http_get_json(session, url, params)
+    return await bybit_get(session, path, params)
 
+# safe parse
 def parse_bybit_row(row):
     try:
         o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
@@ -176,6 +191,28 @@ def slope(values, lookback: int = 10):
     if len(values) < 2 * lookback:
         return 0.0
     return mean(values[-lookback:]) - mean(values[-2*lookback:-lookback])
+
+# ---------------- DEMO FALLBACK ----------------
+def demo_activity():
+    rows = [
+        {"symbol":"SOLUSDT","venue":"Bybit","vol_mult":2.3,"share24":52},
+        {"symbol":"DOGEUSDT","venue":"Bybit","vol_mult":1.9,"share24":41},
+    ]
+    return rows
+
+def demo_volatility():
+    rows = [
+        {"symbol":"BTCUSDT","venue":"Bybit","atr_pct":1.2,"vol_mult":1.1},
+        {"symbol":"ETHUSDT","venue":"Bybit","atr_pct":1.0,"vol_mult":1.0},
+    ]
+    return rows
+
+def demo_trend():
+    rows = [
+        {"symbol":"SOLUSDT","venue":"Bybit","above200":True,"above360":True,"slope200":0.5,"vol_change":"↑"},
+        {"symbol":"DOGEUSDT","venue":"Bybit","above200":True,"above360":False,"slope200":0.1,"vol_change":"≈"},
+    ]
+    return rows
 
 # ---------------- SCREENER BUILDERS ----------------
 async def build_activity_bybit(session: aiohttp.ClientSession) -> list[dict]:
@@ -275,7 +312,7 @@ async def build_trend_bybit(session: aiohttp.ClientSession) -> list[dict]:
     res.sort(key=lambda x: (x["above200"], x["above360"], x["slope200"]), reverse=True)
     return res[:10]
 
-# ---------------- RENDERERS ----------------
+# ---------------- RENDERERS (with demo fallback) ----------------
 async def render_activity_text() -> str:
     key = "activity:bybit"
     cached = cache_get(key, ttl=45)
@@ -288,11 +325,17 @@ async def render_activity_text() -> str:
     except Exception as e:
         logging.warning(f"[ACTIVITY ERR] {e}")
     if not items:
-        txt = """🔥 <b>Активность</b>
-Нет данных (тихо/таймаут/лимиты)."""
-        cache_set(key, txt)
-        return txt
-    lines = ["""🔥 <b>Активность</b> (Bybit)"""]
+        # demo fallback
+        demo = demo_activity()
+        if demo:
+            lines = ["\n🔥 <b>Активность</b> (Bybit, demo)"]
+            for i, r in enumerate(demo, 1):
+                lines.append(f"{i}) {r['symbol']} ({r['venue']}) Vol x{r['vol_mult']:.1f} | 24h vs 7d: {r['share24']}%")
+            txt = "\n".join(lines)
+            cache_set(key, txt); return txt
+        txt = "\n🔥 <b>Активность</b>\nНет данных (тихо/таймаут/лимиты)."
+        cache_set(key, txt); return txt
+    lines = ["\n🔥 <b>Активность</b> (Bybit)"]
     for i, r in enumerate(items, 1):
         lines.append(f"{i}) {r['symbol']} ({r['venue']}) Vol x{r['vol_mult']:.1f} | 24h vs 7d: {r['share24']}%")
     txt = "\n".join(lines)
@@ -311,13 +354,17 @@ async def render_volatility_text() -> str:
     except Exception as e:
         logging.warning(f"[VOL ERR] {e}")
     if not items:
-        txt = """⚡ <b>Волатильность</b>
-Нет данных."""
-        cache_set(key, txt)
-        return txt
-    lines = ["""⚡ <b>Волатильность</b> (ATR%, 5m, Bybit)"""]
+        demo = demo_volatility()
+        if demo:
+            lines = ["\n⚡ <b>Волатильность</b> (ATR%, 5m, Bybit, demo)"]
+            for i, r in enumerate(demo, 1):
+                lines.append(f"{i}) {r['symbol']} ({r['venue']}) ATR {r['atr_pct']:.2f}% | Vol x{r['vol_mult']:.1f}")
+            txt = "\n".join(lines)
+            cache_set(key, txt); return txt
+        txt = "\n⚡ <b>Волатильность</b>\nНет данных."
+        cache_set(key, txt); return txt
+    lines = ["\n⚡ <b>Волатильность</b> (ATR%, 5m, Bybit)"]
     for i, r in enumerate(items, 1):
-        # FIX: правильная f-строка без лишней скобки
         lines.append(f"{i}) {r['symbol']} ({r['venue']}) ATR {r['atr_pct']:.2f}% | Vol x{r['vol_mult']:.1f}")
     txt = "\n".join(lines)
     cache_set(key, txt)
@@ -335,11 +382,18 @@ async def render_trend_text() -> str:
     except Exception as e:
         logging.warning(f"[TREND ERR] {e}")
     if not items:
-        txt = """📈 <b>Тренд</b>
-Нет данных."""
-        cache_set(key, txt)
-        return txt
-    lines = ["""📈 <b>Тренд</b> (5m, MA200/MA360, Bybit)"""]
+        demo = demo_trend()
+        if demo:
+            lines = ["\n📈 <b>Тренд</b> (5m, MA200/MA360, Bybit, demo)"]
+            for i, r in enumerate(demo, 1):
+                pos = [">MA200" if r["above200"] else "<MA200", ">MA360" if r["above360"] else "<MA360"]
+                slope_tag = "slope+" if r["slope200"] > 0 else ("slope-" if r["slope200"] < 0 else "slope≈")
+                lines.append(f"{i}) {r['symbol']} ({r['venue']}) {' & '.join(pos)} | {slope_tag} | вола {r['vol_change']}")
+            txt = "\n".join(lines)
+            cache_set(key, txt); return txt
+        txt = "\n📈 <b>Тренд</b>\nНет данных."
+        cache_set(key, txt); return txt
+    lines = ["\n📈 <b>Тренд</b> (5m, MA200/MA360, Bybit)"]
     for i, r in enumerate(items, 1):
         pos = [">MA200" if r["above200"] else "<MA200", ">MA360" if r["above360"] else "<MA360"]
         slope_tag = "slope+" if r["slope200"] > 0 else ("slope-" if r["slope200"] < 0 else "slope≈")
@@ -412,15 +466,12 @@ async def build_risk_excel_template()->bytes:
     ws["K2"]='=IF(UPPER(C2)="LONG",D2+G2,D2-G2)'; ws["L2"]='=IF(UPPER(C2)="LONG",D2+2*G2,D2-2*G2)'; ws["M2"]='=IF(UPPER(C2)="LONG",D2+3*G2,D2-3*G2)'
     fill = PatternFill("solid", fgColor="1f2937"); white = Font(color="FFFFFF", bold=True)
     thin = Side(style="thin", color="404040"); border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for cell in ws[1]:
-        cell.font = white; cell.fill = fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border
+    for cell in ws[1]: cell.font = white; cell.fill = fill; cell.alignment = Alignment(horizontal="center", vertical="center"); cell.border = border
     for col in "ABCDEFGHIJKLM": ws.column_dimensions[col].width = 14
     ws.column_dimensions["C"].width = 18; ws.column_dimensions["A"].width = 16
     bio = BytesIO(); wb.save(bio); return bio.getvalue()
 
-# ---------------- KEYBOARDS & SETTINGS ----------------
+# ---------------- UI ----------------
 def bottom_menu_kb()->ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -432,29 +483,27 @@ def bottom_menu_kb()->ReplyKeyboardMarkup:
         input_field_placeholder="Выберите раздел…",
     )
 
-def settings_text(u: dict) -> str:
-    wl = ", ".join(u.get("watchlist") or []) if u.get("watchlist") else "—"
-    return f"""⚙️ <b>Настройки</b>
-Биржа: Bybit (USDT perp)
-Режим: {u.get('mode','active')} | Quiet: {u.get('quiet', False)}
-Watchlist: {wl}
-
-Команды:
-• /add SYMBOL  — добавить (например, /add SOLUSDT)
-• /rm SYMBOL   — удалить
-• /watchlist   — показать лист
-• /passive     — автосводки/сигналы ON
-• /active      — автосводки/сигналы OFF
-"""
+def settings_text(u: dict)->str:
+    wl = ", ".join(u["watchlist"]) if u["watchlist"] else "—"
+    return (
+        "⚙️ <b>Настройки</b>\n"
+        "Биржа: Bybit (USDT perp)\n"
+        f"Режим: {u['mode']} | Quiet: {u['quiet']}\n"
+        f"Watchlist: {wl}\n\n"
+        "Команды:\n"
+        "• /add SYMBOL  — добавить (например, /add SOLUSDT)\n"
+        "• /rm SYMBOL   — удалить\n"
+        "• /watchlist   — показать лист\n"
+        "• /passive     — автосводки/сигналы ON\n"
+        "• /active      — автосводки/сигналы OFF"
+    )
 
 # ---------------- COMMANDS & HANDLERS ----------------
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     ensure_user(m.from_user.id)
     header = await render_header_text()
-    await m.answer(header + f"""
-
-Добро пожаловать в <b>Innertrade Screener</b> {VERSION} (Bybit).""",
+    await m.answer(header + f"\n\nДобро пожаловать в <b>Innertrade Screener</b> {VERSION} (Bybit).",
                    reply_markup=bottom_menu_kb())
 
 @dp.message(Command("status"))
@@ -462,45 +511,49 @@ async def cmd_status(m: Message):
     u = ensure_user(m.from_user.id)
     now = datetime.now(pytz.timezone(TZ)).strftime("%Y-%m-%d %H:%M:%S")
     wl = ", ".join(u["watchlist"]) if u["watchlist"] else "—"
-    await m.answer(f"""<b>Status</b>
-Time: {now} ({TZ})
-Mode: {u['mode']} | Quiet: {u['quiet']}
-Source: Bybit (linear USDT)
-Watchlist: {wl}
-Webhook: ON
-Version: {VERSION}""")
+    await m.answer(
+        "<b>Status</b>\n"
+        f"Time: {now} ({TZ})\n"
+        f"Mode: {u['mode']} | Quiet: {u['quiet']}\n"
+        "Source: Bybit (linear USDT)\n"
+        f"Watchlist: {wl}\n"
+        "Webhook: ON\n"
+        f"Version: {VERSION}"
+    )
 
 @dp.message(Command("diag"))
 async def cmd_diag(m: Message):
     sym = "BTCUSDT"
-    async with aiohttp.ClientSession() as s:
-        k5 = await bybit_klines(s, sym, 5, 50)
-        l5 = (k5 or {}).get("result", {}).get("list", [])
-        tk = await bybit_ticker(s, sym)
-        lst = (tk or {}).get("result", {}).get("list", [])
-    await m.answer(f"Diag {sym}: 5m candles={len(l5)} | ticker={'OK' if lst else 'EMPTY'}")
+    try:
+        async with aiohttp.ClientSession() as s:
+            k5 = await bybit_klines(s, sym, 5, 50)
+            l5 = (k5 or {}).get("result", {}).get("list", [])
+            tk = await bybit_ticker(s, sym)
+            lst = (tk or {}).get("result", {}).get("list", [])
+        await m.answer(f"Diag {sym}: 5m candles={len(l5)} | ticker={'OK' if lst else 'EMPTY'} | host={ACTIVE_BYBIT_HOST}")
+    except Exception as e:
+        await m.answer(f"Diag error: {e!r}")
 
 @dp.message(Command("diagnet"))
 async def cmd_diagnet(m: Message):
-    """Показывает статус и кусок ответа Bybit, чтобы понять retCode/403/429 и т.п."""
-    sym = "BTCUSDT"
-    async with aiohttp.ClientSession() as s:
-        # KLINE
-        url_k = f"{BYBIT_API}/v5/market/kline"
-        p_k = {"category":"linear","symbol":sym,"interval":"5","limit":"2"}
-        st_k, txt_k = await http_get_raw(s, url_k, p_k)
-        # TICKER
-        url_t = f"{BYBIT_API}/v5/market/tickers"
-        p_t = {"category":"linear","symbol":sym}
-        st_t, txt_t = await http_get_raw(s, url_t, p_t)
-
-    snip_k = (txt_k or "")[:200].replace("\n"," ")
-    snip_t = (txt_t or "")[:200].replace("\n"," ")
-    await m.answer(
-        f"<b>diagnet</b>\n"
-        f"kline: status={st_k} body[:200]={snip_k}\n"
-        f"ticker: status={st_t} body[:200]={snip_t}"
-    )
+    # Прямой пинг обоих хостов, чтобы увидеть, кто жив
+    out_lines = []
+    try:
+        async with aiohttp.ClientSession() as s:
+            for host in BYBIT_HOSTS:
+                # пробуем time endpoint (минимальный):
+                url = f"{host}/v5/market/time"
+                try:
+                    async with s.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT) as r:
+                        text = await r.text()
+                        out_lines.append(f"{host} -> {r.status} | {text[:120].replace(chr(10),' ')}")
+                except Exception as e:
+                    out_lines.append(f"{host} -> ERR {repr(e)}")
+    except Exception as e:
+        out_lines.append(f"session ERR {repr(e)}")
+    if LAST_HTTP_ERROR:
+        out_lines.append(f"last_err: {LAST_HTTP_ERROR[:160]}")
+    await m.answer("diagnet:\n" + "\n".join(out_lines))
 
 @dp.message(F.text == "📊 Активность")
 async def on_activity(m: Message):
@@ -523,10 +576,7 @@ async def on_trend(m: Message):
 @dp.message(F.text == "📰 Новости")
 async def on_news(m: Message):
     header = await render_header_text()
-    await m.answer(header + """
-
-📰 <b>Макро (последний час)</b>
-• CPI (US) 3.1% vs 3.2% прогноз — риск-он""")
+    await m.answer(header + "\n\n📰 <b>Макро (последний час)</b>\n• CPI (US) 3.1% vs 3.2% прогноз — риск-он")
 
 @dp.message(F.text == "🫧 Bubbles")
 async def on_bubbles(m: Message):
@@ -683,7 +733,7 @@ async def passive_loop():
 
 # ---------------- AIOHTTP SERVER (WEBHOOK) ----------------
 async def handle_health(request):
-    return web.json_response({"ok": True, "service": "innertrade-screener", "version": VERSION})
+    return web.json_response({"ok": True, "service": "innertrade-screener", "version": VERSION, "host": ACTIVE_BYBIT_HOST})
 
 async def handle_webhook(request):
     try:
