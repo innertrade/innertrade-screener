@@ -121,6 +121,7 @@ async def http_get_json(session: aiohttp.ClientSession, url: str, params: dict |
             await asyncio.sleep(0.8)
     return None
 
+Iurii Qechunts, [05.09.2025 23:54]
 # ---------------- BYBIT PROVIDERS ----------------
 async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval_minutes: int, limit: int):
     interval = str(interval_minutes) if interval_minutes in (1,3,5,15,30,60,120,240,360,720) else "5"
@@ -219,7 +220,9 @@ async def build_volatility_bybit(session: aiohttp.ClientSession) -> list[dict]:
             return sym, None
 
     raws = await asyncio.gather(*[asyncio.create_task(fetch(s)) for s in SYMBOLS_BYBIT])
-    out = []
+
+Iurii Qechunts, [05.09.2025 23:54]
+out = []
     for sym, k5 in raws:
         try:
             l5 = (k5 or {}).get("result", {}).get("list", [])
@@ -317,7 +320,7 @@ async def render_volatility_text() -> str:
     cache_set(key, txt)
     return txt
 
-
+Iurii Qechunts, [05.09.2025 23:54]
 async def render_trend_text() -> str:
     key = "trend:bybit"
     cached = cache_get(key, ttl=60)
@@ -414,7 +417,9 @@ async def build_risk_excel_template()->bytes:
                "Risk $", "Stop Dist", "Qty", "Leverage", "Notional $", "TP1", "TP2", "TP3"]
     ws.append(headers)
     ws["A2"]=10000; ws["B2"]=0.01; ws["C2"]="LONG"; ws["D2"]=100.0; ws["E2"]=95.0; ws["I2"]=5
-    ws["F2"]="=A2*B2"
+
+Iurii Qechunts, [05.09.2025 23:54]
+ws["F2"]="=A2*B2"
     ws["G2"]='=ABS(IF(UPPER(C2)="LONG",D2-E2,E2-D2))'
     ws["H2"]="=IF(G2>0,F2/G2,0)"
     ws["J2"]="=H2*D2"
@@ -524,7 +529,7 @@ async def on_news(m: Message):
     header = await render_header_text()
     await m.answer(header + "\n\n📰 <b>Макро (последний час)</b>\n• CPI (US) 3.1% vs 3.2% прогноз — риск-он")
 
-
+Iurii Qechunts, [05.09.2025 23:54]
 @dp.message(F.text == "🫧 Bubbles")
 async def on_bubbles(m: Message):
     try:
@@ -643,7 +648,7 @@ async def fetch_watchlist_snapshot(symbols: list[str]) -> dict:
             out[sym] = {"pct24": pct, "vol_mult": vol_mult}
     return out
 
-
+Iurii Qechunts, [05.09.2025 23:54]
 async def passive_loop():
     tz = pytz.timezone(TZ)
     while True:
@@ -747,5 +752,5 @@ async def main():
         await asyncio.sleep(3600)
 
 
-if __name__ == "__main__":
+if name == "main":
     asyncio.run(main())
