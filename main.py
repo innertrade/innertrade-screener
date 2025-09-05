@@ -121,7 +121,6 @@ async def http_get_json(session: aiohttp.ClientSession, url: str, params: dict |
                     continue
                 try:
                     js = await r.json()
-                    # спец-лог по Bybit: retCode != 0
                     if isinstance(js, dict) and "retCode" in js and js.get("retCode") != 0:
                         logging.warning(f"[BYBIT retCode] {url} {params} -> retCode={js.get('retCode')} retMsg={js.get('retMsg')}")
                     return js
@@ -318,7 +317,7 @@ async def render_volatility_text() -> str:
         return txt
     lines = ["""⚡ <b>Волатильность</b> (ATR%, 5m, Bybit)"""]
     for i, r in enumerate(items, 1):
-        lines.append(f"{i}) {r['symbol']} ({r['venue']}) ATR {r['atr_pct']:.2f}% | Vol x{r['vol_mult']:.1f}")
+        lines.append(f"{i}) {r['symbol']} ({r['venue']}) ATR {r['atr_pct']:.2f}% | Vol x{r['vol_mult']):.1f}")
     txt = "\n".join(lines)
     cache_set(key, txt)
     return txt
@@ -424,7 +423,7 @@ def bottom_menu_kb()->ReplyKeyboardMarkup:
             [KeyboardButton(text="📊 Активность"), KeyboardButton(text="⚡ Волатильность")],
             [KeyboardButton(text="📈 Тренд"),      KeyboardButton(text="🫧 Bubbles")],
             [KeyboardButton(text="📰 Новости"),    KeyboardButton(text="🧮 Калькулятор")],
-            [KeyboardButton(text="⭐ Watchlist"),   KeyboardButton(text=⚙️ Настройки")],
+            [KeyboardButton(text="⭐ Watchlist"),   KeyboardButton(text="⚙️ Настройки")],
         ], resize_keyboard=True, is_persistent=True,
         input_field_placeholder="Выберите раздел…",
     )
