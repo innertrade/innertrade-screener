@@ -33,7 +33,7 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 TZ = os.getenv("TZ", "Europe/Stockholm")
-VERSION = "v0.7.1-webhook"
+VERSION = "v0.7.2-webhook"
 
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -88,25 +88,45 @@ def cache_get(key: str, ttl: int):
 def cache_set(key: str, val: str):
     CACHE[key] = (time(), val)
 
-# ---------------- MARKET HEADER (стаб) ----------------
+# ---------------- MARKET HEADER (stub) ----------------
 async def render_header_text() -> str:
     return """🧭 <b>Market mood</b>
 BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)"""
 
 # ---------------- HTTP HELPERS ----------------
+async def http_get_raw(session: aiohttp.ClientSession, url: str, params: dict | None = None):
+    """Возвращает (status:int, text:str) с ретраями — для диагностики."""
+    for attempt in range(4):
+        try:
+            async with session.get(url, params=params, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT) as r:
+                txt = await r.text()
+                if r.status != 200:
+                    logging.warning(f"[HTTP {r.status}] {url} {params} -> {txt[:200]}")
+                    await asyncio.sleep(0.8 + 0.3*attempt)
+                    continue
+                return r.status, txt
+        except Exception as e:
+            logging.warning(f"[REQ ERR] {url} {params} -> {e}")
+            await asyncio.sleep(0.9 + 0.2*attempt)
+    return None, None
+
 async def http_get_json(session: aiohttp.ClientSession, url: str, params: dict | None = None):
     for attempt in range(4):
         try:
             async with session.get(url, params=params, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT) as r:
                 text = await r.text()
                 if r.status != 200:
-                    logging.warning(f"[HTTP {r.status}] {url} {params} -> {text[:160]}")
+                    logging.warning(f"[HTTP {r.status}] {url} {params} -> {text[:200]}")
                     await asyncio.sleep(0.8 + 0.3*attempt)
                     continue
                 try:
-                    return await r.json()
+                    js = await r.json()
+                    # спец-лог по Bybit: retCode != 0
+                    if isinstance(js, dict) and "retCode" in js and js.get("retCode") != 0:
+                        logging.warning(f"[BYBIT retCode] {url} {params} -> retCode={js.get('retCode')} retMsg={js.get('retMsg')}")
+                    return js
                 except Exception as e:
-                    logging.warning(f"[JSON ERR] {url} -> {e}")
+                    logging.warning(f"[JSON ERR] {url} -> {e} | body[:200]={text[:200]}")
                     await asyncio.sleep(0.5)
         except Exception as e:
             logging.warning(f"[REQ ERR] {url} {params} -> {e}")
@@ -397,14 +417,14 @@ async def build_risk_excel_template()->bytes:
     ws.column_dimensions["C"].width = 18; ws.column_dimensions["A"].width = 16
     bio = BytesIO(); wb.save(bio); return bio.getvalue()
 
-# ---------------- KEYBOARDS & SETTINGS TEXT ----------------
+# ---------------- KEYBOARDS & SETTINGS ----------------
 def bottom_menu_kb()->ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 Активность"), KeyboardButton(text="⚡ Волатильность")],
             [KeyboardButton(text="📈 Тренд"),      KeyboardButton(text="🫧 Bubbles")],
             [KeyboardButton(text="📰 Новости"),    KeyboardButton(text="🧮 Калькулятор")],
-            [KeyboardButton(text="⭐ Watchlist"),   KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="⭐ Watchlist"),   KeyboardButton(text=⚙️ Настройки")],
         ], resize_keyboard=True, is_persistent=True,
         input_field_placeholder="Выберите раздел…",
     )
@@ -456,6 +476,28 @@ async def cmd_diag(m: Message):
         tk = await bybit_ticker(s, sym)
         lst = (tk or {}).get("result", {}).get("list", [])
     await m.answer(f"Diag {sym}: 5m candles={len(l5)} | ticker={'OK' if lst else 'EMPTY'}")
+
+@dp.message(Command("diagnet"))
+async def cmd_diagnet(m: Message):
+    """Показывает статус и кусок ответа Bybit, чтобы понять retCode/403/429 и т.п."""
+    sym = "BTCUSDT"
+    async with aiohttp.ClientSession() as s:
+        # KLINE
+        url_k = f"{BYBIT_API}/v5/market/kline"
+        p_k = {"category":"linear","symbol":sym,"interval":"5","limit":"2"}
+        st_k, txt_k = await http_get_raw(s, url_k, p_k)
+        # TICKER
+        url_t = f"{BYBIT_API}/v5/market/tickers"
+        p_t = {"category":"linear","symbol":sym}
+        st_t, txt_t = await http_get_raw(s, url_t, p_t)
+
+    snip_k = (txt_k or "")[:200].replace("\n"," ")
+    snip_t = (txt_t or "")[:200].replace("\n"," ")
+    await m.answer(
+        f"<b>diagnet</b>\n"
+        f"kline: status={st_k} body[:200]={snip_k}\n"
+        f"ticker: status={st_t} body[:200]={snip_t}"
+    )
 
 @dp.message(F.text == "📊 Активность")
 async def on_activity(m: Message):
