@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import html
 from aiohttp import web, ClientSession, ClientTimeout
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -13,7 +14,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 BYBIT_HOST = os.getenv("BYBIT_HOST", "https://api.bybit.com").rstrip("/")
-VERSION = "v0.8.3-webhook"
+VERSION = "v0.8.4-webhook"
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -74,38 +75,45 @@ async def cmd_diag(m: Message):
         async with ClientSession(timeout=timeout) as s:
             url_ticker = f"{BYBIT_HOST}/v5/market/tickers?category=linear&symbol=BTCUSDT"
             url_kline  = f"{BYBIT_HOST}/v5/market/kline?category=linear&symbol=BTCUSDT&interval=5&limit=5"
+            headers = {"User-Agent": "InnertradeScreener/1.0 (+render.com)"}
 
             # тикер
             st_t, cut_t = None, ""
             try:
-                async with s.get(url_ticker, headers={"User-Agent": "InnertradeScreener/1.0"}) as r:
+                async with s.get(url_ticker, headers=headers) as r:
                     st_t = r.status
                     txt = await r.text()
-                    cut_t = txt[:220].replace("\n", " ")
+                    cut_t = txt[:220]
             except Exception as e:
                 cut_t = f"ERR {type(e).__name__}: {e}"
 
             # клайны
             st_k, cut_k = None, ""
             try:
-                async with s.get(url_kline, headers={"User-Agent": "InnertradeScreener/1.0"}) as r:
+                async with s.get(url_kline, headers=headers) as r:
                     st_k = r.status
                     txt = await r.text()
-                    cut_k = txt[:220].replace("\n", " ")
+                    cut_k = txt[:220]
             except Exception as e:
                 cut_k = f"ERR {type(e).__name__}: {e}"
+
+        # Экранируем на всякий случай, чтобы Телеграм не пытался парсить <…>
+        safe_t = html.escape(cut_t).replace("\n", " ")
+        safe_k = html.escape(cut_k).replace("\n", " ")
 
         msg = (
             "<b>diag</b>\n"
             f"host: {BYBIT_HOST}\n"
-            f"ticker: status={st_t} body[:200]={cut_t}\n"
-            f"kline : status={st_k} body[:200]={cut_k}"
+            f"ticker: status={st_t} body[:200]=<code>{safe_t}</code>\n"
+            f"kline : status={st_k} body[:200]=<code>{safe_k}</code>"
         )
         await m.answer(msg)
     except Exception as e:
-        await m.answer(f"diag failed: {type(e).__name__}: {e}")
+        # На случай, если даже это поломается, отключим HTML в этом единственном сообщении
+        fallback = f"diag failed: {type(e).__name__}: {e}"
+        await m.answer(fallback, parse_mode=None)
 
-# Кнопки — быстрые ответы, чтобы не ждать долгих расчётов
+# Кнопки — быстрые ответы-заглушки
 @router.message(F.text == "📊 Активность")
 async def on_activity(m: Message):
     await m.answer("🔥 Активность\nПодбираю данные… (временная заглушка)", reply_markup=bottom_menu())
@@ -161,7 +169,6 @@ app = web.Application()
 app.router.add_get("/health", handle_health)
 
 async def on_startup():
-    # Перестраховка: удаляем старый вебхук и ставим новый
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
@@ -170,7 +177,6 @@ async def on_startup():
     logging.info(f"Webhook set to: {WEBHOOK_URL}")
 
 async def main():
-    # Регистрируем webhook handler у aiohttp-приложения
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
