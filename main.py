@@ -1,48 +1,176 @@
 import os
 import asyncio
-import logging
 import json
-import html
+import logging
+from datetime import datetime, timezone
 from io import BytesIO
-from typing import Dict, Any, List
+from statistics import mean
 
-from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
-
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup, BufferedInputFile
-from aiogram.client.default import DefaultBotProperties
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-
+import aiohttp
+import asyncpg
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import pytz
 
-# ========= ENV / CONFIG =========
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-PORT = int(os.getenv("PORT", "10000"))
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup, KeyboardButton,
+    BufferedInputFile, Update
+)
+from aiohttp import web
+from dotenv import load_dotenv
 
-VERSION = "v0.8.7-websocket"
-WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
+# ============== ENV & CONFIG ==============
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
+TZ = os.getenv("TZ", "Europe/Moscow")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+BYBIT_WS = os.getenv("BYBIT_WS", "wss://stream.bybit.com/v5/public/linear")
+
+VERSION = "v1.0-persist-ws"
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is not set")
+    raise RuntimeError("TELEGRAM_TOKEN env is required")
 if not BASE_URL.startswith("https://"):
     raise RuntimeError("BASE_URL must be your public https URL, e.g. https://<service>.onrender.com")
-
-SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT",
-    "DOGEUSDT","ADAUSDT","LINKUSDT","TRXUSDT","TONUSDT",
-    "ARBUSDT","OPUSDT"
-]
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL (Postgres/Neon) is required")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# ========= BOT / ROUTER =========
-bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-router = Router()
+
+# ============== SYMBOLS / INTERVALS ==============
+SYMBOLS = [
+    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","DOGEUSDT","ADAUSDT",
+    "LINKUSDT","TRXUSDT","TONUSDT","ARBUSDT","OPUSDT"
+]
+INTERVAL = "5"  # 5m строка для Bybit v5: topic kline.5.SYMBOL
+
+# ============== DB LAYER ==============
+_pool: asyncpg.Pool | None = None
+
+DDL_SQL = """
+CREATE TABLE IF NOT EXISTS candles (
+  symbol TEXT NOT NULL,
+  interval TEXT NOT NULL,
+  ts BIGINT NOT NULL,              -- старт свечи (ms / or s -> будем хранить ms)
+  open DOUBLE PRECISION NOT NULL,
+  high DOUBLE PRECISION NOT NULL,
+  low  DOUBLE PRECISION NOT NULL,
+  close DOUBLE PRECISION NOT NULL,
+  volume DOUBLE PRECISION NOT NULL,
+  turnover DOUBLE PRECISION NOT NULL,
+  PRIMARY KEY (symbol, interval, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_candles_sym_int_ts ON candles(symbol, interval, ts DESC);
+
+CREATE TABLE IF NOT EXISTS tickers (
+  symbol TEXT PRIMARY KEY,
+  price24hPcnt DOUBLE PRECISION,   -- в долях (на WS так приходит); при выводе *100
+  turnover24h  DOUBLE PRECISION,
+  last_price   DOUBLE PRECISION,
+  updated_at   TIMESTAMPTZ DEFAULT now()
+);
+"""
+
+async def db_init():
+    global _pool
+    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
+    async with _pool.acquire() as con:
+        for stmt in DDL_SQL.strip().split(";\n\n"):
+            if stmt.strip():
+                await con.execute(stmt)
+
+async def upsert_candle(symbol: str, interval: str, ts_ms: int,
+                        o: float, h: float, l: float, c: float, v: float, t: float):
+    assert _pool is not None
+    sql = """
+    INSERT INTO candles(symbol, interval, ts, open, high, low, close, volume, turnover)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    ON CONFLICT(symbol, interval, ts) DO UPDATE
+    SET open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close,
+        volume=EXCLUDED.volume, turnover=EXCLUDED.turnover;
+    """
+    async with _pool.acquire() as c:
+        await c.execute(sql, symbol, interval, ts_ms, o, h, l, c, v, t)
+
+async def upsert_ticker(symbol: str, price24hPcnt: float | None,
+                        turnover24h: float | None, last_price: float | None):
+    assert _pool is not None
+    sql = """
+    INSERT INTO tickers(symbol, price24hPcnt, turnover24h, last_price, updated_at)
+    VALUES($1,$2,$3,$4, now())
+    ON CONFLICT(symbol) DO UPDATE SET
+      price24hPcnt = EXCLUDED.price24hPcnt,
+      turnover24h  = EXCLUDED.turnover24h,
+      last_price   = EXCLUDED.last_price,
+      updated_at   = now();
+    """
+    async with _pool.acquire() as c:
+        await c.execute(sql, symbol, price24hPcnt, turnover24h, last_price)
+
+async def fetch_last_candles(symbol: str, interval: str, limit: int = 400):
+    assert _pool is not None
+    sql = """
+    SELECT ts, open, high, low, close, volume, turnover
+    FROM candles
+    WHERE symbol=$1 AND interval=$2
+    ORDER BY ts DESC
+    LIMIT $3;
+    """
+    async with _pool.acquire() as c:
+        rows = await c.fetch(sql, symbol, interval, limit)
+    # вернём в прямом хрон. порядке
+    return list(reversed(rows))
+
+async def top_by_ticker(metric: str, limit: int = 10):
+    """
+    metric: 'turnover24h' | 'price24hPcnt_abs' | 'price24hPcnt'
+    """
+    assert _pool is not None
+    if metric == "turnover24h":
+        sql = "SELECT symbol, price24hPcnt, turnover24h, last_price FROM tickers ORDER BY turnover24h DESC NULLS LAST LIMIT $1;"
+    elif metric == "price24hPcnt_abs":
+        sql = "SELECT symbol, price24hPcnt, turnover24h, last_price FROM tickers ORDER BY ABS(price24hPcnt) DESC NULLS LAST LIMIT $1;"
+    else:
+        sql = "SELECT symbol, price24hPcnt, turnover24h, last_price FROM tickers ORDER BY price24hPcnt DESC NULLS LAST LIMIT $1;"
+
+    async with _pool.acquire() as c:
+        rows = await c.fetch(sql, limit)
+    return rows
+
+# ============== INDICATORS ==============
+def moving_average(vals: list[float], length: int) -> float | None:
+    if len(vals) < length:
+        return None
+    return float(mean(vals[-length:]))
+
+def compute_atr(ohlc: list[tuple[float,float,float,float]], period: int = 14) -> float | None:
+    if len(ohlc) < period + 1:
+        return None
+    trs = []
+    prev_close = ohlc[0][3]
+    for i in range(1, len(ohlc)):
+        _, h, l, c = ohlc[i]
+        tr = max(h - l, abs(h - prev_close), abs(prev_close - l))
+        trs.append(tr)
+        prev_close = c
+    if len(trs) < period:
+        return None
+    return float(mean(trs[-period:]))
+
+# ============== RENDER HELPERS ==============
+def header_text() -> str:
+    # заглушка шапки; реальные макро-метрики подставите позже
+    return "🧭 <b>Market mood</b>\nBTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)"
 
 def bottom_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -52,284 +180,325 @@ def bottom_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📰 Новости"),    KeyboardButton(text="🧮 Калькулятор")],
             [KeyboardButton(text="⭐ Watchlist"),   KeyboardButton(text="⚙️ Настройки")],
         ],
-        resize_keyboard=True,
-        is_persistent=True,
+        resize_keyboard=True, is_persistent=True,
         input_field_placeholder="Выберите раздел…",
     )
 
-# ========= WS HELPERS =========
-def _ingest_ticker_payload(out: Dict[str, Dict[str, Any]], payload: Dict[str, Any]):
-    """Сливаем тикер в out, выбирая 'лучшие' ненулевые значения."""
-    sym = payload.get("symbol")
-    if not sym:
+# ============== BUSINESS LOGIC (uses DB) ==============
+async def render_activity() -> str:
+    # Активность = сортировка по обороту 24h из таблицы tickers
+    rows = await top_by_ticker("turnover24h", limit=10)
+    if not rows:
+        return "🔥 <b>Активность</b>\nНет данных (ожидаю WS тикеры)…"
+    lines = ["🔥 <b>Активность</b> (Bybit WS)"]
+    for i, r in enumerate(rows, 1):
+        sym = r["symbol"]
+        pct = (r["price24hPcnt"] or 0.0) * 100.0
+        tov = r["turnover24h"] or 0.0
+        lines.append(f"{i}) {sym}  24h% {pct:+.2f}  | turnover24h ~ {int(tov):,}".replace(",", " "))
+    return "\n".join(lines)
+
+async def render_volatility() -> str:
+    # Волатильность = сортировка по |%24h| из tickers (пока нет очень длинной истории без REST)
+    rows = await top_by_ticker("price24hPcnt_abs", limit=10)
+    if not rows:
+        return "⚡ <b>Волатильность</b>\nНет данных (ожидаю WS тикеры)…"
+    lines = ["⚡ <b>Волатильность</b> (24h %, Bybit WS)"]
+    for i, r in enumerate(rows, 1):
+        sym = r["symbol"]
+        pct = (r["price24hPcnt"] or 0.0) * 100.0
+        last = r["last_price"] or 0.0
+        lines.append(f"{i}) {sym}  24h% {pct:+.2f}  | last {last}")
+    return "\n".join(lines)
+
+async def render_trend() -> str:
+    # Тренд = MA200 по 5m, если хватает свечей; иначе упрощённая версия по 24h%
+    # Сначала проверим, у кого хватает истории
+    ranked = []
+    for sym in SYMBOLS:
+        rows = await fetch_last_candles(sym, INTERVAL, limit=260)  # до 260 свечей 5м
+        if len(rows) >= 200:
+            closes = [float(r["close"]) for r in rows]
+            ma200 = moving_average(closes, 200)
+            last = closes[-1]
+            above = last > (ma200 or last)
+            ranked.append((sym, "MA200", above, last))
+    if ranked:
+        ranked.sort(key=lambda x: (x[2], x[3]), reverse=True)  # above True выше, затем цена
+        lines = ["📈 <b>Тренд</b> (5m MA200, WS history)"]
+        for i, (sym, _, above, last) in enumerate(ranked[:10], 1):
+            tag = ">MA200" if above else "<MA200"
+            lines.append(f"{i}) {sym}  {tag}  | last {last}")
+        return "\n".join(lines)
+
+    # Фоллбек — упрощённый по 24h%
+    rows = await top_by_ticker("price24hPcnt", limit=10)
+    if not rows:
+        return "📈 <b>Тренд</b>\nНет данных (ожидаю WS)…"
+    lines = ["📈 <b>Тренд</b> (упрощённо по 24h%, WS)"]
+    for i, r in enumerate(rows, 1):
+        sym = r["symbol"]
+        pct = (r["price24hPcnt"] or 0.0) * 100.0
+        last = r["last_price"] or 0.0
+        approx = "↑" if pct > 0 else ("↓" if pct < 0 else "≈")
+        lines.append(f"{i}) {sym}  {approx}  24h% {pct:+.2f}  | last {last}")
+    return "\n".join(lines)
+
+# ============== WS CONSUMER ==============
+async def ws_consumer():
+    """
+    Подключаемся к Bybit Public WS и подписываемся:
+      - tickers.SYMBOL
+      - kline.5.SYMBOL
+    Сохраняем в БД тикеры и свечи. При подписке Bybit шлёт снапшоты (включая ~последние 200 свечей).
+    """
+    sub_topics = []
+    for s in SYMBOLS:
+        sub_topics.append(f"tickers.{s}")
+        sub_topics.append(f"kline.{INTERVAL}.{s}")
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.ws_connect(BYBIT_WS, heartbeat=20) as ws:
+                    logging.info(f"WS connected: {BYBIT_WS}")
+                    # subscribe
+                    await ws.send_json({"op": "subscribe", "args": sub_topics})
+
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = msg.json(loads=json.loads)
+                            except Exception:
+                                # Иногда Bybit шлёт пинг или plain text
+                                text = msg.data
+                                if text == "pong":
+                                    continue
+                                with contextlib.suppress(Exception):
+                                    dj = json.loads(text)
+                                    data = dj
+                                if not isinstance(text, str):
+                                    continue
+                                # не JSON — пропускаем
+                                continue
+
+                            # обработка
+                            if isinstance(data, dict):
+                                topic = data.get("topic") or ""
+                                if topic.startswith("tickers."):
+                                    await handle_ws_ticker(data)
+                                elif topic.startswith("kline."):
+                                    await handle_ws_kline(data)
+                                else:
+                                    # pong/confirm/subscribed/ etc.
+                                    pass
+
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            logging.warning(f"WS ERROR: {msg}")
+                            break
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED,
+                                          aiohttp.WSMsgType.CLOSING):
+                            break
+            except Exception as e:
+                logging.warning(f"WS connect fail: {e}")
+                await asyncio.sleep(3.0)
+
+async def handle_ws_ticker(payload: dict):
+    """
+    payload пример (Bybit v5):
+    {
+      "topic":"tickers.BTCUSDT",
+      "type":"snapshot"|"delta",
+      "data":[{"symbol":"BTCUSDT","lastPrice":"110023.2","turnover24h":"123...", "price24hPcnt":"-0.0115", ...}],
+      "ts": 1710000000000
+    }
+    """
+    arr = payload.get("data") or []
+    if not arr:
         return
-    try:
-        last = float(payload.get("lastPrice", 0.0))
-    except Exception:
-        last = 0.0
-    try:
-        pct = float(payload.get("price24hPcnt", 0.0)) * 100.0
-    except Exception:
-        pct = 0.0
-    try:
-        turn = float(payload.get("turnover24h", 0.0))
-    except Exception:
-        turn = 0.0
+    for it in arr:
+        try:
+            symbol = it.get("symbol")
+            last = float(it.get("lastPrice", 0) or 0)
+            # На некоторых WS потоках поле называется "turnover24h", 24h проценты — "price24hPcnt"
+            tov = float(it.get("turnover24h", 0) or 0)
+            pct = float(it.get("price24hPcnt", 0) or 0)  # доли, не проценты
+            await upsert_ticker(symbol, pct, tov, last)
+        except Exception as e:
+            logging.warning(f"[WS ticker parse] {e}")
 
-    cur = out.get(sym, {"last": 0.0, "pct24": 0.0, "turn24": 0.0})
-    # выбираем «лучшее»: ненулевое > нулевого; по turn24 — большее информативнее
-    best_last = last if (last != 0.0 or cur["last"] == 0.0) else cur["last"]
-    best_pct  = pct  if (pct  != 0.0 or cur["pct24"] == 0.0) else cur["pct24"]
-    best_turn = turn if (turn > cur["turn24"]) else cur["turn24"]
-    out[sym] = {"last": best_last, "pct24": best_pct, "turn24": best_turn}
-
-async def ws_collect_tickers(symbols: List[str], collect_secs: float = 8.0) -> Dict[str, Dict[str, Any]]:
+async def handle_ws_kline(payload: dict):
     """
-    Подключаемся к публичному WS и собираем тикеры (24ч) для заданных символов.
-    Возвращаем срез: {symbol: {"last": float, "turn24": float, "pct24": float}}
+    payload пример (Bybit v5):
+    {
+      "topic":"kline.5.BTCUSDT",
+      "type":"snapshot"|"delta",
+      "data":[
+        {"start":"1710000000000","end":"1710000300000","interval":"5",
+         "open":"...","high":"...","low":"...","close":"...","volume":"...","turnover":"...", "confirm": true/false}
+      ],
+      "ts": ...
+    }
+    Сохраняем по ключу (symbol, interval, start_ts).
     """
-    out: Dict[str, Dict[str, Any]] = {}
-    timeout = ClientTimeout(total=collect_secs + 5.0)
-    sub_args = [f"tickers.{s}" for s in symbols]
+    topic = payload.get("topic", "")
+    parts = topic.split(".")
+    if len(parts) != 3:
+        return
+    # parts: ["kline", "5", "BTCUSDT"]
+    interval = parts[1]
+    symbol = parts[2]
+    arr = payload.get("data") or []
+    for it in arr:
+        try:
+            ts_ms = int(it.get("start"))
+            o = float(it.get("open", 0))
+            h = float(it.get("high", 0))
+            l = float(it.get("low", 0))
+            c = float(it.get("close", 0))
+            v = float(it.get("volume", 0))
+            t = float(it.get("turnover", 0))
+            await upsert_candle(symbol, interval, ts_ms, o, h, l, c, v, t)
+        except Exception as e:
+            logging.warning(f"[WS kline parse] {e}")
 
-    async with ClientSession(timeout=timeout) as s:
-        async with s.ws_connect(WS_PUBLIC_LINEAR) as ws:
-            await ws.send_str(json.dumps({"op": "subscribe", "args": sub_args}))
-            end_t = asyncio.get_event_loop().time() + collect_secs
-            while asyncio.get_event_loop().time() < end_t:
-                try:
-                    msg = await ws.receive(timeout=collect_secs)
-                except Exception:
-                    break
-                if msg.type != WSMsgType.TEXT:
-                    if msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR, WSMsgType.CLOSE):
-                        break
-                    continue
-                try:
-                    data = msg.json(loads=json.loads)
-                except Exception:
-                    continue
-                if not isinstance(data, dict):
-                    continue
-                topic = data.get("topic", "")
-                if not topic.startswith("tickers."):
-                    continue
-                payload = data.get("data")
-                # Bybit может прислать либо dict, либо list (snapshot)
-                if isinstance(payload, dict):
-                    _ingest_ticker_payload(out, payload)
-                elif isinstance(payload, list):
-                    for it in payload:
-                        if isinstance(it, dict):
-                            _ingest_ticker_payload(out, it)
-    return out
+# ============== AIOHTTP SERVER (WEBHOOK) ==============
+async def handle_health(_request):
+    return web.json_response({"ok": True, "service": "innertrade-screener", "version": VERSION, "source": "Bybit WS"})
 
-def render_bubbles_png(items: List[Dict[str, Any]]) -> bytes:
-    buf = BytesIO()
-    if not items:
-        fig = plt.figure(figsize=(8,4), dpi=160)
-        ax = fig.add_subplot(111); ax.axis("off")
-        ax.text(0.5,0.5,"Нет данных для пузырьков (WS)", ha="center", va="center", fontsize=16)
-        fig.savefig(buf, format="png"); plt.close(fig)
-        return buf.getvalue()
+async def handle_webhook(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400)
+    try:
+        update = Update.model_validate(data)
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        logging.warning(f"[WEBHOOK ERR] {e}")
+    return web.Response(text="OK")
 
-    turns = np.array([max(1.0, it["turn24"]) for it in items], dtype=float)
-    sizes = np.sqrt(turns)
-    k = (8000.0 / sizes.max()) if sizes.max() > 0 else 1.0
-    s = sizes * k
+async def start_http_server():
+    app = web.Application()
+    app.router.add_get("/health", handle_health)
+    app.router.add_post(f"/webhook/{TELEGRAM_TOKEN}", handle_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"HTTP server started on 0.0.0.0:{port}")
 
-    n = len(items)
-    cols = int(np.ceil(np.sqrt(n)))
-    rows = int(np.ceil(n / cols))
-    xs, ys = [], []
-    for i in range(n):
-        r = i // cols
-        c = i % cols
-        xs.append(c)
-        ys.append(rows - 1 - r)
-    xs = np.array(xs); ys = np.array(ys)
-
-    colors = ["#16a34a" if it["pct24"] > 0.5 else ("#dc2626" if it["pct24"] < -0.5 else "#6b7280") for it in items]
-    labels = [f"{it['symbol']}\n{it['pct24']:+.1f}%" for it in items]
-
-    fig = plt.figure(figsize=(12,7), dpi=160)
-    ax = fig.add_subplot(111)
-    ax.set_facecolor("#0b1020"); fig.patch.set_facecolor("#0b1020")
-    ax.scatter(xs, ys, s=s, c=colors, alpha=0.85)
-    for x, y, lab in zip(xs, ys, labels):
-        ax.text(x, y, lab, ha="center", va="center", color="white", fontsize=9, weight="bold")
-    ax.set_xticks([]); ax.set_yticks([])
-    ax.set_xlim(-0.8, cols-0.2); ax.set_ylim(-0.2, rows-0.2)
-    ax.set_title("Daily Bubbles (Bybit WS, 24h% | size ~ turnover24h)", color="white", fontsize=14)
-    fig.tight_layout()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
-    plt.close(fig)
-    return buf.getvalue()
-
-# ========= HANDLERS =========
-@router.message(F.text == "/start")
+# ============== HANDLERS ==============
+@dp.message(Command("start"))
 async def cmd_start(m: Message):
-    await m.answer(
-        "🧭 <b>Market mood</b>\n"
-        "BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)\n\n"
-        f"Добро пожаловать в <b>Innertrade Screener</b> {VERSION} (Bybit WS).",
-        reply_markup=bottom_menu()
-    )
+    await m.answer(header_text() + f"\n\nДобро пожаловать в <b>Innertrade Screener</b> {VERSION} (Bybit WS).",
+                   reply_markup=bottom_menu())
 
-@router.message(F.text == "/menu")
-async def cmd_menu(m: Message):
-    await m.answer("Клавиатура восстановлена.", reply_markup=bottom_menu())
-
-@router.message(F.text == "/status")
+@dp.message(Command("status"))
 async def cmd_status(m: Message):
     await m.answer(
         "<b>Status</b>\n"
-        "Mode: active | Quiet: False\n"
+        f"Mode: active | Quiet: False\n"
         "Source: Bybit (public WS)\n"
         f"Version: {VERSION}"
     )
 
-@router.message(F.text == "/diag")
+@dp.message(Command("diag"))
 async def cmd_diag(m: Message):
-    ok = {"ticker": False}
-    timeout = ClientTimeout(total=10)
-    try:
-        async with ClientSession(timeout=timeout) as s:
-            async with s.ws_connect(WS_PUBLIC_LINEAR) as ws:
-                await ws.send_str(json.dumps({"op": "subscribe", "args": ["tickers.BTCUSDT"]}))
-                for _ in range(20):
-                    msg = await ws.receive(timeout=8.0)
-                    if msg.type == WSMsgType.TEXT:
-                        data = msg.json(loads=json.loads)
-                        if isinstance(data, dict) and data.get("topic", "").startswith("tickers."):
-                            ok["ticker"] = True
-                            break
-                    elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
-                        break
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        await m.answer(f"diag\nWS public: ok=False err={html.escape(err)}")
-        return
-
-    await m.answer(f"diag\nWS public: ok={ok['ticker']}")
-
-@router.message(F.text == "📊 Активность")
-async def on_activity(m: Message):
-    await m.answer("🔥 Активность\nПодбираю данные (WS)…", reply_markup=bottom_menu())
-    data = await ws_collect_tickers(SYMBOLS, collect_secs=8.0)
-    items = [{"symbol": s, **v} for s, v in data.items() if v.get("turn24", 0.0) > 0.0]
-    if not items:
-        await m.answer("🔥 Активность\nНет данных (WS).", reply_markup=bottom_menu())
-        return
-    items.sort(key=lambda x: x["turn24"], reverse=True)
-    lines = ["🔥 <b>Активность</b> (Bybit WS)"]
-    for i, it in enumerate(items[:10], 1):
-        lines.append(f"{i}) {it['symbol']}  24h% {it['pct24']:+.2f}  | turnover24h ~ {it['turn24']:.0f}")
-    await m.answer("\n".join(lines), reply_markup=bottom_menu())
-
-@router.message(F.text == "⚡ Волатильность")
-async def on_vol(m: Message):
-    await m.answer("⚡ Волатильность\nПодбираю данные (WS)…", reply_markup=bottom_menu())
-    data = await ws_collect_tickers(SYMBOLS, collect_secs=8.0)
-    items = [{"symbol": s, **v} for s, v in data.items() if v.get("last", 0.0) > 0.0]
-    if not items:
-        await m.answer("⚡ Волатильность\nНет данных (WS).", reply_markup=bottom_menu())
-        return
-    items.sort(key=lambda x: abs(x["pct24"]), reverse=True)
-    lines = ["⚡ <b>Волатильность</b> (24h %, Bybit WS)"]
-    for i, it in enumerate(items[:10], 1):
-        lines.append(f"{i}) {it['symbol']}  24h% {it['pct24']:+.2f}  | last {it['last']}")
-    await m.answer("\n".join(lines), reply_markup=bottom_menu())
-
-@router.message(F.text == "📈 Тренд")
-async def on_trend(m: Message):
-    await m.answer("📈 Тренд (упрощённо по 24h%, WS)\nПодбираю данные…", reply_markup=bottom_menu())
-    data = await ws_collect_tickers(SYMBOLS, collect_secs=8.0)
-    items = [{"symbol": s, **v} for s, v in data.items() if v.get("last", 0.0) > 0.0]
-    if not items:
-        await m.answer("📈 Тренд\nНет данных (WS).", reply_markup=bottom_menu())
-        return
-    items.sort(key=lambda x: x["pct24"], reverse=True)
-    lines = ["📈 <b>Тренд</b> (упрощённо, Bybit WS)"]
-    for i, it in enumerate(items[:10], 1):
-        tag = "↑" if it["pct24"] > 0 else ("↓" if it["pct24"] < 0 else "≈")
-        lines.append(f"{i}) {it['symbol']}  {tag}  24h% {it['pct24']:+.2f}  | last {it['last']}")
-    await m.answer("\n".join(lines), reply_markup=bottom_menu())
-
-@router.message(F.text == "🫧 Bubbles")
-async def on_bubbles(m: Message):
-    await m.answer("🫧 Bubbles\nСобираю WS-тикеры…", reply_markup=bottom_menu())
-    data = await ws_collect_tickers(SYMBOLS, collect_secs=10.0)
-    items = [{"symbol": s, **v} for s, v in data.items() if v.get("turn24", 0.0) > 0.0]
-    if not items:
-        await m.answer("🫧 Bubbles\nНет данных (WS).", reply_markup=bottom_menu())
-        return
-    items.sort(key=lambda x: x["turn24"], reverse=True)
-    png = render_bubbles_png(items[:16])
-    await m.answer_photo(
-        BufferedInputFile(png, filename="bubbles_ws.png"),
-        caption="WS Bubbles (24h %, size~turnover24h)",
-        reply_markup=bottom_menu()
+    # Быстрая проверка наличия данных в БД
+    rows = await fetch_last_candles("BTCUSDT", INTERVAL, limit=5)
+    await m.answer(
+        "diag\n"
+        f"WS consumer: running (see logs)\n"
+        f"BTCUSDT candles(5m) in DB: {len(rows)}\n"
+        "tickers filled: top turnover shown in /activity"
     )
 
-@router.message(F.text == "📰 Новости")
+@dp.message(F.text == "📊 Активность")
+async def on_activity(m: Message):
+    await m.answer(header_text())
+    txt = await render_activity()
+    await m.answer(txt, reply_markup=bottom_menu())
+
+@dp.message(F.text == "⚡ Волатильность")
+async def on_vol(m: Message):
+    await m.answer(header_text())
+    txt = await render_volatility()
+    await m.answer(txt, reply_markup=bottom_menu())
+
+@dp.message(F.text == "📈 Тренд")
+async def on_trend(m: Message):
+    await m.answer(header_text())
+    txt = await render_trend()
+    await m.answer(txt, reply_markup=bottom_menu())
+
+@dp.message(F.text == "🫧 Bubbles")
+async def on_bubbles(m: Message):
+    # Пока строим по 24h% + turnover (без matplotlib картинки, чтобы не задерживать)
+    rows = await top_by_ticker("turnover24h", limit=12)
+    if not rows:
+        await m.answer("Не удалось собрать данные для Bubbles (ожидаю WS).")
+        return
+    lines = ["WS Bubbles (24h %, size~turnover24h)"]
+    for r in rows:
+        sym = r["symbol"]
+        pct = (r["price24hPcnt"] or 0.0) * 100.0
+        tov = r["turnover24h"] or 0.0
+        lines.append(f"• {sym}  {pct:+.2f}%  turnover~{int(tov):,}".replace(",", " "))
+    await m.answer("\n".join(lines), reply_markup=bottom_menu())
+
+@dp.message(F.text == "📰 Новости")
 async def on_news(m: Message):
-    await m.answer("📰 Макро (последний час)\n• demo headline", reply_markup=bottom_menu())
+    await m.answer(header_text() + "\n\n📰 <b>Макро (последний час)</b>\n• demo headline")
 
-@router.message(F.text == "🧮 Калькулятор")
+@dp.message(F.text == "🧮 Калькулятор")
 async def on_calc(m: Message):
-    await m.answer("Шаблон риск-менеджмента (встроенный Excel добавим позже).", reply_markup=bottom_menu())
+    # Заглушка: можно прикрутить генерацию Excel (openpyxl) — формулы из прежнего варианта
+    await m.answer("Шаблон риск-менеджмента (Excel) добавим по кнопке чуть позже.")
 
-@router.message(F.text == "⭐ Watchlist")
+@dp.message(F.text == "⭐ Watchlist")
 async def on_watchlist(m: Message):
-    await m.answer("Watchlist пуст. Добавь /add SYMBOL (например, /add SOLUSDT)", reply_markup=bottom_menu())
+    await m.answer("Watchlist пуст. (/add в этой версии ещё не подключён)")
 
-@router.message(F.text == "⚙️ Настройки")
+@dp.message(F.text == "⚙️ Настройки")
 async def on_settings(m: Message):
     await m.answer(
-        "⚙️ Настройки\nБиржа: Bybit (USDT perp, WS)\nРежим: active | Quiet: False\nWatchlist: —\n\n"
+        "⚙️ Настройки\n"
+        "Биржа: Bybit (USDT perp, WS)\n"
+        "Режим: active | Quiet: False\n"
+        "Watchlist: —\n\n"
         "Команды:\n"
-        "• /add SYMBOL  — добавить (например, /add SOLUSDT)\n"
-        "• /rm SYMBOL   — удалить\n"
-        "• /watchlist   — показать лист\n"
-        "• /passive     — автосводки/сигналы ON\n"
-        "• /active      — автосводки/сигналы OFF\n"
-        "• /menu        — восстановить клавиатуру",
-        reply_markup=bottom_menu()
+        "• /status — состояние\n"
+        "• /diag   — диагностика\n"
+        "• /menu   — восстановить клавиатуру"
     )
 
-dp.include_router(router)
+@dp.message(Command("menu"))
+async def cmd_menu(m: Message):
+    await m.answer("Клавиатура восстановлена.", reply_markup=bottom_menu())
 
-# ========= AIOHTTP (health + webhook) =========
-async def handle_health(request):
-    return web.json_response({"ok": True, "service": "innertrade-screener", "version": VERSION, "source": "bybit-ws"})
+# ============== ENTRYPOINT ==============
+async def main():
+    await db_init()
+    await start_http_server()
 
-WEBHOOK_PATH = f"/webhook/{TELEGRAM_TOKEN}"
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
-
-app = web.Application()
-app.router.add_get("/health", handle_health)
-
-async def on_startup():
+    # Webhook
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-    await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"Webhook set to: {WEBHOOK_URL}")
+    webhook_url = f"{BASE_URL}/webhook/{TELEGRAM_TOKEN}"
+    allowed = dp.resolve_used_update_types()
+    await bot.set_webhook(webhook_url, allowed_updates=allowed)
+    logging.info(f"Webhook set to: {webhook_url}")
 
-async def main():
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
+    # WS consumer
+    asyncio.create_task(ws_consumer())
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-    await on_startup()
-    logging.info("HTTP server started")
-    await asyncio.Event().wait()
+    # keep running
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
