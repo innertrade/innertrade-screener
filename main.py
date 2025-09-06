@@ -1,8 +1,8 @@
+# main.py
 import os
 import asyncio
 import logging
 from io import BytesIO
-from statistics import mean
 from time import time
 from datetime import datetime
 import contextlib
@@ -24,15 +24,20 @@ from aiogram.types import (
 
 from aiohttp import web
 from dotenv import load_dotenv
+
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 
 # ---------------- ENV & CONFIG ----------------
 load_dotenv()
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+BASE_URL = (os.getenv("BASE_URL") or "").rstrip("/")
 TZ = os.getenv("TZ", "Europe/Moscow")
+
+# По умолчанию используем альтернативный хост Bybit, который обычно доступен из РФ/СНГ.
 BYBIT_HOST = os.getenv("BYBIT_HOST", "https://api.bytick.com").rstrip("/")
+
 VERSION = "v0.8-fast"
 
 if not TOKEN:
@@ -49,8 +54,8 @@ dp = Dispatcher()
 REQUEST_TIMEOUT = 20
 HTTP_HEADERS = {"User-Agent": "InnertradeScreener/1.0 (+render.com)"}
 
-# Набор символов по умолчанию (можно расширять командой /add)
-SYMBOLS_BYBIT: list[str] = [
+# Базовый список ликвидных символов линейных USDT-перпетуалов
+SYMBOLS_BYBIT = [
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT",
     "DOGEUSDT","ADAUSDT","LINKUSDT","TRXUSDT","TONUSDT","ARBUSDT","OPUSDT"
 ]
@@ -77,12 +82,14 @@ def ensure_user(uid: int) -> dict:
 
 # ---------------- SIMPLE CACHE ----------------
 CACHE: dict[str, tuple[float, str]] = {}
+
 def cache_get(key: str, ttl: int):
     item = CACHE.get(key)
     if not item:
         return None
     ts, val = item
     return val if (time() - ts) < ttl else None
+
 def cache_set(key: str, val: str):
     CACHE[key] = (time(), val)
 
@@ -94,37 +101,56 @@ async def render_header_text() -> str:
     )
 
 # ---------------- HTTP HELPERS ----------------
-async def http_get_json(session: aiohttp.ClientSession, url: str, params: dict | None = None):
-    for attempt in range(4):
+async def http_get(session: aiohttp.ClientSession, url: str, params: dict | None = None):
+    """Возвращает (status, text) либо (None, '') при сетевых проблемах."""
+    for attempt in range(3):
         try:
             async with session.get(url, params=params, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT) as r:
                 text = await r.text()
                 if r.status != 200:
-                    logging.warning(f"[HTTP {r.status}] {url} {params} -> {text[:160]}")
-                    await asyncio.sleep(0.6 + 0.3*attempt)
-                    continue
-                try:
-                    return await r.json()
-                except Exception as e:
-                    logging.warning(f"[JSON ERR] {url} -> {e}")
-                    await asyncio.sleep(0.4)
+                    logging.warning(f"[HTTP {r.status}] {url} {params} -> {text[:180]}")
+                return r.status, text
         except Exception as e:
             logging.warning(f"[REQ ERR] {url} {params} -> {e}")
-            await asyncio.sleep(0.8 + 0.2*attempt)
-    return None
+            await asyncio.sleep(0.8 + 0.3*attempt)
+    return None, ""
+
+async def http_get_json(session: aiohttp.ClientSession, url: str, params: dict | None = None):
+    """Возвращает JSON или None. Логирует статус/ошибки."""
+    status, text = await http_get(session, url, params)
+    if status != 200:
+        return None
+    try:
+        return await session._json_decoder(text)  # внутренний json decoder aiohttp
+    except Exception:
+        # запасной путь
+        import json as _json
+        try:
+            return _json.loads(text)
+        except Exception as e:
+            logging.warning(f"[JSON ERR] {url} -> {e}")
+            return None
 
 # ---------------- BYBIT PROVIDERS ----------------
+def _kline_url():
+    return f"{BYBIT_HOST}/v5/market/kline"
+
+def _ticker_url():
+    return f"{BYBIT_HOST}/v5/market/tickers"
+
 async def bybit_klines(session: aiohttp.ClientSession, symbol: str, interval_minutes: int, limit: int):
-    interval = str(interval_minutes) if interval_minutes in (1,3,5,15,30,60,120,240,360,720) else "5"
-    url = f"{BYBIT_HOST}/v5/market/kline"
+    # Bybit принимает интервалы: 1,3,5,15,30,60,120,240,360,720 (строкой)
+    interval = str(interval_minutes if interval_minutes in (1,3,5,15,30,60,120,240,360,720) else 5)
+    url = _kline_url()
     params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": str(limit)}
     return await http_get_json(session, url, params)
 
 async def bybit_ticker(session: aiohttp.ClientSession, symbol: str):
-    url = f"{BYBIT_HOST}/v5/market/tickers"
+    url = _ticker_url()
     params = {"category": "linear", "symbol": symbol}
     return await http_get_json(session, url, params)
 
+# ---------------- SAFE PARSE ----------------
 def parse_bybit_row(row):
     # row = [start, open, high, low, close, volume, turnover, ...]
     try:
@@ -135,6 +161,8 @@ def parse_bybit_row(row):
         return 0,0,0,0,0,0
 
 # ---------------- INDICATORS ----------------
+from statistics import mean
+
 def moving_average(values, length):
     if not values or len(values) < length:
         return None
@@ -159,25 +187,23 @@ def slope(values, lookback: int = 10):
         return 0.0
     return mean(values[-lookback:]) - mean(values[-2*lookback:-lookback])
 
-# ---------------- SCREENER BUILDERS (быстрые и частичные) ----------------
-async def build_activity_bybit(session: aiohttp.ClientSession, symbols: list[str]) -> list[dict]:
+# ---------------- SCREENER BUILDERS ----------------
+async def build_activity_bybit(session: aiohttp.ClientSession) -> list[dict]:
     async def fetch(sym: str):
         try:
-            # Урезали лимиты ради скорости
-            k5 = await bybit_klines(session, sym, 5, 120)
-            k1h = await bybit_klines(session, sym, 60, 48)
+            k5 = await bybit_klines(session, sym, 5, 220)
+            k1h = await bybit_klines(session, sym, 60, 180)
             return sym, k5, k1h
         except Exception as e:
             logging.warning(f"[fetch_act ERR] {sym} -> {e}")
             return sym, None, None
 
-    tasks = [asyncio.create_task(fetch(s)) for s in symbols]
-    raw = await asyncio.gather(*tasks)
+    raw = await asyncio.gather(*[asyncio.create_task(fetch(s)) for s in SYMBOLS_BYBIT])
     out = []
     for sym, k5, k1h in raw:
         l5 = (k5 or {}).get("result", {}).get("list", [])
         l1h = (k1h or {}).get("result", {}).get("list", [])
-        if len(l5) < 25 or len(l1h) < 24:
+        if len(l5) < 20 or len(l1h) < 24:
             continue
         rows5 = [parse_bybit_row(r) for r in l5]
         rows1h = [parse_bybit_row(r) for r in l1h]
@@ -196,18 +222,18 @@ async def build_activity_bybit(session: aiohttp.ClientSession, symbols: list[str
     out.sort(key=lambda x: x["vol_mult"], reverse=True)
     return out[:10]
 
-async def build_volatility_bybit(session: aiohttp.ClientSession, symbols: list[str]) -> list[dict]:
+async def build_volatility_bybit(session: aiohttp.ClientSession) -> list[dict]:
     async def fetch(sym: str):
         try:
-            k5 = await bybit_klines(session, sym, 5, 200)
+            k5 = await bybit_klines(session, sym, 5, 260)
             return sym, k5
         except Exception as e:
             logging.warning(f"[fetch_vol ERR] {sym} -> {e}")
             return sym, None
 
-    raw = await asyncio.gather(*[asyncio.create_task(fetch(s)) for s in symbols])
+    raws = await asyncio.gather(*[asyncio.create_task(fetch(s)) for s in SYMBOLS_BYBIT])
     out = []
-    for sym, k5 in raw:
+    for sym, k5 in raws:
         l5 = (k5 or {}).get("result", {}).get("list", [])
         if len(l5) < 60:
             continue
@@ -227,18 +253,18 @@ async def build_volatility_bybit(session: aiohttp.ClientSession, symbols: list[s
     out.sort(key=lambda x: x["atr_pct"], reverse=True)
     return out[:10]
 
-async def build_trend_bybit(session: aiohttp.ClientSession, symbols: list[str]) -> list[dict]:
+async def build_trend_bybit(session: aiohttp.ClientSession) -> list[dict]:
     async def fetch(sym: str):
         try:
-            k5 = await bybit_klines(session, sym, 5, 300)
+            k5 = await bybit_klines(session, sym, 5, 400)
             return sym, k5
         except Exception as e:
             logging.warning(f"[fetch_trend ERR] {sym} -> {e}")
             return sym, None
 
-    raw = await asyncio.gather(*[asyncio.create_task(fetch(s)) for s in symbols])
+    raws = await asyncio.gather(*[asyncio.create_task(fetch(s)) for s in SYMBOLS_BYBIT])
     res = []
-    for sym, k5 in raw:
+    for sym, k5 in raws:
         l5 = (k5 or {}).get("result", {}).get("list", [])
         if len(l5) < 220:
             continue
@@ -259,55 +285,23 @@ async def build_trend_bybit(session: aiohttp.ClientSession, symbols: list[str]) 
     res.sort(key=lambda x: (x["above200"], x["above360"], x["slope200"]), reverse=True)
     return res[:10]
 
-# ---------------- RENDERERS (кеш + частичная отдача) ----------------
-def bottom_menu_kb()->ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📊 Активность"), KeyboardButton(text="⚡ Волатильность")],
-            [KeyboardButton(text="📈 Тренд"),      KeyboardButton(text="🫧 Bubbles")],
-            [KeyboardButton(text="📰 Новости"),    KeyboardButton(text="🧮 Калькулятор")],
-            [KeyboardButton(text="⭐ Watchlist"),   KeyboardButton(text="⚙️ Настройки")],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Выберите раздел…",
-    )
-
+# ---------------- RENDERERS (fast/soft) ----------------
 async def render_activity_text() -> str:
     key = "activity:bybit"
     cached = cache_get(key, ttl=45)
     if cached:
         return cached
-    items: list[dict] = []
+    items = []
     try:
         async with aiohttp.ClientSession() as s:
-            # ограничим список для скорости: сначала топ-8 базовых
-            base = [x for x in SYMBOLS_BYBIT if x in ("BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","DOGEUSDT","ADAUSDT","LINKUSDT")]
-            items = await build_activity_bybit(s, base)
-            # Догрузка остального без ожидания пользователя (не блокирует ответ)
-            async def warm_cache_rest():
-                rest = [x for x in SYMBOLS_BYBIT if x not in base]
-                if not rest:
-                    return
-                try:
-                    more = await build_activity_bybit(s, rest)
-                    merged = (items + more)[:10]
-                    lines = ["\n🔥 <b>Активность</b> (Bybit)"]
-                    for i, r in enumerate(merged, 1):
-                        lines.append(f"{i}) {r['symbol']} ({r['venue']}) Vol x{r['vol_mult']:.1f} | 24h vs 7d: {r['share24']}%")
-                    cache_set(key, "\n".join(lines))
-                except Exception as e:
-                    logging.warning(f"[warm_cache_rest ACT] {e}")
-            asyncio.create_task(warm_cache_rest())
+            items = await build_activity_bybit(s)
     except Exception as e:
         logging.warning(f"[ACTIVITY ERR] {e}")
-
     if not items:
-        txt = "\n🔥 <b>Активность</b>\nНет данных (тихо/таймаут/лимиты)."
+        txt = "🔥 <b>Активность</b>\nНет данных (тихо/таймаут/лимиты)."
         cache_set(key, txt)
         return txt
-
-    lines = ["\n🔥 <b>Активность</b> (Bybit)"]
+    lines = ["🔥 <b>Активность</b> (Bybit)"]
     for i, r in enumerate(items, 1):
         lines.append(f"{i}) {r['symbol']} ({r['venue']}) Vol x{r['vol_mult']:.1f} | 24h vs 7d: {r['share24']}%")
     txt = "\n".join(lines)
@@ -319,34 +313,17 @@ async def render_volatility_text() -> str:
     cached = cache_get(key, ttl=60)
     if cached:
         return cached
-    items: list[dict] = []
+    items = []
     try:
         async with aiohttp.ClientSession() as s:
-            base = [x for x in SYMBOLS_BYBIT if x in ("BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","DOGEUSDT","ADAUSDT","LINKUSDT")]
-            items = await build_volatility_bybit(s, base)
-            async def warm_cache_rest():
-                rest = [x for x in SYMBOLS_BYBIT if x not in base]
-                if not rest:
-                    return
-                try:
-                    more = await build_volatility_bybit(s, rest)
-                    merged = (items + more)[:10]
-                    lines = ["\n⚡ <b>Волатильность</b> (ATR%, 5m, Bybit)"]
-                    for i, r in enumerate(merged, 1):
-                        lines.append(f"{i}) {r['symbol']} ({r['venue']}) ATR {r['atr_pct']:.2f}% | Vol x{r['vol_mult']:.1f}")
-                    cache_set(key, "\n".join(lines))
-                except Exception as e:
-                    logging.warning(f"[warm_cache_rest VOL] {e}")
-            asyncio.create_task(warm_cache_rest())
+            items = await build_volatility_bybit(s)
     except Exception as e:
         logging.warning(f"[VOL ERR] {e}")
-
     if not items:
-        txt = "\n⚡ <b>Волатильность</b>\nНет данных."
+        txt = "⚡ <b>Волатильность</b>\nНет данных."
         cache_set(key, txt)
         return txt
-
-    lines = ["\n⚡ <b>Волатильность</b> (ATR%, 5m, Bybit)"]
+    lines = ["⚡ <b>Волатильность</b> (ATR%, 5m, Bybit)"]
     for i, r in enumerate(items, 1):
         lines.append(f"{i}) {r['symbol']} ({r['venue']}) ATR {r['atr_pct']:.2f}% | Vol x{r['vol_mult']:.1f}")
     txt = "\n".join(lines)
@@ -358,36 +335,17 @@ async def render_trend_text() -> str:
     cached = cache_get(key, ttl=60)
     if cached:
         return cached
-    items: list[dict] = []
+    items = []
     try:
         async with aiohttp.ClientSession() as s:
-            base = [x for x in SYMBOLS_BYBIT if x in ("BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","DOGEUSDT","ADAUSDT","LINKUSDT")]
-            items = await build_trend_bybit(s, base)
-            async def warm_cache_rest():
-                rest = [x for x in SYMBOLS_BYBIT if x not in base]
-                if not rest:
-                    return
-                try:
-                    more = await build_trend_bybit(s, rest)
-                    merged = (items + more)[:10]
-                    lines = ["\n📈 <b>Тренд</b> (5m, MA200/MA360, Bybit)"]
-                    for i, r in enumerate(merged, 1):
-                        pos = [">MA200" if r["above200"] else "<MA200", ">MA360" if r["above360"] else "<MA360"]
-                        slope_tag = "slope+" if r["slope200"] > 0 else ("slope-" if r["slope200"] < 0 else "slope≈")
-                        lines.append(f"{i}) {r['symbol']} ({r['venue']}) {' & '.join(pos)} | {slope_tag} | вола {r['vol_change']}")
-                    cache_set(key, "\n".join(lines))
-                except Exception as e:
-                    logging.warning(f"[warm_cache_rest TREND] {e}")
-            asyncio.create_task(warm_cache_rest())
+            items = await build_trend_bybit(s)
     except Exception as e:
         logging.warning(f"[TREND ERR] {e}")
-
     if not items:
-        txt = "\n📈 <b>Тренд</b>\nНет данных."
+        txt = "📈 <b>Тренд</b>\nНет данных."
         cache_set(key, txt)
         return txt
-
-    lines = ["\n📈 <b>Тренд</b> (5m, MA200/MA360, Bybit)"]
+    lines = ["📈 <b>Тренд</b> (5m, MA200/MA360, Bybit)"]
     for i, r in enumerate(items, 1):
         pos = [">MA200" if r["above200"] else "<MA200", ">MA360" if r["above360"] else "<MA360"]
         slope_tag = "slope+" if r["slope200"] > 0 else ("slope-" if r["slope200"] < 0 else "slope≈")
@@ -460,13 +418,30 @@ async def build_risk_excel_template()->bytes:
     ws["K2"]='=IF(UPPER(C2)="LONG",D2+G2,D2-G2)'; ws["L2"]='=IF(UPPER(C2)="LONG",D2+2*G2,D2-2*G2)'; ws["M2"]='=IF(UPPER(C2)="LONG",D2+3*G2,D2-3*G2)'
     fill = PatternFill("solid", fgColor="1f2937"); white = Font(color="FFFFFF", bold=True)
     thin = Side(style="thin", color="404040"); border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for cell in ws[1]: cell.font = white; cell.fill = fill; cell.alignment = Alignment(horizontal="center", vertical="center"); cell.border = border
+    for cell in ws[1]:
+        cell.font = white; cell.fill = fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
     for col in "ABCDEFGHIJKLM": ws.column_dimensions[col].width = 14
     ws.column_dimensions["C"].width = 18; ws.column_dimensions["A"].width = 16
     bio = BytesIO(); wb.save(bio); return bio.getvalue()
 
+# ---------------- KEYBOARDS ----------------
+def bottom_menu_kb()->ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📊 Активность"), KeyboardButton(text="⚡ Волатильность")],
+            [KeyboardButton(text="📈 Тренд"),      KeyboardButton(text="🫧 Bubbles")],
+            [KeyboardButton(text="📰 Новости"),    KeyboardButton(text="🧮 Калькулятор")],
+            [KeyboardButton(text="⭐ Watchlist"),   KeyboardButton(text="⚙️ Настройки")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите раздел…",
+    )
+
 # ---------------- HELPERS ----------------
-def settings_text(u: dict)->str:
+def settings_text(u: dict) -> str:
     wl = ", ".join(u["watchlist"]) if u["watchlist"] else "—"
     return (
         "⚙️ Настройки\n"
@@ -487,13 +462,14 @@ def settings_text(u: dict)->str:
 async def cmd_start(m: Message):
     ensure_user(m.from_user.id)
     header = await render_header_text()
-    await m.answer(header + f"\n\nДобро пожаловать в <b>Innertrade Screener</b> {VERSION} (Bybit).",
-                   reply_markup=bottom_menu_kb())
+    await m.answer(
+        header + f"\n\nДобро пожаловать в <b>Innertrade Screener</b> {VERSION} (Bybit).",
+        reply_markup=bottom_menu_kb()
+    )
 
 @dp.message(Command("menu"))
 async def cmd_menu(m: Message):
-    # Быстро восстановить клавиатуру, если пользователь удалил сообщения
-    await m.answer("Меню обновлено.", reply_markup=bottom_menu_kb())
+    await m.answer("Меню восстановлено.", reply_markup=bottom_menu_kb())
 
 @dp.message(Command("status"))
 async def cmd_status(m: Message):
@@ -507,62 +483,53 @@ async def cmd_status(m: Message):
         "Source: Bybit (linear USDT)\n"
         f"Watchlist: {wl}\n"
         "Webhook: ON\n"
-        f"Version: {VERSION}",
-        reply_markup=bottom_menu_kb()
+        f"Version: {VERSION}"
     )
 
 @dp.message(Command("diag"))
 async def cmd_diag(m: Message):
-    sym = "BTCUSDT"
-    status_k = "None"; status_t = "None"; body_k = ""; body_t = ""
-    try:
-        async with aiohttp.ClientSession() as s:
-            k5 = await bybit_klines(s, sym, 5, 50)
-            tkr = await bybit_ticker(s, sym)
-            # Попробуем вынуть «статус»
-            if isinstance(k5, dict):
-                status_k = "OK" if k5.get("retCode", 0) == 0 else str(k5.get("retCode"))
-                body_k = str(k5)[:200]
-            if isinstance(tkr, dict):
-                status_t = "OK" if tkr.get("retCode", 0) == 0 else str(tkr.get("retCode"))
-                body_t = str(tkr)[:200]
-    except Exception as e:
-        logging.warning(f"[DIAG ERR] {e}")
-    await m.answer(f"diagnet\nkline: status={status_k} body[:200]={body_k}\n"
-                   f"ticker: status={status_t} body[:200]={body_t}",
-                   reply_markup=bottom_menu_kb())
+    # краткая проверка доступности
+    async with aiohttp.ClientSession() as s:
+        tk = await bybit_ticker(s, "BTCUSDT")
+    lst = (tk or {}).get("result", {}).get("list", [])
+    await m.answer(f"Diag BTCUSDT: ticker={'OK' if lst else 'EMPTY'}")
 
-# --- Быстрые ответы с частичной загрузкой (сначала скелет, потом редактируем) ---
-async def _send_with_progress(m: Message, title: str, builder_coro):
-    header = await render_header_text()
-    placeholder = await m.answer(header + f"\n\n{title}\nПодбираю данные…", reply_markup=bottom_menu_kb())
-    try:
-        # Ограничим общее ожидание сборки
-        body = await asyncio.wait_for(builder_coro(), timeout=12.0)
-        await placeholder.edit_text(header + "\n" + body, reply_markup=bottom_menu_kb())
-    except asyncio.TimeoutError:
-        await placeholder.edit_text(header + f"\n\n{title}\nТаймаут. Попробуйте ещё раз.", reply_markup=bottom_menu_kb())
-    except Exception as e:
-        logging.warning(f"[SEND_WITH_PROGRESS ERR] {e}")
-        await placeholder.edit_text(header + f"\n\n{title}\nОшибка. Попробуйте позже.", reply_markup=bottom_menu_kb())
+@dp.message(Command("diagnet"))
+async def cmd_diagnet(m: Message):
+    # расширенная диагностика: статус-коды сырьём
+    async with aiohttp.ClientSession() as s:
+        # kline
+        url_k = _kline_url()
+        params_k = {"category": "linear", "symbol": "BTCUSDT", "interval": "5", "limit": "20"}
+        ks, kt = await http_get(s, url_k, params_k)
+        # ticker
+        url_t = _ticker_url()
+        params_t = {"category":"linear", "symbol":"BTCUSDT"}
+        ts, tt = await http_get(s, url_t, params_t)
+    msg = (
+        "diagnet\n"
+        f"kline: status={ks} body[:200]={kt[:200] if kt else ''}\n"
+        f"ticker: status={ts} body[:200]={tt[:200] if tt else ''}"
+    )
+    await m.answer(msg)
 
 @dp.message(F.text == "📊 Активность")
 async def on_activity(m: Message):
-    async def builder():
-        return await render_activity_text()
-    await _send_with_progress(m, "🔥 Активность", builder)
+    header = await render_header_text()
+    body = await render_activity_text()
+    await m.answer(header + "\n\n" + body, reply_markup=bottom_menu_kb())
 
 @dp.message(F.text == "⚡ Волатильность")
 async def on_vol(m: Message):
-    async def builder():
-        return await render_volatility_text()
-    await _send_with_progress(m, "⚡ Волатильность", builder)
+    header = await render_header_text()
+    body = await render_volatility_text()
+    await m.answer(header + "\n\n" + body, reply_markup=bottom_menu_kb())
 
 @dp.message(F.text == "📈 Тренд")
 async def on_trend(m: Message):
-    async def builder():
-        return await render_trend_text()
-    await _send_with_progress(m, "📈 Тренд", builder)
+    header = await render_header_text()
+    body = await render_trend_text()
+    await m.answer(header + "\n\n" + body, reply_markup=bottom_menu_kb())
 
 @dp.message(F.text == "📰 Новости")
 async def on_news(m: Message):
@@ -572,16 +539,13 @@ async def on_news(m: Message):
 
 @dp.message(F.text == "🫧 Bubbles")
 async def on_bubbles(m: Message):
-    header = await render_header_text()
-    ph = await m.answer(header + "\n\nГотовлю инфографику…", reply_markup=bottom_menu_kb())
     try:
-        header2, png = await render_bubbles_message()
+        header, png = await render_bubbles_message()
         buf = BufferedInputFile(png, filename="bubbles.png")
-        await ph.delete()
-        await m.answer_photo(photo=buf, caption=header2, reply_markup=bottom_menu_kb())
+        await m.answer_photo(photo=buf, caption=header, reply_markup=bottom_menu_kb())
     except Exception as e:
         logging.warning(f"[BUBBLES ERR] {e}")
-        await ph.edit_text(header + "\n\nНе удалось построить Bubbles (попробуйте позже).", reply_markup=bottom_menu_kb())
+        await m.answer("Не удалось построить Bubbles (проверь логи).", reply_markup=bottom_menu_kb())
 
 @dp.message(F.text == "🧮 Калькулятор")
 async def on_calc(m: Message):
@@ -610,7 +574,7 @@ async def on_settings(m: Message):
 async def cmd_add(m: Message):
     parts = m.text.split()
     if len(parts) < 2:
-        await m.answer("Формат: /add SYMBOL (например /add SOLUSDT)", reply_markup=bottom_menu_kb())
+        await m.answer("Формат: /add SYMBOL (например /add SOLUSDT)")
         return
     sym = parts[1].upper()
     if not sym.endswith("USDT"):
@@ -620,21 +584,21 @@ async def cmd_add(m: Message):
         SYMBOLS_BYBIT.append(sym)
     if sym not in u["watchlist"]:
         u["watchlist"].append(sym)
-    await m.answer(f"Добавлено в Watchlist: {sym}", reply_markup=bottom_menu_kb())
+    await m.answer(f"Добавлено в Watchlist: {sym}")
 
 @dp.message(Command("rm"))
 async def cmd_rm(m: Message):
     parts = m.text.split()
     if len(parts) < 2:
-        await m.answer("Формат: /rm SYMBOL (например /rm SOLUSDT)", reply_markup=bottom_menu_kb())
+        await m.answer("Формат: /rm SYMBOL (например /rm SOLUSDT)")
         return
     sym = parts[1].upper()
     u = ensure_user(m.from_user.id)
     if sym in u["watchlist"]:
         u["watchlist"].remove(sym)
-        await m.answer(f"Удалено из Watchlist: {sym}", reply_markup=bottom_menu_kb())
+        await m.answer(f"Удалено из Watchlist: {sym}")
     else:
-        await m.answer(f"{sym} не найден в Watchlist", reply_markup=bottom_menu_kb())
+        await m.answer(f"{sym} не найден в Watchlist")
 
 @dp.message(Command("watchlist"))
 async def cmd_watchlist(m: Message):
@@ -648,13 +612,13 @@ async def cmd_watchlist(m: Message):
 async def cmd_passive(m: Message):
     u = ensure_user(m.from_user.id)
     u["mode"] = "passive"
-    await m.answer("Пассивный режим включен (автосигналы).", reply_markup=bottom_menu_kb())
+    await m.answer("Пассивный режим включен (автосигналы).")
 
 @dp.message(Command("active"))
 async def cmd_active(m: Message):
     u = ensure_user(m.from_user.id)
     u["mode"] = "active"
-    await m.answer("Пассивный режим выключен.", reply_markup=bottom_menu_kb())
+    await m.answer("Пассивный режим выключен.")
 
 # ---------------- PASSIVE STREAM / ALERTS ----------------
 async def fetch_watchlist_snapshot(symbols: list[str]) -> dict:
@@ -697,7 +661,7 @@ async def passive_loop():
             try:
                 header = await render_header_text()
                 body = await render_activity_text()
-                await bot.send_message(uid, header + "\n" + body, reply_markup=bottom_menu_kb())
+                await bot.send_message(uid, header + "\n\n" + body)
             except Exception as e:
                 logging.warning(f"[PASSIVE DIGEST ERR] {e}")
             wl = st.get("watchlist", [])
@@ -721,7 +685,7 @@ async def passive_loop():
                                 st["last_alert"][sym] = now_ts
                                 msg = f"🔔 <b>{sym}</b> — " + ", ".join(reasons)
                                 with contextlib.suppress(Exception):
-                                    await bot.send_message(uid, msg, reply_markup=bottom_menu_kb())
+                                    await bot.send_message(uid, msg)
                 except Exception as e:
                     logging.warning(f"[PASSIVE WL ERR] {e}")
         await asyncio.sleep(900)
@@ -756,13 +720,16 @@ async def start_http_server():
 # ---------------- ENTRYPOINT ----------------
 async def main():
     await start_http_server()
+    # Сброс вебхука на всякий случай
     with contextlib.suppress(Exception):
         await bot.delete_webhook(drop_pending_updates=True)
     webhook_url = f"{BASE_URL}/webhook/{TOKEN}"
     allowed = dp.resolve_used_update_types()
     await bot.set_webhook(webhook_url, allowed_updates=allowed)
     logging.info(f"Webhook set to: {webhook_url}")
+    # пассивные рассылки
     asyncio.create_task(passive_loop())
+    # держим процесс живым
     while True:
         await asyncio.sleep(3600)
 
