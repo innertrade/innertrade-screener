@@ -1,117 +1,129 @@
 import os
-import aiohttp
 import asyncio
 import logging
-import pytz
-from datetime import datetime
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from dotenv import load_dotenv
-import hmac
-import hashlib
-import time
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiohttp import ClientSession
 
-# ---------------------------
-# Настройки
-# ---------------------------
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-BYBIT_HOST = os.getenv("BYBIT_HOST", "https://api.bybit.com")
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-TZ = os.getenv("TZ", "Europe/Moscow")
-
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
-dp = Dispatcher()
+# Логирование
 logging.basicConfig(level=logging.INFO)
 
-HTTP_HEADERS = {"User-Agent": "InnertradeScreener/0.9 (+render.com)"}
+# Переменные окружения
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+BYBIT_KEY = os.getenv("BYBIT_KEY")
+BYBIT_SECRET = os.getenv("BYBIT_SECRET")
+BYBIT_HOST = os.getenv("BYBIT_HOST", "https://api.bybit.com")
 
+# Инициализация бота и диспетчера
+bot = Bot(
+    token=TELEGRAM_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
+dp = Dispatcher()
 
-# ---------------------------
-# Вспомогательные
-# ---------------------------
-def _sign(params: dict) -> dict:
-    """Подпись для приватных запросов Bybit"""
-    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        return params
-    ts = str(int(time.time() * 1000))
-    params["api_key"] = BYBIT_API_KEY
-    params["timestamp"] = ts
-    sorted_params = "&".join([f"{k}={params[k]}" for k in sorted(params)])
-    sign = hmac.new(BYBIT_API_SECRET.encode(), sorted_params.encode(), hashlib.sha256).hexdigest()
-    params["sign"] = sign
-    return params
+# HTTP headers
+HTTP_HEADERS = {"User-Agent": "InnertradeScreener/1.0 (+render.com)"}
 
+# Главное меню
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 Активность"), KeyboardButton(text="⚡ Волатильность")],
+        [KeyboardButton(text="📈 Тренд"), KeyboardButton(text="🫧 Bubbles")],
+        [KeyboardButton(text="📰 Новости"), KeyboardButton(text="🧮 Калькулятор")],
+        [KeyboardButton(text="⭐ Watchlist"), KeyboardButton(text="⚙️ Настройки")],
+    ],
+    resize_keyboard=True
+)
 
-async def fetch_json(session, url, params=None, private=False):
-    try:
-        if private and BYBIT_API_KEY and BYBIT_API_SECRET:
-            params = _sign(params or {})
-        async with session.get(url, params=params, headers=HTTP_HEADERS, timeout=10) as r:
-            return await r.json()
-    except Exception as e:
-        logging.error(f"fetch_json error {url}: {e}")
-        return None
-
-
-# ---------------------------
-# Хэндлеры
-# ---------------------------
-@dp.message(commands=["start"])
-async def cmd_start(message: types.Message):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("📊 Активность"), KeyboardButton("⚡ Волатильность"))
-    kb.add(KeyboardButton("📈 Тренд"), KeyboardButton("🫧 Bubbles"))
-    kb.add(KeyboardButton("📰 Новости"), KeyboardButton("🧮 Калькулятор"))
-    kb.add(KeyboardButton("⭐ Watchlist"), KeyboardButton("⚙️ Настройки"))
-
+# /start
+@dp.message(F.text == "/start")
+async def cmd_start(message: Message):
     await message.answer(
-        f"🧭 <b>Market mood</b>\nBTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)\n\n"
-        f"Добро пожаловать в Innertrade Screener v0.9-with-keys (Bybit).",
-        reply_markup=kb,
+        "🧭 <b>Market mood</b>\nBTC.D: — | Funding avg: — | F&G: —\n\n"
+        "Добро пожаловать в <b>Innertrade Screener</b> v0.9-beta (Bybit).",
+        reply_markup=main_kb
     )
 
-
-@dp.message(commands=["diag"])
-async def cmd_diag(message: types.Message):
-    async with aiohttp.ClientSession() as session:
-        # свечи BTCUSDT
-        kline = await fetch_json(
-            session,
-            f"{BYBIT_HOST}/v5/market/kline",
-            params={"symbol": "BTCUSDT", "interval": "5", "limit": "2"},
-            private=True,
+# 📊 Активность
+@dp.message(F.text == "📊 Активность")
+async def activity(message: Message):
+    async with ClientSession() as session:
+        url = f"{BYBIT_HOST}/v5/market/tickers?category=linear&symbol=BTCUSDT"
+        async with session.get(url, headers=HTTP_HEADERS) as resp:
+            data = await resp.json()
+    if "result" in data and "list" in data["result"]:
+        ticker = data["result"]["list"][0]
+        text = (
+            f"📊 <b>Активность</b>\n"
+            f"Symbol: {ticker['symbol']}\n"
+            f"Last Price: {ticker['lastPrice']}\n"
+            f"24h Volume: {ticker['turnover24h']}"
         )
-        # тикер BTCUSDT
-        ticker = await fetch_json(
-            session,
-            f"{BYBIT_HOST}/v5/market/tickers",
-            params={"category": "linear", "symbol": "BTCUSDT"},
-            private=True,
-        )
+    else:
+        text = "📊 Активность\nНет данных (API пустой)."
+    await message.answer(text)
 
+# ⚡ Волатильность
+@dp.message(F.text == "⚡ Волатильность")
+async def volatility(message: Message):
+    await message.answer("⚡ Волатильность\n(Заглушка — данные будут позже).")
+
+# 📈 Тренд
+@dp.message(F.text == "📈 Тренд")
+async def trend(message: Message):
+    await message.answer("📈 Тренд\n(Заглушка — данные будут позже).")
+
+# 🫧 Bubbles
+@dp.message(F.text == "🫧 Bubbles")
+async def bubbles(message: Message):
+    await message.answer("🫧 Bubbles\n(Заглушка — инфографика позже).")
+
+# 📰 Новости
+@dp.message(F.text == "📰 Новости")
+async def news(message: Message):
+    await message.answer("📰 Макро (последний час)\n• CPI (US) 3.1% vs 3.2% прогноз — риск-он")
+
+# 🧮 Калькулятор
+@dp.message(F.text == "🧮 Калькулятор")
+async def calc(message: Message):
+    await message.answer("Шаблон риск-менеджмента")
+
+# ⭐ Watchlist
+@dp.message(F.text == "⭐ Watchlist")
+async def watchlist(message: Message):
+    await message.answer("Watchlist пуст. Добавь /add SYMBOL (например, /add SOLUSDT)")
+
+# ⚙️ Настройки
+@dp.message(F.text == "⚙️ Настройки")
+async def settings(message: Message):
     await message.answer(
-        f"Diag BTCUSDT:\n"
-        f"kline: {kline if kline else 'None'}\n\n"
-        f"ticker: {ticker if ticker else 'None'}"
+        "⚙️ Настройки\n"
+        "Биржа: Bybit (USDT perp)\n"
+        "Режим: active | Quiet: False\n"
+        "Watchlist: —\n\n"
+        "Команды:\n"
+        "• /add SYMBOL  — добавить (например, /add SOLUSDT)\n"
+        "• /rm SYMBOL   — удалить\n"
+        "• /watchlist   — показать лист\n"
+        "• /passive     — автосводки/сигналы ON\n"
+        "• /active      — автосводки/сигналы OFF\n"
+        "• /menu        — восстановить клавиатуру"
     )
 
+# Health-check endpoint
+from aiohttp import web
+async def health(request):
+    return web.Response(text='ok')
 
-@dp.message(commands=["status"])
-async def cmd_status(message: types.Message):
-    now = datetime.now(pytz.timezone(TZ)).strftime("%Y-%m-%d %H:%M:%S")
-    await message.answer(
-        f"Status\nTime: {now}\nMode: active | Quiet: False\nSource: Bybit\n"
-        f"Webhook: ON\nVersion: v0.9-with-keys\nHost: {BYBIT_HOST}\n"
-        f"API: {'ON' if BYBIT_API_KEY else 'OFF'}"
-    )
-
-
-# ---------------------------
-# Запуск
-# ---------------------------
 async def main():
+    app = web.Application()
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080)))
+    await site.start()
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
