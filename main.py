@@ -13,7 +13,6 @@ from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup, Buffered
 from aiogram.client.default import DefaultBotProperties
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# Для пузырьков
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -24,7 +23,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
-VERSION = "v0.8.6-websocket"
+VERSION = "v0.8.7-websocket"
 WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
 
 if not TELEGRAM_TOKEN:
@@ -32,7 +31,6 @@ if not TELEGRAM_TOKEN:
 if not BASE_URL.startswith("https://"):
     raise RuntimeError("BASE_URL must be your public https URL, e.g. https://<service>.onrender.com")
 
-# Набор символов
 SYMBOLS = [
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT",
     "DOGEUSDT","ADAUSDT","LINKUSDT","TRXUSDT","TONUSDT",
@@ -60,13 +58,38 @@ def bottom_menu() -> ReplyKeyboardMarkup:
     )
 
 # ========= WS HELPERS =========
-async def ws_collect_tickers(symbols: List[str], collect_secs: float = 4.0) -> Dict[str, Dict[str, Any]]:
+def _ingest_ticker_payload(out: Dict[str, Dict[str, Any]], payload: Dict[str, Any]):
+    """Сливаем тикер в out, выбирая 'лучшие' ненулевые значения."""
+    sym = payload.get("symbol")
+    if not sym:
+        return
+    try:
+        last = float(payload.get("lastPrice", 0.0))
+    except Exception:
+        last = 0.0
+    try:
+        pct = float(payload.get("price24hPcnt", 0.0)) * 100.0
+    except Exception:
+        pct = 0.0
+    try:
+        turn = float(payload.get("turnover24h", 0.0))
+    except Exception:
+        turn = 0.0
+
+    cur = out.get(sym, {"last": 0.0, "pct24": 0.0, "turn24": 0.0})
+    # выбираем «лучшее»: ненулевое > нулевого; по turn24 — большее информативнее
+    best_last = last if (last != 0.0 or cur["last"] == 0.0) else cur["last"]
+    best_pct  = pct  if (pct  != 0.0 or cur["pct24"] == 0.0) else cur["pct24"]
+    best_turn = turn if (turn > cur["turn24"]) else cur["turn24"]
+    out[sym] = {"last": best_last, "pct24": best_pct, "turn24": best_turn}
+
+async def ws_collect_tickers(symbols: List[str], collect_secs: float = 8.0) -> Dict[str, Dict[str, Any]]:
     """
     Подключаемся к публичному WS и собираем тикеры (24ч) для заданных символов.
-    Возвращаем срез: {symbol: {"lastPrice": float, "turnover24h": float, "price24hPcnt": float}}
+    Возвращаем срез: {symbol: {"last": float, "turn24": float, "pct24": float}}
     """
     out: Dict[str, Dict[str, Any]] = {}
-    timeout = ClientTimeout(total=collect_secs + 3.0)
+    timeout = ClientTimeout(total=collect_secs + 5.0)
     sub_args = [f"tickers.{s}" for s in symbols]
 
     async with ClientSession(timeout=timeout) as s:
@@ -82,28 +105,26 @@ async def ws_collect_tickers(symbols: List[str], collect_secs: float = 4.0) -> D
                     if msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR, WSMsgType.CLOSE):
                         break
                     continue
-                data = msg.json(loads=json.loads)
+                try:
+                    data = msg.json(loads=json.loads)
+                except Exception:
+                    continue
                 if not isinstance(data, dict):
                     continue
-                if data.get("topic", "").startswith("tickers."):
-                    payload = data.get("data")
-                    if isinstance(payload, dict):
-                        sym = payload.get("symbol")
-                        if not sym:
-                            continue
-                        try:
-                            last = float(payload.get("lastPrice", 0.0))
-                            pct = float(payload.get("price24hPcnt", 0.0)) * 100.0
-                            turn = float(payload.get("turnover24h", 0.0))
-                        except Exception:
-                            continue
-                        out[sym] = {"last": last, "pct24": pct, "turn24": turn}
+                topic = data.get("topic", "")
+                if not topic.startswith("tickers."):
+                    continue
+                payload = data.get("data")
+                # Bybit может прислать либо dict, либо list (snapshot)
+                if isinstance(payload, dict):
+                    _ingest_ticker_payload(out, payload)
+                elif isinstance(payload, list):
+                    for it in payload:
+                        if isinstance(it, dict):
+                            _ingest_ticker_payload(out, it)
     return out
 
 def render_bubbles_png(items: List[Dict[str, Any]]) -> bytes:
-    """
-    items: [{"symbol":..., "pct24": float, "turn24": float}]
-    """
     buf = BytesIO()
     if not items:
         fig = plt.figure(figsize=(8,4), dpi=160)
@@ -112,13 +133,11 @@ def render_bubbles_png(items: List[Dict[str, Any]]) -> bytes:
         fig.savefig(buf, format="png"); plt.close(fig)
         return buf.getvalue()
 
-    # нормировка размера
     turns = np.array([max(1.0, it["turn24"]) for it in items], dtype=float)
     sizes = np.sqrt(turns)
     k = (8000.0 / sizes.max()) if sizes.max() > 0 else 1.0
     s = sizes * k
 
-    # сетка раскладки
     n = len(items)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
@@ -172,15 +191,14 @@ async def cmd_status(m: Message):
 
 @router.message(F.text == "/diag")
 async def cmd_diag(m: Message):
-    # Простая проверка: подписываемся на 2 темы и ждём
     ok = {"ticker": False}
-    timeout = ClientTimeout(total=8)
+    timeout = ClientTimeout(total=10)
     try:
         async with ClientSession(timeout=timeout) as s:
             async with s.ws_connect(WS_PUBLIC_LINEAR) as ws:
                 await ws.send_str(json.dumps({"op": "subscribe", "args": ["tickers.BTCUSDT"]}))
-                for _ in range(10):
-                    msg = await ws.receive(timeout=6.0)
+                for _ in range(20):
+                    msg = await ws.receive(timeout=8.0)
                     if msg.type == WSMsgType.TEXT:
                         data = msg.json(loads=json.loads)
                         if isinstance(data, dict) and data.get("topic", "").startswith("tickers."):
@@ -198,54 +216,42 @@ async def cmd_diag(m: Message):
 @router.message(F.text == "📊 Активность")
 async def on_activity(m: Message):
     await m.answer("🔥 Активность\nПодбираю данные (WS)…", reply_markup=bottom_menu())
-    data = await ws_collect_tickers(SYMBOLS, collect_secs=4.0)
-    if not data:
+    data = await ws_collect_tickers(SYMBOLS, collect_secs=8.0)
+    items = [{"symbol": s, **v} for s, v in data.items() if v.get("turn24", 0.0) > 0.0]
+    if not items:
         await m.answer("🔥 Активность\nНет данных (WS).", reply_markup=bottom_menu())
         return
-    # Топ по обороту
-    items = sorted(
-        [{"symbol": s, **v} for s, v in data.items()],
-        key=lambda x: x["turn24"],
-        reverse=True
-    )[:10]
+    items.sort(key=lambda x: x["turn24"], reverse=True)
     lines = ["🔥 <b>Активность</b> (Bybit WS)"]
-    for i, it in enumerate(items, 1):
+    for i, it in enumerate(items[:10], 1):
         lines.append(f"{i}) {it['symbol']}  24h% {it['pct24']:+.2f}  | turnover24h ~ {it['turn24']:.0f}")
     await m.answer("\n".join(lines), reply_markup=bottom_menu())
 
 @router.message(F.text == "⚡ Волатильность")
 async def on_vol(m: Message):
     await m.answer("⚡ Волатильность\nПодбираю данные (WS)…", reply_markup=bottom_menu())
-    data = await ws_collect_tickers(SYMBOLS, collect_secs=4.0)
-    if not data:
+    data = await ws_collect_tickers(SYMBOLS, collect_secs=8.0)
+    items = [{"symbol": s, **v} for s, v in data.items() if v.get("last", 0.0) > 0.0]
+    if not items:
         await m.answer("⚡ Волатильность\nНет данных (WS).", reply_markup=bottom_menu())
         return
-    # Топ по абсолютному изменению 24h%
-    items = sorted(
-        [{"symbol": s, **v} for s, v in data.items()],
-        key=lambda x: abs(x["pct24"]),
-        reverse=True
-    )[:10]
+    items.sort(key=lambda x: abs(x["pct24"]), reverse=True)
     lines = ["⚡ <b>Волатильность</b> (24h %, Bybit WS)"]
-    for i, it in enumerate(items, 1):
+    for i, it in enumerate(items[:10], 1):
         lines.append(f"{i}) {it['symbol']}  24h% {it['pct24']:+.2f}  | last {it['last']}")
     await m.answer("\n".join(lines), reply_markup=bottom_menu())
 
 @router.message(F.text == "📈 Тренд")
 async def on_trend(m: Message):
-    # Без истории по свечам по WS трудно посчитать MA/ATR за 5м — покажем срез по 24h%
     await m.answer("📈 Тренд (упрощённо по 24h%, WS)\nПодбираю данные…", reply_markup=bottom_menu())
-    data = await ws_collect_tickers(SYMBOLS, collect_secs=4.0)
-    if not data:
+    data = await ws_collect_tickers(SYMBOLS, collect_secs=8.0)
+    items = [{"symbol": s, **v} for s, v in data.items() if v.get("last", 0.0) > 0.0]
+    if not items:
         await m.answer("📈 Тренд\nНет данных (WS).", reply_markup=bottom_menu())
         return
-    items = sorted(
-        [{"symbol": s, **v} for s, v in data.items()],
-        key=lambda x: x["pct24"],
-        reverse=True
-    )[:10]
+    items.sort(key=lambda x: x["pct24"], reverse=True)
     lines = ["📈 <b>Тренд</b> (упрощённо, Bybit WS)"]
-    for i, it in enumerate(items, 1):
+    for i, it in enumerate(items[:10], 1):
         tag = "↑" if it["pct24"] > 0 else ("↓" if it["pct24"] < 0 else "≈")
         lines.append(f"{i}) {it['symbol']}  {tag}  24h% {it['pct24']:+.2f}  | last {it['last']}")
     await m.answer("\n".join(lines), reply_markup=bottom_menu())
@@ -253,12 +259,18 @@ async def on_trend(m: Message):
 @router.message(F.text == "🫧 Bubbles")
 async def on_bubbles(m: Message):
     await m.answer("🫧 Bubbles\nСобираю WS-тикеры…", reply_markup=bottom_menu())
-    data = await ws_collect_tickers(SYMBOLS, collect_secs=5.0)
-    items = [{"symbol": s, **v} for s, v in data.items()]
-    # отсортируем, чтобы крупные в начале (красиво на картинке)
+    data = await ws_collect_tickers(SYMBOLS, collect_secs=10.0)
+    items = [{"symbol": s, **v} for s, v in data.items() if v.get("turn24", 0.0) > 0.0]
+    if not items:
+        await m.answer("🫧 Bubbles\nНет данных (WS).", reply_markup=bottom_menu())
+        return
     items.sort(key=lambda x: x["turn24"], reverse=True)
     png = render_bubbles_png(items[:16])
-    await m.answer_photo(BufferedInputFile(png, filename="bubbles_ws.png"), caption="WS Bubbles (24h %, size~turnover24h)", reply_markup=bottom_menu())
+    await m.answer_photo(
+        BufferedInputFile(png, filename="bubbles_ws.png"),
+        caption="WS Bubbles (24h %, size~turnover24h)",
+        reply_markup=bottom_menu()
+    )
 
 @router.message(F.text == "📰 Новости")
 async def on_news(m: Message):
