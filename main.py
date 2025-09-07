@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, List, Union
 
 import pytz
 from aiohttp import web, ClientSession, WSMsgType, ClientTimeout
@@ -21,11 +21,11 @@ from aiogram.exceptions import TelegramNetworkError
 # ENV
 # =======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-BASE_URL = os.getenv("BASE_URL", "").strip()
+BASE_URL = os.getenv("BASE_URL", "").strip()  # например: https://innertrade-screener-bot.onrender.com
 TZ = os.getenv("TZ", "Europe/Moscow")
 BYBIT_WS = os.getenv("BYBIT_WS", "wss://stream.bybit.com/v5/public/linear")
 
-BOT_VERSION = "v0.9.3-webhook-ws"
+BOT_VERSION = "v0.9.4-webhook-ws"
 MOOD_LINE = "🧭 Market mood\nBTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)"
 
 if not TELEGRAM_TOKEN:
@@ -37,7 +37,7 @@ if not BASE_URL or not BASE_URL.startswith("http"):
 # logging
 # =======================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger(__name__)
+log = logging.getLogger("innertrade")
 
 # =======================
 # state
@@ -46,8 +46,7 @@ router = Router()
 ws_state: Dict[str, Any] = {
     "ok": False,
     "err": None,
-    "tickers": {},
-    "kline_5m": {},
+    "tickers": {},     # symbol -> {lastPrice, price24hPcnt, turnover24h}
     "symbols": [],
 }
 DEFAULT_SYMBOLS = [
@@ -81,67 +80,57 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def _safe_float(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
 def render_activity() -> str:
     items = list(ws_state["tickers"].items())
-    items.sort(key=lambda kv: float(kv[1].get("turnover24h", 0) or 0), reverse=True)
+    items.sort(key=lambda kv: _safe_float(kv[1].get("turnover24h"), 0.0), reverse=True)
     top = items[:10]
     if not top:
         return f"{MOOD_LINE}\n\n🔥 Активность\nНет данных (WS пусто)."
     lines = [MOOD_LINE, "", "🔥 Активность (Bybit WS)"]
     for i, (sym, data) in enumerate(top, 1):
-        pct = data.get("price24hPcnt")
-        t24 = data.get("turnover24h")
-        try:
-            pct_disp = f"{float(pct)*100:.2f}" if pct is not None else "0.00"
-        except Exception:
-            pct_disp = "0.00"
-        try:
-            t24_disp = f"{float(t24):,.0f}".replace(",", " ")
-        except Exception:
-            t24_disp = "0"
-        lines.append(f"{i}) {sym}  24h% {pct_disp}  | turnover24h ~ {t24_disp}")
+        pct = _safe_float(data.get("price24hPcnt"), 0.0) * 100.0
+        t24 = _safe_float(data.get("turnover24h"), 0.0)
+        t24_disp = f"{t24:,.0f}".replace(",", " ")
+        lines.append(f"{i}) {sym}  24h% {pct:+.2f}  | turnover24h ~ {t24_disp}")
     return "\n".join(lines)
 
 
 def render_volatility() -> str:
     items = list(ws_state["tickers"].items())
-
-    def abs_pct(v):
-        p = v[1].get("price24hPcnt")
-        try:
-            return abs(float(p) * 100.0)
-        except Exception:
-            return 0.0
-
+    def abs_pct(kv):
+        return abs(_safe_float(kv[1].get("price24hPcnt"), 0.0) * 100.0)
     items.sort(key=abs_pct, reverse=True)
     top = items[:10]
     if not top:
         return f"{MOOD_LINE}\n\n⚡ Волатильность\nНет данных."
     lines = [MOOD_LINE, "", "⚡ Волатильность (24h %, Bybit WS)"]
     for i, (sym, data) in enumerate(top, 1):
-        try:
-            pct = float(data.get("price24hPcnt", 0)) * 100.0
-            last = float(data.get("lastPrice", 0))
-            lines.append(f"{i}) {sym}  24h% {pct:+.2f}  | last {last}")
-        except Exception:
-            lines.append(f"{i}) {sym}  —")
+        pct = _safe_float(data.get("price24hPcnt"), 0.0) * 100.0
+        last = _safe_float(data.get("lastPrice"), 0.0)
+        lines.append(f"{i}) {sym}  24h% {pct:+.2f}  | last {last}")
     return "\n".join(lines)
 
 
 def render_trend() -> str:
     items = list(ws_state["tickers"].items())
-    items.sort(key=lambda kv: float(kv[1].get("price24hPcnt", 0) or 0), reverse=True)
+    items.sort(key=lambda kv: _safe_float(kv[1].get("price24hPcnt"), 0.0), reverse=True)
     top = items[:10]
     if not top:
         return f"{MOOD_LINE}\n\n📈 Тренд\nНет данных."
     lines = [MOOD_LINE, "", "📈 Тренд (упрощённо по 24h%, Bybit WS)"]
     for i, (sym, data) in enumerate(top, 1):
-        try:
-            pct = float(data.get("price24hPcnt", 0)) * 100.0
-            last = float(data.get("lastPrice", 0))
-            lines.append(f"{i}) {sym}  ≈  24h% {pct:+.2f}  | last {last}")
-        except Exception:
-            lines.append(f"{i}) {sym}  —")
+        pct = _safe_float(data.get("price24hPcnt"), 0.0) * 100.0
+        last = _safe_float(data.get("lastPrice"), 0.0)
+        lines.append(f"{i}) {sym}  ≈  24h% {pct:+.2f}  | last {last}")
     return "\n".join(lines)
 
 
@@ -241,19 +230,52 @@ async def on_settings(message: Message):
 
 
 # =======================
-# WS consumer
+# WS consumer (Bybit v5 format)
 # =======================
+def _make_subscriptions(symbols: List[str]) -> List[Dict[str, Any]]:
+    # Bybit v5 WS: args = [{"topic":"tickers","params":{"category":"linear","symbol":"BTCUSDT"}}, ...]
+    args = []
+    for sym in symbols:
+        args.append({"topic": "tickers", "params": {"category": "linear", "symbol": sym}})
+    return args
+
+
+def _ingest_ticker_payload(payload: Union[Dict[str, Any], List[Dict[str, Any]]]):
+    # data может быть словарём или списком словарей
+    if isinstance(payload, dict):
+        payload = [payload]
+    for row in payload or []:
+        sym = row.get("symbol")
+        if not sym:
+            continue
+        last = row.get("lastPrice")
+        pct = row.get("price24hPcnt")
+        t24 = row.get("turnover24h")
+
+        # В некоторых потоках Bybit отдаёт строки — приводим к float позже через _safe_float
+        rec = ws_state["tickers"].get(sym, {})
+        if last is not None:
+            rec["lastPrice"] = last
+        if pct is not None:
+            rec["price24hPcnt"] = pct
+        if t24 is not None:
+            rec["turnover24h"] = t24
+        ws_state["tickers"][sym] = rec
+        if sym not in ws_state["symbols"]:
+            ws_state["symbols"].append(sym)
+
+
 async def bybit_ws_consumer():
-    topics = [f"tickers.{sym}" for sym in DEFAULT_SYMBOLS]
-    sub_msg = {"op": "subscribe", "args": topics}
+    args = _make_subscriptions(DEFAULT_SYMBOLS)
+    sub_msg = {"op": "subscribe", "args": args}
 
     while True:
         try:
-            async with ClientSession(headers=HTTP_HEADERS, timeout=ClientTimeout(total=30)) as sess:
+            async with ClientSession(headers=HTTP_HEADERS, timeout=ClientTimeout(total=40)) as sess:
                 log.info(f"Bybit WS connecting: {BYBIT_WS}")
-                async with sess.ws_connect(BYBIT_WS, heartbeat=15) as ws:
+                async with sess.ws_connect(BYBIT_WS, heartbeat=20) as ws:
                     await ws.send_str(json.dumps(sub_msg))
-                    log.info(f"WS subscribed: {len(topics)} topics")
+                    log.info(f"WS subscribed (v5): {len(args)} tickers")
                     ws_state["ok"] = True
                     ws_state["err"] = None
 
@@ -261,17 +283,8 @@ async def bybit_ws_consumer():
                         if msg.type == WSMsgType.TEXT:
                             data = json.loads(msg.data)
                             topic = data.get("topic")
-                            if topic and topic.startswith("tickers."):
-                                payload = data.get("data") or {}
-                                sym = payload.get("symbol")
-                                if sym:
-                                    ws_state["tickers"][sym] = {
-                                        "lastPrice": payload.get("lastPrice"),
-                                        "price24hPcnt": payload.get("price24hPcnt"),
-                                        "turnover24h": payload.get("turnover24h"),
-                                    }
-                                    if sym not in ws_state["symbols"]:
-                                        ws_state["symbols"].append(sym)
+                            if topic == "tickers":
+                                _ingest_ticker_payload(data.get("data"))
                         elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSED, WSMsgType.CLOSE):
                             raise RuntimeError(str(msg.type))
         except Exception as e:
@@ -285,7 +298,6 @@ async def bybit_ws_consumer():
 # App & webhook
 # =======================
 async def set_webhook_with_retry(bot: Bot, url: str):
-    """Пробуем поставить вебхук с ретраями, чтобы разовый сетевой глюк не валил процесс."""
     delay = 2
     for attempt in range(1, 7):
         try:
@@ -307,22 +319,19 @@ async def set_webhook_with_retry(bot: Bot, url: str):
 def build_app() -> web.Application:
     app = web.Application()
 
-    # Собственная HTTP-сессия для Telegram с таймаутами
     tg_timeout = ClientTimeout(total=35, connect=10, sock_read=25)
-    tg_session = AiohttpSession(timeout=tg_timeout)  # <-- убрали trust_env
+    tg_session = AiohttpSession(timeout=tg_timeout)
 
     bot = Bot(token=TELEGRAM_TOKEN, session=tg_session, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Health
     async def health_ok(request: web.Request):
         return web.Response(text="ok", content_type="text/plain")
 
     app.router.add_get("/", health_ok)
     app.router.add_get("/health", health_ok)
 
-    # Webhook handler
     token_prefix = TELEGRAM_TOKEN.split(":", 1)[0]
     webhook_path = f"/webhook/{token_prefix}"
 
@@ -334,11 +343,9 @@ def build_app() -> web.Application:
     app["dp"] = dp
     app["webhook_url"] = f"{BASE_URL}{webhook_path}"
 
-    # startup / cleanup
     async def on_startup(app: web.Application):
         bot: Bot = app["bot"]
         webhook_url: str = app["webhook_url"]
-
         app["webhook_task"] = asyncio.create_task(set_webhook_with_retry(bot, webhook_url))
         app["ws_task"] = asyncio.create_task(bybit_ws_consumer())
 
@@ -351,7 +358,6 @@ def build_app() -> web.Application:
                     await task
                 except asyncio.CancelledError:
                     pass
-
         bot: Bot = app["bot"]
         try:
             await bot.delete_webhook(drop_pending_updates=False)
