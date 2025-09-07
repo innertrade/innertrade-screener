@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 import pytz
 from aiohttp import web, ClientSession, WSMsgType
@@ -23,12 +23,11 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 # Конфигурация из ENV
 # =======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-BASE_URL = os.getenv("BASE_URL", "").strip()  # например: https://innertrade-screener-bot.onrender.com
+BASE_URL = os.getenv("BASE_URL", "").strip()  # напр.: https://innertrade-screener-bot.onrender.com
 TZ = os.getenv("TZ", "Europe/Moscow")
 BYBIT_WS = os.getenv("BYBIT_WS", "wss://stream.bybit.com/v5/public/linear")
 
-# Версия и эмодзи
-BOT_VERSION = "v0.9.1-webhook-ws"
+BOT_VERSION = "v0.9.2-webhook-ws"
 MOOD_LINE = "🧭 Market mood\nBTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)"
 
 if not TELEGRAM_TOKEN:
@@ -39,27 +38,22 @@ if not BASE_URL or not BASE_URL.startswith("http"):
 # =======================
 # Логирование
 # =======================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
 # =======================
-# Глобальные состояния
+# Состояние WS
 # =======================
 router = Router()
 
-# Кеш данных из публичного WS Bybit
 ws_state: Dict[str, Any] = {
     "ok": False,
     "err": None,
-    "tickers": {},     # symbol -> {lastPrice, price24hPcnt, turnover24h, ...}
-    "kline_5m": {},    # symbol -> list of ohlc rows (по желанию потом наполним)
-    "symbols": [],     # список символов, которые мы показали в последнем срезе
+    "tickers": {},     # symbol -> {lastPrice, price24hPcnt, turnover24h}
+    "kline_5m": {},    # на будущее
+    "symbols": [],
 }
 
-# набор по умолчанию (топ USDT linear; можно расширять)
 DEFAULT_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
     "DOGEUSDT", "ADAUSDT", "LINKUSDT", "TRXUSDT", "TONUSDT",
@@ -93,20 +87,18 @@ def main_keyboard() -> ReplyKeyboardMarkup:
 
 
 # =======================
-# Рендеры сообщений
+# Рендеры
 # =======================
 def render_activity() -> str:
-    # сортируем по turnover24h (обороту) по убыванию
     items = list(ws_state["tickers"].items())
     items.sort(key=lambda kv: float(kv[1].get("turnover24h", 0) or 0), reverse=True)
-    top = items[:10] if items else []
+    top = items[:10]
     if not top:
         return f"{MOOD_LINE}\n\n🔥 Активность\nНет данных (WS пусто)."
 
     lines = [MOOD_LINE, "", "🔥 Активность (Bybit WS)"]
     for i, (sym, data) in enumerate(top, 1):
         pct = data.get("price24hPcnt")
-        last = data.get("lastPrice")
         t24 = data.get("turnover24h")
         try:
             pct_disp = f"{float(pct)*100:.2f}" if pct is not None else "0.00"
@@ -121,16 +113,17 @@ def render_activity() -> str:
 
 
 def render_volatility() -> str:
-    # упрощённо: сорт по |24h%|
     items = list(ws_state["tickers"].items())
-    def abs_pct(v):  # безопасно берём абсолют 24h%
+
+    def abs_pct(v):
         p = v[1].get("price24hPcnt")
         try:
             return abs(float(p) * 100.0)
         except Exception:
             return 0.0
+
     items.sort(key=abs_pct, reverse=True)
-    top = items[:10] if items else []
+    top = items[:10]
     if not top:
         return f"{MOOD_LINE}\n\n⚡ Волатильность\nНет данных."
 
@@ -146,10 +139,9 @@ def render_volatility() -> str:
 
 
 def render_trend() -> str:
-    # упрощённо: просто вывести top по 24h%
     items = list(ws_state["tickers"].items())
     items.sort(key=lambda kv: float(kv[1].get("price24hPcnt", 0) or 0), reverse=True)
-    top = items[:10] if items else []
+    top = items[:10]
     if not top:
         return f"{MOOD_LINE}\n\n📈 Тренд\nНет данных."
 
@@ -158,15 +150,13 @@ def render_trend() -> str:
         try:
             pct = float(data.get("price24hPcnt", 0)) * 100.0
             last = float(data.get("lastPrice", 0))
-            approx = "≈"
-            lines.append(f"{i}) {sym}  {approx}  24h% {pct:+.2f}  | last {last}")
+            lines.append(f"{i}) {sym}  ≈  24h% {pct:+.2f}  | last {last}")
         except Exception:
             lines.append(f"{i}) {sym}  —")
     return "\n".join(lines)
 
 
 def render_bubbles() -> str:
-    # пока только заглушка текста (графику можно будет рисовать позже)
     return "WS Bubbles (24h %, size~turnover24h)"
 
 
@@ -189,7 +179,7 @@ def render_diag() -> str:
 
 
 # =======================
-# Хэндлеры команд
+# Команды
 # =======================
 @router.message(Command("start"))
 @router.message(Command("menu"))
@@ -209,7 +199,7 @@ async def cmd_diag(message: Message):
 
 
 # =======================
-# Хэндлеры кнопок (тексты)
+# Кнопки
 # =======================
 @router.message(F.text == "📊 Активность")
 async def on_activity(message: Message):
@@ -230,7 +220,6 @@ async def on_bubbles(message: Message):
 
 @router.message(F.text == "📰 Новости")
 async def on_news(message: Message):
-    # Пока демо, потом подключим реальные источники или webhook
     await message.answer(
         f"{MOOD_LINE}\n\n📰 Макро (последний час)\n• demo headline",
         reply_markup=main_keyboard(),
@@ -263,13 +252,9 @@ async def on_settings(message: Message):
 
 
 # =======================
-# Публичный WS Bybit
+# WS Bybit consumer
 # =======================
 async def bybit_ws_consumer():
-    """
-    Подключается к BYBIT_WS и подписывается на tickers для DEFAULT_SYMBOLS.
-    Заполняет ws_state["tickers"] данными с поля tickers.
-    """
     topics = [f"tickers.{sym}" for sym in DEFAULT_SYMBOLS]
     sub_msg = {"op": "subscribe", "args": topics}
 
@@ -278,7 +263,6 @@ async def bybit_ws_consumer():
             async with ClientSession(headers=HTTP_HEADERS) as sess:
                 log.info(f"Bybit WS connecting: {BYBIT_WS}")
                 async with sess.ws_connect(BYBIT_WS, heartbeat=15) as ws:
-                    # подписка
                     await ws.send_str(json.dumps(sub_msg))
                     log.info(f"WS subscribed: {len(topics)} topics")
                     ws_state["ok"] = True
@@ -287,97 +271,96 @@ async def bybit_ws_consumer():
                     async for msg in ws:
                         if msg.type == WSMsgType.TEXT:
                             data = json.loads(msg.data)
-                            # формат tickers: {"topic":"tickers.BTCUSDT","data":{"symbol":"BTCUSDT", ...}}
                             topic = data.get("topic")
                             if topic and topic.startswith("tickers."):
                                 payload = data.get("data") or {}
                                 sym = payload.get("symbol")
                                 if sym:
-                                    # извлекаем безопасно интересующие поля
-                                    last = payload.get("lastPrice")
-                                    p24 = payload.get("price24hPcnt")
-                                    t24 = payload.get("turnover24h")
                                     ws_state["tickers"][sym] = {
-                                        "lastPrice": last,
-                                        "price24hPcnt": p24,
-                                        "turnover24h": t24,
+                                        "lastPrice": payload.get("lastPrice"),
+                                        "price24hPcnt": payload.get("price24hPcnt"),
+                                        "turnover24h": payload.get("turnover24h"),
                                     }
                                     if sym not in ws_state["symbols"]:
                                         ws_state["symbols"].append(sym)
-                        elif msg.type == WSMsgType.ERROR:
-                            raise RuntimeError(f"WS error: {ws.exception()}")
-                        elif msg.type in (WSMsgType.CLOSED, WSMsgType.CLOSE):
-                            raise RuntimeError("WS closed by server")
+                        elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSED, WSMsgType.CLOSE):
+                            raise RuntimeError(str(msg.type))
         except Exception as e:
             ws_state["ok"] = False
             ws_state["err"] = str(e)
             log.exception(f"WS loop error: {e}")
-            await asyncio.sleep(3.0)  # backoff и повторить
+            await asyncio.sleep(3.0)
 
 
 # =======================
 # Aiohttp app + Webhook
 # =======================
-def build_app(bot: Bot, dp: Dispatcher) -> web.Application:
+def build_app() -> web.Application:
     app = web.Application()
 
-    # Health endpoints (чтобы Render и мы могли проверять живость)
+    # Бот/диспетчер
+    bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    # health endpoints
     async def health_ok(request: web.Request):
         return web.Response(text="ok", content_type="text/plain")
 
     app.router.add_get("/", health_ok)
     app.router.add_get("/health", health_ok)
 
-    # Регистрируем webhook-хэндлер
+    # webhook handler
     token_prefix = TELEGRAM_TOKEN.split(":", 1)[0]
-    WEBHOOK_PATH = f"/webhook/{token_prefix}"
+    webhook_path = f"/webhook/{token_prefix}"
 
     wh = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    wh.register(app, path=WEBHOOK_PATH)
-
+    wh.register(app, path=webhook_path)
     setup_application(app, dp, bot=bot)
+
+    # сохраняем в app
+    app["bot"] = bot
+    app["dp"] = dp
+    app["webhook_url"] = f"{BASE_URL}{webhook_path}"
+
+    # старты/остановки aiohttp
+    async def on_startup(app: web.Application):
+        bot: Bot = app["bot"]
+        webhook_url: str = app["webhook_url"]
+        await bot.set_webhook(webhook_url, drop_pending_updates=True)
+        log.info(f"Webhook set to {webhook_url}")
+
+        # стартуем фонового WS-консьюмера
+        app["ws_task"] = asyncio.create_task(bybit_ws_consumer())
+
+    async def on_cleanup(app: web.Application):
+        # гасим WS-таск
+        task: asyncio.Task = app.get("ws_task")
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # снимаем вебхук
+        bot: Bot = app["bot"]
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            pass
+
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
     return app
 
 
-async def on_startup(bot: Bot, dp: Dispatcher):
-    # Устанавливаем вебхук
-    token_prefix = TELEGRAM_TOKEN.split(":", 1)[0]
-    webhook_url = f"{BASE_URL}/webhook/{token_prefix}"
-    await bot.set_webhook(webhook_url, drop_pending_updates=True)
-    log.info(f"Webhook set to {webhook_url}")
-
-    # Запускаем задачу для WS
-    asyncio.create_task(bybit_ws_consumer())
-
-
-async def on_shutdown(bot: Bot, dp: Dispatcher):
-    try:
-        await bot.delete_webhook(drop_pending_updates=False)
-    except Exception:
-        pass
-
-
-async def main():
-    # Инициализация бота/диспетчера
-    bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher()
-    dp.include_router(router)
-
-    # Хуки старта/остановки
-    dp.startup.register(lambda: on_startup(bot, dp))
-    dp.shutdown.register(lambda: on_shutdown(bot, dp))
-
-    # Aiohttp приложение
-    app = build_app(bot, dp)
-
-    # Стартуем HTTP-сервер (Render слушает PORT)
+def serve():
+    app = build_app()
     port = int(os.getenv("PORT", "10000"))
     log.info(f"App starting on 0.0.0.0:{port}")
     web.run_app(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        log.info("App stopped")
+    serve()
