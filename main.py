@@ -21,11 +21,14 @@ from aiogram.exceptions import TelegramNetworkError
 # ENV
 # =======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-BASE_URL = os.getenv("BASE_URL", "").strip()  # например: https://innertrade-screener-bot.onrender.com
+BASE_URL_RAW = os.getenv("BASE_URL", "").strip()  # например: https://innertrade-screener-bot.onrender.com
+# Нормализуем BASE_URL: убираем хвостовой /
+BASE_URL = BASE_URL_RAW[:-1] if BASE_URL_RAW.endswith("/") else BASE_URL_RAW
+
 TZ = os.getenv("TZ", "Europe/Moscow")
 BYBIT_WS = os.getenv("BYBIT_WS", "wss://stream.bybit.com/v5/public/linear")
 
-BOT_VERSION = "v0.9.4-webhook-ws"
+BOT_VERSION = "v0.9.5-webhook-ws"
 MOOD_LINE = "🧭 Market mood\nBTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)"
 
 if not TELEGRAM_TOKEN:
@@ -175,6 +178,16 @@ async def cmd_status(message: Message):
 async def cmd_diag(message: Message):
     await message.answer(render_diag(), reply_markup=main_keyboard())
 
+@router.message(Command("health"))
+async def cmd_health(message: Message):
+    await message.answer("ok", reply_markup=main_keyboard())
+
+@router.message(Command("webhook"))
+async def cmd_webhook(message: Message):
+    token_prefix = TELEGRAM_TOKEN.split(":", 1)[0]
+    webhook_path = f"/webhook/{token_prefix}"
+    await message.answer(f"Current webhook: {BASE_URL}{webhook_path}", reply_markup=main_keyboard())
+
 
 # =======================
 # buttons
@@ -252,7 +265,6 @@ def _ingest_ticker_payload(payload: Union[Dict[str, Any], List[Dict[str, Any]]])
         pct = row.get("price24hPcnt")
         t24 = row.get("turnover24h")
 
-        # В некоторых потоках Bybit отдаёт строки — приводим к float позже через _safe_float
         rec = ws_state["tickers"].get(sym, {})
         if last is not None:
             rec["lastPrice"] = last
@@ -348,6 +360,7 @@ def build_app() -> web.Application:
         webhook_url: str = app["webhook_url"]
         app["webhook_task"] = asyncio.create_task(set_webhook_with_retry(bot, webhook_url))
         app["ws_task"] = asyncio.create_task(bybit_ws_consumer())
+        log.info(f"App started on 0.0.0.0:{os.getenv('PORT','10000')}")
 
     async def on_cleanup(app: web.Application):
         for key in ("webhook_task", "ws_task"):
