@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 import pytz
 from aiohttp import web, ClientSession, WSMsgType, ClientTimeout
@@ -287,7 +287,7 @@ async def bybit_ws_consumer():
 async def set_webhook_with_retry(bot: Bot, url: str):
     """Пробуем поставить вебхук с ретраями, чтобы разовый сетевой глюк не валил процесс."""
     delay = 2
-    for attempt in range(1, 7):  # до 6 попыток ~ суммарно ~ 2+4+8+16+32+64 сек
+    for attempt in range(1, 7):
         try:
             await bot.set_webhook(url, drop_pending_updates=True, allowed_updates=["message"])
             log.info(f"Webhook set to {url}")
@@ -307,9 +307,9 @@ async def set_webhook_with_retry(bot: Bot, url: str):
 def build_app() -> web.Application:
     app = web.Application()
 
-    # Собственная HTTP-сессия для Telegram с таймаутами (чтобы не залипало)
+    # Собственная HTTP-сессия для Telegram с таймаутами
     tg_timeout = ClientTimeout(total=35, connect=10, sock_read=25)
-    tg_session = AiohttpSession(timeout=tg_timeout, trust_env=True)
+    tg_session = AiohttpSession(timeout=tg_timeout)  # <-- убрали trust_env
 
     bot = Bot(token=TELEGRAM_TOKEN, session=tg_session, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
@@ -339,14 +339,10 @@ def build_app() -> web.Application:
         bot: Bot = app["bot"]
         webhook_url: str = app["webhook_url"]
 
-        # Ставим вебхук в фоновом таске с ретраями
         app["webhook_task"] = asyncio.create_task(set_webhook_with_retry(bot, webhook_url))
-
-        # Запускаем WS-консьюмера
         app["ws_task"] = asyncio.create_task(bybit_ws_consumer())
 
     async def on_cleanup(app: web.Application):
-        # Гасим фоновые таски
         for key in ("webhook_task", "ws_task"):
             task: asyncio.Task = app.get(key)
             if task and not task.done():
@@ -356,13 +352,11 @@ def build_app() -> web.Application:
                 except asyncio.CancelledError:
                     pass
 
-        # Снимаем вебхук и закрываем сессию Telegram
         bot: Bot = app["bot"]
         try:
             await bot.delete_webhook(drop_pending_updates=False)
         except Exception:
             pass
-        # Важно: закрыть HTTP-сессию бота, иначе "Unclosed client session"
         try:
             await bot.session.close()
         except Exception:
