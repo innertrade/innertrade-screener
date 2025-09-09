@@ -19,7 +19,7 @@ from aiogram.filters import CommandStart, Command
 
 from psycopg_pool import AsyncConnectionPool
 
-# ------------- Конфиг/лог -------------
+# ========== Конфиг / лог ==========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("innertrade")
 
@@ -41,7 +41,7 @@ WEBHOOK_URL  = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "10000"))
 
-# ------------- Bot/DP/DB -------------
+# ========== Bot / DP / DB ==========
 tg_timeout = ClientTimeout(total=15)
 tg_session = AiohttpSession(timeout=tg_timeout)
 bot = Bot(token=TELEGRAM_TOKEN, session=tg_session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -49,12 +49,12 @@ dp = Dispatcher()
 
 db_pool: AsyncConnectionPool = AsyncConnectionPool(DATABASE_URL, open=False, min_size=1, max_size=5)
 
-# ------------- WS state -------------
+# ========== WS state ==========
 ws_task: Optional[asyncio.Task] = None
 ws_connected: bool = False
-symbols_seed = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT", "TRXUSDT", "TONUSDT"]
+symbols_seed = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","DOGEUSDT","ADAUSDT","LINKUSDT","TRXUSDT","TONUSDT"]
 
-# ------------- SQL -------------
+# ========== SQL ==========
 DDL_CREATE = """
 CREATE TABLE IF NOT EXISTS ws_ticks (
     symbol TEXT PRIMARY KEY,
@@ -67,15 +67,15 @@ CREATE TABLE IF NOT EXISTS ws_ticks (
 
 SELECT_SORTED_TMPL = """
 SELECT symbol,
-       COALESCE(last,0)      AS last,
-       COALESCE(chg24,0)     AS chg24,
-       COALESCE(turnover24,0) AS turnover24
+       COALESCE(last,0)       AS last,
+       COALESCE(chg24,0)      AS chg24,
+        COALESCE(turnover24,0) AS turnover24
 FROM ws_ticks
 ORDER BY {order_by} DESC NULLS LAST
 LIMIT %s;
 """
 
-# ------------- DB helpers -------------
+# ========== DB helpers ==========
 async def db_init() -> None:
     await db_pool.open()
     log.info("DB pool opened")
@@ -104,7 +104,7 @@ async def select_sorted(order_by: str, limit: int = 10) -> List[Tuple[str, float
             rows = await cur.fetchall()
             return rows or []
 
-# ------------- WS worker -------------
+# ========== WS worker ==========
 def safe_float(x: Any) -> Optional[float]:
     try:
         if x is None: return None
@@ -138,7 +138,7 @@ async def ws_worker(app: web.Application) -> None:
                             for it in items:
                                 symbol = it.get("symbol")
                                 last = safe_float(it.get("lastPrice"))
-                                chg  = safe_float(it.get("price24hPcnt"))  # доля
+                                chg  = safe_float(it.get("price24hPcnt"))  # доля (0.0123=1.23%)
                                 turn = safe_float(it.get("turnover24h"))
                                 if symbol:
                                     await db_upsert_tick(symbol, last, chg, turn)
@@ -151,7 +151,7 @@ async def ws_worker(app: web.Application) -> None:
         finally:
             ws_connected = False
 
-# ------------- UI -------------
+# ========== UI ==========
 def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Активность", callback_data="activity")],
@@ -165,18 +165,13 @@ def kb_main() -> InlineKeyboardMarkup:
     ])
 
 def fmt_pc(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
-    # Bybit price24hPcnt = доля (0.0123 -> 1.23%)
-    val = x * 100
-    return f"{val:.2f}"
+    if x is None: return "—"
+    return f"{x*100:.2f}"
 
 def fmt_turnover(x: Optional[float]) -> str:
-    if not x or x == 0:
-        return "—"
+    if not x or x == 0: return "—"
     for suf, base in (("T",1e12),("B",1e9),("M",1e6)):
-        if x >= base:
-            return f"{x/base:.0f}{suf}"
+        if x >= base: return f"{x/base:.0f}{suf}"
     return f"{x:.0f}"
 
 def fmt_last(x: Optional[float]) -> str:
@@ -188,12 +183,12 @@ async def reply_event(event: Message|CallbackQuery, text: str):
     else:
         await event.message.answer(text, reply_markup=kb_main())
 
-# ------------- Handlers -------------
+# ========== Handlers ==========
 @dp.message(CommandStart())
 async def h_start(m: Message):
     await m.answer(
         "🧭 Market mood\nBTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)\n\n"
-        "Добро пожаловать в Innertrade Screener v1.0.1-db-ws (Bybit WS + DB).",
+        "Добро пожаловать в Innertrade Screener v1.0.2-db-ws (Bybit WS + DB).",
         reply_markup=kb_main()
     )
 
@@ -205,12 +200,13 @@ async def h_status(m: Message):
         f"Time: {now} ({TZ})\n"
         "Mode: active | Quiet: False\n"
         "Source: Bybit (public WS)\n"
-        "Version: v1.0.1-db-ws\n"
+        "Version: v1.0.2-db-ws\n"
         f"Bybit WS: {BYBIT_WS_URL}\n"
         f"WS connected: {ws_connected}\n",
         reply_markup=kb_main()
     )
 
+# --- Роутинг по callback-кнопкам И по slash-командам
 @dp.callback_query(F.data == "activity")
 @dp.message(Command("activity"))
 async def h_activity(e: Message|CallbackQuery):
@@ -256,13 +252,31 @@ async def h_diag(m: Message):
         cnt = -1
     await m.answer(f"diag\nws_connected={ws_connected}\nrows_in_db={cnt}\n", reply_markup=kb_main())
 
-# Catch-all: покажет, что бот вообще получает и обрабатывает текст
-@dp.message()
-async def h_catch_all(m: Message):
-    txt = (m.text or "").strip()
-    await m.answer(f"Принял: <code>{txt}</code>\n(команды: /start /status /activity /volatility /trend /diag)", reply_markup=kb_main())
+# --- Текстовые триггеры (если пользователь вводит фразу руками)
+TRIGGER_ACTIVITY   = {"активность", "📊 активность"}
+TRIGGER_VOLATILITY = {"волатильность", "⚡ волатильность"}
+TRIGGER_TREND      = {"тренд", "📈 тренд"}
 
-# ------------- Aiohttp (webhook + health) -------------
+def norm(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
+
+@dp.message(F.text)
+async def h_text_shortcuts(m: Message):
+    t = norm(m.text)
+    if t in TRIGGER_ACTIVITY:
+        return await h_activity(m)
+    if t in TRIGGER_VOLATILITY:
+        return await h_volatility(m)
+    if t in TRIGGER_TREND:
+        return await h_trend(m)
+    # fallback
+    await m.answer(
+        f"Принял: <code>{m.text}</code>\n"
+        "(команды: /start /status /activity /volatility /trend /diag)",
+        reply_markup=kb_main()
+    )
+
+# ========== Aiohttp (webhook + health) ==========
 async def handle_root(request: web.Request) -> web.Response:
     return web.Response(text="OK", content_type="text/plain")
 
@@ -270,7 +284,7 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({
         "ok": True,
         "service": "innertrade-screener",
-        "version": "v1.0.1-db-ws",
+        "version": "v1.0.2-db-ws",
         "webhook": True,
         "ws_connected": ws_connected,
     })
@@ -279,7 +293,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
     try:
         body = await request.text()
         update = Update.model_validate_json(body)
-        # логируем кратко, что прилетело
         kind = "unknown"
         desc = ""
         if update.message:
@@ -296,7 +309,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
         return web.Response(text="ok")
     except Exception as e:
         log.exception("bad update: %s", e)
-        # всё равно 200, чтобы не копить pending; ошибку мы уже залогировали
         return web.Response(text="ok")
 
 async def on_startup(app: web.Application):
@@ -323,8 +335,6 @@ def build_app() -> web.Application:
     app = web.Application()
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
-
-    # Только GET — HEAD зарегистрируется автоматически
     app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
