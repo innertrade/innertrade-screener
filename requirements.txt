@@ -1,11 +1,7 @@
 aiogram==3.13.1
-python-dotenv==1.0.1
 aiohttp==3.9.5
+python-dotenv==1.0.1
 pytz==2024.1
 matplotlib==3.9.2
 numpy==1.26.4
 openpyxl==3.1.5
-
-# Postgres (под Python 3.13)
-psycopg[binary]==3.2.9
-psycopg-pool==3.2.6
