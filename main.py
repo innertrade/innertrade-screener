@@ -1,327 +1,373 @@
+# main.py
+# Innertrade Screener — v1.0.1-db-ws
+# Совместимо с aiogram 3.13.x и psycopg 3.2.x (async)
+# Требуемые ENV:
+# TELEGRAM_TOKEN, WEBHOOK_BASE, WEBHOOK_SECRET, PORT(=10000),
+# DATABASE_URL (postgres://... или postgresql://...),
+# BYBIT_WS_URL (по умолчанию wss://stream.bybit.com/v5/public/linear),
+# TZ (например, Europe/Moscow)
+
 import asyncio
 import json
 import logging
 import os
 import signal
-from contextlib import suppress
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
 
 import pytz
-from aiohttp import web, ClientSession, ClientWebSocketResponse, WSMsgType
-from aiogram import Bot, Dispatcher, F, types
+import aiohttp
+from aiohttp import web
+
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
+    Message, Update, ReplyKeyboardMarkup, KeyboardButton,
+    CallbackQuery
 )
+
 from psycopg_pool import AsyncConnectionPool
 
-# ---------------------------
-# Config / ENV
-# ---------------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # e.g. https://innertrade-screener-bot.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "G7-ADVmM").strip()
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-BYBIT_WS = os.getenv("BYBIT_WS", "wss://stream.bybit.com/v5/public/linear").strip()
-# 10 ликвидных символов по умолчанию (можно расширить через ENV)
-BYBIT_SYMBOLS = os.getenv(
-    "BYBIT_SYMBOLS",
-    "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT",
-).replace(" ", "").split(",")
-
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-TZ = pytz.timezone(TIMEZONE)
-
-BOT_VERSION = "v1.0.0-db-ws"
-BOT_NAME = "Innertrade Screener"
-
-# TTL «свежести» записей
-ROW_TTL = int(os.getenv("ROW_TTL_MIN", "5"))  # минуты
-
-# ---------------------------
-# Logging
-# ---------------------------
+# ----------------------- ЛОГИ -----------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("innertrade")
+log = logging.getLogger(__name__)
 
-# ---------------------------
-# Globals (инициализируются в on_startup)
-# ---------------------------
-bot: Optional[Bot] = None
-dp: Optional[Dispatcher] = None
-pool: Optional[AsyncConnectionPool] = None
-ws_task: Optional[asyncio.Task] = None
-ws_state: Dict[str, Any] = {
-    "connected": False,
-    "last_msg_ts": None,  # UTC datetime
-    "last_error": None,
-    "subscribed": False,
-    "topics": [],
+# ----------------------- ENV -----------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip().rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip().strip("/")
+PORT = int(os.getenv("PORT", "10000"))
+BYBIT_WS_URL = os.getenv("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+TZ = os.getenv("TZ", "Europe/Moscow").strip()
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN is required")
+if not WEBHOOK_BASE:
+    raise RuntimeError("WEBHOOK_BASE is required (e.g. https://your-service.onrender.com)")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET is required (any non-empty string)")
+
+# ----------------------- GLOBALS -----------------------
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher()
+app: web.Application | None = None
+
+# Пул соединений к БД
+db_pool: AsyncConnectionPool | None = None
+
+# Состояние WS
+ws_session: aiohttp.ClientSession | None = None
+ws_task: asyncio.Task | None = None
+ws_connected = asyncio.Event()
+
+# Символы для подписки (топ ликвид по умолчанию)
+DEFAULT_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+    "DOGEUSDT", "ADAUSDT", "LINKUSDT", "TRXUSDT", "TONUSDT",
+]
+
+# Карта столбцов для безопасной сортировки
+COL_MAP = {
+    "turnover": "turnover24h",
+    "change": "change24h",
+    "last": "last",
 }
 
-# ---------------------------
-# DB helpers
-# ---------------------------
+# ----------------------- УТИЛИТЫ -----------------------
+def now_str_tz() -> str:
+    try:
+        tz = pytz.timezone(TZ)
+    except Exception:
+        tz = pytz.timezone("Europe/Moscow")
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S (%Z)")
+
+def hnum(n: float | int | None) -> str:
+    if n is None:
+        return "—"
+    try:
+        n = float(n)
+    except Exception:
+        return "—"
+    # компактный формат для turnover
+    for unit in ["", "K", "M", "B", "T"]:
+        if abs(n) < 1000.0:
+            if unit == "":
+                return f"{n:,.0f}".replace(",", " ")
+            else:
+                return f"{n:,.0f} {unit}".replace(",", " ")
+        n /= 1000.0
+    return f"{n:.0f} P"
+
+def kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📊 Активность"), KeyboardButton(text="⚡ Волатильность")],
+            [KeyboardButton(text="📈 Тренд"), KeyboardButton(text="🫧 Bubbles")],
+            [KeyboardButton(text="📰 Новости"), KeyboardButton(text="🧮 Калькулятор")],
+            [KeyboardButton(text="⭐ Watchlist"), KeyboardButton(text="⚙️ Настройки")],
+        ],
+        resize_keyboard=True
+    )
+
+# ----------------------- БД -----------------------
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS ticker_cache (
+    symbol       text PRIMARY KEY,
+    last         double precision,
+    change24h    double precision,
+    turnover24h  double precision,
+    updated_at   timestamptz default now()
+);
+"""
+
 UPSERT_SQL = """
-INSERT INTO ws_tickers (symbol, last_price, pct_24h, turnover_24h, updated_at)
-VALUES ($1, $2, $3, $4, NOW())
-ON CONFLICT (symbol) DO UPDATE
-SET last_price   = EXCLUDED.last_price,
-    pct_24h      = EXCLUDED.pct_24h,
-    turnover_24h = EXCLUDED.turnover_24h,
-    updated_at   = NOW();
+INSERT INTO ticker_cache(symbol, last, change24h, turnover24h, updated_at)
+VALUES ($1, $2, $3, $4, now())
+ON CONFLICT (symbol) DO UPDATE SET
+  last = EXCLUDED.last,
+  change24h = EXCLUDED.change24h,
+  turnover24h = EXCLUDED.turnover24h,
+  updated_at = now();
 """
 
-SELECT_RECENT_SQL = f"""
-SELECT symbol, last_price, pct_24h, turnover_24h, updated_at
-FROM ws_tickers
-WHERE updated_at > NOW() - INTERVAL '{ROW_TTL} minutes'
-"""
+async def db_init_pool():
+    global db_pool
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is required for DB mode")
+    # Не открываем пул в конструкторе — чтобы не ловить Deprecation warning
+    db_pool = AsyncConnectionPool(DATABASE_URL, open=False)
+    await db_pool.open()
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as cur:
+            await cur.execute(CREATE_SQL)
+    log.info("DB pool opened")
 
-SELECT_STATS_SQL = """
-SELECT
-  COUNT(*) AS total,
-  COUNT(*) FILTER (WHERE pct_24h IS NOT NULL) AS with_pct,
-  COUNT(*) FILTER (WHERE last_price IS NOT NULL) AS with_last,
-  MIN(EXTRACT(EPOCH FROM (NOW() - updated_at)))::int AS min_age_sec,
-  AVG(EXTRACT(EPOCH FROM (NOW() - updated_at)))::int AS avg_age_sec,
-  MAX(EXTRACT(EPOCH FROM (NOW() - updated_at)))::int AS max_age_sec
-FROM ws_tickers;
-"""
+async def db_close_pool():
+    global db_pool
+    if db_pool is not None:
+        await db_pool.close()
+        db_pool = None
+        log.info("DB pool closed")
 
-# ---------------------------
-# WebSocket collector
-# ---------------------------
-async def ws_collector():
+async def upsert_ticker(symbol: str, last: float | None, change24h: float | None, turnover24h: float | None):
+    if db_pool is None:
+        return
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as cur:
+            await cur.execute(
+                UPSERT_SQL,
+                (symbol, last, change24h, turnover24h)
+            )
+
+async def select_sorted(metric: str, limit: int = 10):
     """
-    Поддерживает WS соединение с Bybit, подписывается на tickers.24h и kline.5 (для тех же символов),
-    парсит апдейты и UPSERT в таблицу ws_tickers. Автовосстановление при обрывах.
+    Безопасная сортировка по whitelisted столбцам.
+    Возвращает список кортежей (symbol, last, change24h, turnover24h)
     """
-    backoff = 1
-    topics_ticker = [f"tickers.24h.{sym}" for sym in BYBIT_SYMBOLS]
-    topics_kline = [f"kline.5.{sym}" for sym in BYBIT_SYMBOLS]
-    topics = topics_ticker + topics_kline
+    if db_pool is None:
+        return []
+    col = COL_MAP.get(metric, "turnover24h")
+    sql = f"""
+        SELECT symbol, last, change24h, turnover24h
+        FROM ticker_cache
+        ORDER BY {col} DESC NULLS LAST
+        LIMIT %s
+    """
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as cur:
+            await cur.execute(sql, (limit,))
+            rows = await cur.fetchall()
+            return rows or []
+
+# ----------------------- WS -----------------------
+async def ws_worker():
+    """Подключение к Bybit public WS и апсерт тикеров в БД."""
+    global ws_session
+    topics = [f"tickers.{sym}" for sym in DEFAULT_SYMBOLS]
+
+    params = {
+        "op": "subscribe",
+        "args": topics,
+    }
 
     while True:
         try:
-            async with ClientSession() as session:
-                log.info("Bybit WS connecting: %s", BYBIT_WS)
-                ws: ClientWebSocketResponse
-                async with session.ws_connect(BYBIT_WS, heartbeat=20, timeout=30) as ws:
-                    ws_state.update(
-                        {
-                            "connected": True,
-                            "last_error": None,
-                            "subscribed": False,
-                            "topics": topics,
-                        }
-                    )
-                    # подписка
-                    await ws.send_json({"op": "subscribe", "args": topics})
-                    ws_state["subscribed"] = True
-                    log.info("WS subscribed: %d topics", len(topics))
+            if ws_session is None:
+                ws_session = aiohttp.ClientSession()
+            log.info(f"Bybit WS connecting: {BYBIT_WS_URL}")
+            async with ws_session.ws_connect(BYBIT_WS_URL, heartbeat=20) as ws:
+                # подписка
+                await ws.send_json(params)
+                log.info(f"WS subscribed: {len(topics)} topics")
+                ws_connected.set()
 
-                    backoff = 1  # сбросили backoff после успешного коннекта
-
-                    async for msg in ws:
-                        if msg.type == WSMsgType.TEXT:
-                            ws_state["last_msg_ts"] = datetime.now(timezone.utc)
-                            data = json.loads(msg.data)
-
-                            # Пинги Bybit (op ping/pong)
-                            if "op" in data and data["op"] == "ping":
-                                await ws.send_json({"op": "pong"})
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            data = msg.json(loads=json.loads)
+                        except Exception:
+                            # иногда Bybit присылает текст; пробуем распарсить вручную
+                            try:
+                                data = json.loads(msg.data)
+                            except Exception:
                                 continue
 
-                            # Поток тикеров: topic = tickers.24h.SYMBOL
-                            topic = data.get("topic")
-                            if topic and topic.startswith("tickers.24h."):
-                                try:
-                                    await handle_ticker_24h(data)
-                                except Exception as e:
-                                    log.exception("handle_ticker_24h error: %s", e)
-
-                            # Поток свечей (на будущее, если захочешь доп.расчёты):
-                            # topic = kline.5.SYMBOL; здесь пока не используем
+                        # ожидаем формат {"topic":"tickers.BTCUSDT", "data":[{...}] } или {"data":{...,"symbol":"BTCUSDT"}}
+                        topic = data.get("topic") or ""
+                        payload = data.get("data")
+                        if not payload:
                             continue
 
-                        elif msg.type in (WSMsgType.CLOSED, WSMsgType.CLOSING, WSMsgType.ERROR):
-                            raise ConnectionError(f"WS closed: {msg.type}")
+                        # Bybit может вернуть объект или массив объектов
+                        items = payload if isinstance(payload, list) else [payload]
+                        for itm in items:
+                            symbol = itm.get("symbol")
+                            if not symbol:
+                                # иногда topic вида tickers.BTCUSDT — вытащим оттуда
+                                if topic.startswith("tickers."):
+                                    symbol = topic.split(".", 1)[1]
+                            try:
+                                last = float(itm.get("lastPrice", itm.get("last_price", "nan")))
+                            except Exception:
+                                last = None
+                            try:
+                                ch = float(itm.get("price24hPcnt", itm.get("price24hPcnt_e4", "nan")))
+                                # Bybit часто даёт долю (0.0123 => 1.23%)
+                                change24h = ch * 100.0 if abs(ch) < 50 else ch
+                            except Exception:
+                                change24h = None
+                            try:
+                                # оборот за 24 часа (turnover24h), может приходить строкой
+                                tov = float(itm.get("turnover24h", itm.get("turnover_24h", "nan")))
+                            except Exception:
+                                tov = None
+
+                            if symbol:
+                                await upsert_ticker(symbol, last, change24h, tov)
+
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
 
         except asyncio.CancelledError:
             log.info("WS worker cancelled")
-            ws_state["connected"] = False
-            raise
+            break
         except Exception as e:
-            ws_state.update({"connected": False, "last_error": str(e)})
-            log.warning("WS error: %s", e)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)  # эксп. backoff до 30с
+            ws_connected.clear()
+            log.exception("WS worker error: %s", e)
+            await asyncio.sleep(3.0)
+        finally:
+            ws_connected.clear()
+            if ws_session:
+                await ws_session.close()
+                ws_session = None
+            await asyncio.sleep(2.0)
 
+# ----------------------- ХЭНДЛЕРЫ -----------------------
+WELCOME = (
+    "🧭 Market mood\n"
+    "BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)\n\n"
+    "Добро пожаловать в Innertrade Screener v1.0.1-db-ws (Bybit WS + DB)."
+)
 
-async def handle_ticker_24h(payload: Dict[str, Any]):
-    """
-    Пример сообщения:
-    {
-      "topic":"tickers.24h.BTCUSDT",
-      "ts": 1719999999999,
-      "type":"snapshot|delta",
-      "data": { "symbol":"BTCUSDT", "lastPrice":"111111.0", "price24hPcnt":"0.0123", "turnover24h":"123456789" ... }
-    }
-    """
-    if not pool:
-        return
-    data = payload.get("data") or {}
-    if isinstance(data, list):
-        # иногда приходит массив; нормализуем
-        for d in data:
-            await upsert_from_ticker_dict(d)
-    else:
-        await upsert_from_ticker_dict(data)
+@dp.message(CommandStart())
+async def on_start(message: Message):
+    await message.answer(WELCOME, reply_markup=kb())
 
-
-async def upsert_from_ticker_dict(d: Dict[str, Any]):
-    symbol = d.get("symbol") or d.get("s")
-    if not symbol:
-        return
-
-    # lastPrice/turnover24h/price24hPcnt приходят строками
-    def to_float(x: Any) -> Optional[float]:
-        if x is None or x == "" or x == "-":
-            return None
-        try:
-            return float(x)
-        except Exception:
-            return None
-
-    last_price = to_float(d.get("lastPrice"))
-    turnover_24h = to_float(d.get("turnover24h"))
-    pct_24h = to_float(d.get("price24hPcnt"))
-
-    # UPSERT
-    async with pool.connection() as conn:
-        await conn.execute(UPSERT_SQL, symbol, last_price, pct_24h, turnover_24h)
-
-
-# ---------------------------
-# Format helpers
-# ---------------------------
-def fmt_money(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
-    if x >= 1_000_000_000:
-        return f"{x/1_000_000_000:.0f}B"
-    if x >= 1_000_000:
-        return f"{x/1_000_000:.0f}M"
-    if x >= 1_000:
-        return f"{x/1_000:.0f}K"
-    return f"{x:.0f}"
-
-def fmt_pct(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
-    return f"{x*100:.2f}"
-
-def now_local_str() -> str:
-    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-# ---------------------------
-# Bot UI
-# ---------------------------
-def menu_kbd() -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text="📊 Активность"), KeyboardButton(text="⚡ Волатильность")],
-        [KeyboardButton(text="📈 Тренд"), KeyboardButton(text="🫧 Bubbles")],
-        [KeyboardButton(text="📰 Новости"), KeyboardButton(text="🧮 Калькулятор")],
-        [KeyboardButton(text="⭐ Watchlist"), KeyboardButton(text="⚙️ Настройки")],
-    ]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
-def status_text(source_hint: str) -> str:
-    return (
+@dp.message(Command("status"))
+async def on_status(message: Message):
+    await message.answer(
         "Status\n"
-        f"Time: {now_local_str()} (MSK)\n"
+        f"Time: {now_str_tz()}\n"
         f"Mode: active | Quiet: False\n"
-        f"Source: {source_hint}\n"
-        f"Version: {BOT_VERSION}\n"
-        f"Bybit WS: {BYBIT_WS}\n"
+        f"Source: Bybit (public WS)\n"
+        f"Version: v1.0.1-db-ws\n"
+        f"Bybit WS: {BYBIT_WS_URL}"
     )
 
-async def fetch_recent(limit: int = 10) -> List[Tuple[str, Optional[float], Optional[float], Optional[float], datetime]]:
-    if not pool:
-        return []
-    sql = SELECT_RECENT_SQL + " ORDER BY updated_at DESC LIMIT $1"
-    async with pool.connection() as conn:
-        rows = await conn.fetchall(sql, limit)
-    return rows
-
-async def select_sorted(by: str, limit: int = 10) -> List[Tuple[str, Optional[float], Optional[float], Optional[float], datetime]]:
-    """
-    by: 'turnover' | 'pct_abs' | 'pct_up' | 'pct_down'
-    """
-    if not pool:
-        return []
-    base = SELECT_RECENT_SQL
-    if by == "turnover":
-        order = "ORDER BY turnover_24h DESC NULLS LAST"
-    elif by == "pct_abs":
-        order = "ORDER BY ABS(pct_24h) DESC NULLS LAST"
-    elif by == "pct_up":
-        order = "ORDER BY pct_24h DESC NULLS LAST"
-    else:  # pct_down
-        order = "ORDER BY pct_24h ASC NULLS LAST"
-    sql = f"{base} {order} LIMIT $1"
-    async with pool.connection() as conn:
-        rows = await conn.fetchall(sql, limit)
-    return rows
-
-def render_activity(rows) -> str:
-    lines = ["🧭 Market mood", "BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)", ""]
-    lines.append("🔥 Активность (Bybit WS + DB)")
+@dp.message(F.text == "📊 Активность")
+@dp.message(Command("activity"))
+async def on_activity(message: Message):
+    rows = await select_sorted("turnover", limit=10)
     if not rows:
-        lines.append("Нет данных (ожидаю снапшоты).")
-        return "\n".join(lines)
-    for i, (sym, last, pct, turn, ts) in enumerate(rows, start=1):
-        lines.append(
-            f"{i}) {sym:<7}  24h% {fmt_pct(pct)}  | turnover24h ~ {fmt_money(turn)}"
-        )
-    return "\n".join(lines)
+        await message.answer("🔥 Активность\nНет данных (ожидаю WS/БД).")
+        return
 
-def render_vol(rows) -> str:
-    lines = ["🧭 Market mood", "BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)", ""]
-    lines.append("⚡ Волатильность (24h %, Bybit WS + DB)")
+    lines = ["🔥 Активность (топ по turnover24h)"]
+    for i, (sym, last, ch, tov) in enumerate(rows, start=1):
+        ch_str = "—" if ch is None else f"{ch:.2f}"
+        last_str = "—" if last is None else f"{last:.4f}" if last < 100 else f"{last:,.2f}".replace(",", " ")
+        lines.append(f"{i}) {sym}  24h% {ch_str}  | turnover24h ~ {hnum(tov)} | last {last_str}")
+    await message.answer("\n".join(lines))
+
+@dp.message(F.text == "⚡ Волатильность")
+@dp.message(Command("vol"))
+async def on_vol(message: Message):
+    rows = await select_sorted("change", limit=10)
     if not rows:
-        lines.append("Нет данных.")
-        return "\n".join(lines)
-    for i, (sym, last, pct, turn, ts) in enumerate(rows, start=1):
-        last_str = "—" if last is None else f"{last:g}"
-        lines.append(f"{i}) {sym:<7}  24h% {fmt_pct(pct)}  | last {last_str}")
-    return "\n".join(lines)
+        await message.answer("⚡ Волатильность\nНет данных.")
+        return
+    lines = ["⚡ Волатильность (топ по 24h%)"]
+    for i, (sym, last, ch, tov) in enumerate(rows, start=1):
+        ch_str = "—" if ch is None else f"{ch:.2f}"
+        last_str = "—" if last is None else f"{last:.4f}" if last < 100 else f"{last:,.2f}".replace(",", " ")
+        lines.append(f"{i}) {sym}  24h% {ch_str}  | last {last_str}")
+    await message.answer("\n".join(lines))
 
-def render_trend(rows) -> str:
-    lines = ["🧭 Market mood", "BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)", ""]
-    lines.append("📈 Тренд (упрощённо по 24h%, Bybit WS + DB)")
+@dp.message(F.text == "📈 Тренд")
+@dp.message(Command("trend"))
+async def on_trend(message: Message):
+    rows = await select_sorted("change", limit=10)
     if not rows:
-        lines.append("Нет данных.")
-        return "\n".join(lines)
-    for i, (sym, last, pct, turn, ts) in enumerate(rows, start=1):
-        last_str = "—" if last is None else f"{last:g}"
-        lines.append(f"{i}) {sym:<7}  ≈  24h% {fmt_pct(pct)}  | last {last_str}")
-    return "\n".join(lines)
+        await message.answer("📈 Тренд\nНет данных.")
+        return
+    lines = ["📈 Тренд (упрощённо по 24h%)"]
+    for i, (sym, last, ch, tov) in enumerate(rows, start=1):
+        ch_str = "—" if ch is None else f"{ch:.2f}"
+        last_str = "—" if last is None else f"{last:.4f}" if last < 100 else f"{last:,.2f}".replace(",", " ")
+        lines.append(f"{i}) {sym}  ≈  24h% {ch_str}  | last {last_str}")
+    await message.answer("\n".join(lines))
 
-def settings_text() -> str:
-    return (
+@dp.message(F.text == "🫧 Bubbles")
+@dp.message(Command("bubbles"))
+async def on_bubbles(message: Message):
+    rows = await select_sorted("turnover", limit=10)
+    if not rows:
+        await message.answer("🫧 Bubbles\nНет данных.")
+        return
+    # пока текстовый вывод
+    lines = ["WS Bubbles (24h %, size~turnover24h)"]
+    for i, (sym, last, ch, tov) in enumerate(rows, start=1):
+        ch_str = "—" if ch is None else f"{ch:.2f}"
+        lines.append(f"{i}) {sym}  24h% {ch_str}  | size ~ {hnum(tov)}")
+    await message.answer("\n".join(lines))
+
+@dp.message(F.text == "📰 Новости")
+@dp.message(Command("news"))
+async def on_news(message: Message):
+    await message.answer(
+        "🧭 Market mood\n"
+        "BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)\n\n"
+        "📰 Макро (последний час)\n• demo headline"
+    )
+
+@dp.message(F.text == "🧮 Калькулятор")
+@dp.message(Command("calc"))
+async def on_calc(message: Message):
+    await message.answer("Шаблон риск-менеджмента (встроенный Excel добавим позже).")
+
+@dp.message(F.text == "⭐ Watchlist")
+@dp.message(Command("watchlist"))
+async def on_watchlist(message: Message):
+    await message.answer("Watchlist пуст. Добавь /add SYMBOL (например, /add SOLUSDT)")
+
+@dp.message(F.text == "⚙️ Настройки")
+@dp.message(Command("settings"))
+async def on_settings(message: Message):
+    await message.answer(
         "⚙️ Настройки\n"
         "Биржа: Bybit (USDT perp, WS)\n"
         "Режим: active | Quiet: False\n"
@@ -332,201 +378,101 @@ def settings_text() -> str:
         "• /watchlist   — показать лист\n"
         "• /passive     — автосводки/сигналы ON\n"
         "• /active      — автосводки/сигналы OFF\n"
-        "• /menu        — восстановить клавиатуру\n"
+        "• /menu        — восстановить клавиатуру"
     )
 
-# ---------------------------
-# Handlers
-# ---------------------------
-async def on_start(message: types.Message):
-    kb = menu_kbd()
-    text = (
-        "🧭 Market mood\n"
-        "BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)\n\n"
-        f"Добро пожаловать в {BOT_NAME} {BOT_VERSION} (Bybit WS + DB)."
-    )
-    await message.answer(text, reply_markup=kb)
+@dp.message(Command("menu"))
+async def on_menu(message: Message):
+    await message.answer("Меню восстановлено.", reply_markup=kb())
 
-async def on_status(message: types.Message):
-    source = "Bybit (DB+WS)"
-    await message.answer(status_text(source))
+# ----------------------- ВЕБХУК СЕРВЕР -----------------------
+async def handle_health(request: web.Request):
+    return web.json_response({
+        "ok": True,
+        "service": "innertrade-screener",
+        "version": "v1.0.1-db-ws",
+        "webhook": True,
+        "ws_connected": ws_connected.is_set(),
+        "time": now_str_tz(),
+    })
 
-async def on_activity(message: types.Message):
-    rows = await select_sorted("turnover", limit=10)
-    await message.answer(render_activity(rows))
+async def handle_root(request: web.Request):
+    return web.Response(text="ok", status=200)
 
-async def on_vol(message: types.Message):
-    rows = await select_sorted("pct_abs", limit=10)
-    await message.answer(render_vol(rows))
+async def handle_webhook(request: web.Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400)
+    update = Update.model_validate(data)
+    await dp.feed_update(bot, update)
+    return web.Response(status=200)
 
-async def on_trend(message: types.Message):
-    rows = await select_sorted("pct_up", limit=10)
-    await message.answer(render_trend(rows))
-
-async def on_bubbles(message: types.Message):
-    await message.answer("WS Bubbles (24h %, size~turnover24h)")
-
-async def on_news(message: types.Message):
-    text = (
-        "🧭 Market mood\n"
-        "BTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)\n\n"
-        "📰 Макро (последний час)\n"
-        "• demo headline"
-    )
-    await message.answer(text)
-
-async def on_calc(message: types.Message):
-    await message.answer("Шаблон риск-менеджмента (встроенный Excel добавим позже).")
-
-async def on_watchlist(message: types.Message):
-    await message.answer("Watchlist пуст. Добавь /add SYMBOL (например, /add SOLUSDT)")
-
-async def on_settings(message: types.Message):
-    await message.answer(settings_text())
-
-async def on_menu(message: types.Message):
-    await message.answer("ok", reply_markup=menu_kbd())
-
-async def on_diag(message: types.Message):
-    if not pool:
-        await message.answer("DB pool not ready")
-        return
-    # Stats
-    async with pool.connection() as conn:
-        stats = await conn.fetchone(SELECT_STATS_SQL)
-
-    ws_connected = ws_state.get("connected")
-    ws_err = ws_state.get("last_error")
-    last_msg_ts: Optional[datetime] = ws_state.get("last_msg_ts")
-    age_s = None
-    if last_msg_ts:
-        age_s = int((datetime.now(timezone.utc) - last_msg_ts).total_seconds())
-
-    txt = [
-        "diag",
-        f"db_total={stats['total']} with_pct={stats['with_pct']} with_last={stats['with_last']}",
-        f"age_sec min/avg/max = {stats['min_age_sec']}/{stats['avg_age_sec']}/{stats['max_age_sec']}",
-        f"ws_connected={ws_connected} last_msg_age={age_s} ws_err={ws_err}",
-        f"symbols_cached={len(BYBIT_SYMBOLS)}",
-    ]
-    await message.answer("\n".join(txt))
-
-async def on_health(request: web.Request) -> web.Response:
-    # Telegram webhook check helper
-    return web.json_response(
-        {
-            "ok": True,
-            "service": "innertrade-screener",
-            "version": BOT_VERSION,
-            "webhook": True,
-            "ws_connected": ws_state.get("connected"),
-            "last_msg_ts": ws_state.get("last_msg_ts").isoformat() if ws_state.get("last_msg_ts") else None,
-        }
-    )
-
-# ---------------------------
-# Aiogram / Webhook app
-# ---------------------------
 def build_app() -> web.Application:
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN is required")
-    if not WEBHOOK_BASE:
-        raise RuntimeError("WEBHOOK_BASE is required")
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is required")
+    global app
+    app = web.Application()
+    # маршруты
+    app.add_routes([
+        web.head("/", handle_root),
+        web.get("/", handle_root),
+        web.head("/health", handle_health),
+        web.get("/health", handle_health),
+        web.post(f"/webhook/{WEBHOOK_SECRET}", handle_webhook),
+    ])
+    return app
 
-    application = web.Application()
+async def set_webhook():
+    url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
+    await bot.set_webhook(url, allowed_updates=["message", "callback_query"], max_connections=40)
+    log.info(f"Webhook set to {url}")
 
-    # bot / dispatcher
-    global bot, dp
-    bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher()
-
-    # routes
-    application.router.add_get("/", lambda r: web.json_response({"ok": True, "name": BOT_NAME, "version": BOT_VERSION}))
-    application.router.add_get("/health", on_health)
-
-    # webhook handler
-    async def handle_webhook(request: web.Request) -> web.Response:
-        update = types.Update.model_validate(await request.json(), context={"bot": bot})
-        await dp.feed_update(bot, update)
-        return web.json_response({"ok": True})
-
-    application.router.add_post(WEBHOOK_PATH, handle_webhook)
-
-    # startup/shutdown
-    application.on_startup.append(on_app_startup)
-    application.on_shutdown.append(on_app_shutdown)
-
-    return application
-
-
-async def on_app_startup(app: web.Application):
-    # set webhook
-    assert bot is not None
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(url=WEBHOOK_BASE + WEBHOOK_PATH)
-    log.info("Webhook set to %s", WEBHOOK_BASE + WEBHOOK_PATH)
-
-    # db pool
-    global pool
-    pool = AsyncConnectionPool(DATABASE_URL, open=False, num_workers=4, max_size=10)
-    await pool.open()
-    log.info("DB pool opened")
-
-    # register handlers
-    assert dp is not None
-    dp.message.register(on_start, Command("start"))
-    dp.message.register(on_status, Command("status"))
-    dp.message.register(on_diag, Command("diag"))
-    dp.message.register(on_menu, Command("menu"))
-    dp.message.register(on_health_cmd, Command("health"))
-
-    # кнопки
-    dp.message.register(on_activity, F.text == "📊 Активность")
-    dp.message.register(on_vol, F.text == "⚡ Волатильность")
-    dp.message.register(on_trend, F.text == "📈 Тренд")
-    dp.message.register(on_bubbles, F.text == "🫧 Bubbles")
-    dp.message.register(on_news, F.text == "📰 Новости")
-    dp.message.register(on_calc, F.text == "🧮 Калькулятор")
-    dp.message.register(on_watchlist, F.text == "⭐ Watchlist")
-    dp.message.register(on_settings, F.text == "⚙️ Настройки")
-
-    # ws collector
+# ----------------------- ЖИЗНЕННЫЙ ЦИКЛ -----------------------
+async def startup():
+    await set_webhook()
+    await db_init_pool()
+    # запускаем WS
     global ws_task
-    ws_task = asyncio.create_task(ws_collector())
+    ws_task = asyncio.create_task(ws_worker())
 
-
-async def on_app_shutdown(app: web.Application):
-    # stop ws task
-    global ws_task
+async def shutdown():
+    # удаляем вебхук, чтобы TG не слал в никуда
+    try:
+        await bot.delete_webhook()
+    except Exception:
+        pass
+    # останавливаем WS
+    global ws_task, ws_session
     if ws_task and not ws_task.done():
         ws_task.cancel()
-        with suppress(asyncio.CancelledError):
+        try:
             await ws_task
+        except Exception:
+            pass
+    if ws_session:
+        await ws_session.close()
+        ws_session = None
+    await db_close_pool()
+    await bot.session.close()
 
-    # close db pool
-    global pool
-    if pool:
-        await pool.close()
-        log.info("DB pool closed")
-
-    # delete webhook
-    if bot:
-        with suppress(Exception):
-            await bot.delete_webhook(drop_pending_updates=True)
-
-
-async def on_health_cmd(message: types.Message):
-    await message.answer(f"Current webhook: {WEBHOOK_BASE + WEBHOOK_PATH}")
-
-# ---------------------------
-# Entrypoint
-# ---------------------------
 def serve():
-    app = build_app()
-    port = int(os.getenv("PORT", "10000"))
-    web.run_app(app, host="0.0.0.0", port=port)
+    application = build_app()
+    loop = asyncio.get_event_loop()
 
+    async def _on_start(_app):
+        await startup()
+
+    async def _on_cleanup(_app):
+        await shutdown()
+
+    application.on_startup.append(_on_start)
+    application.on_cleanup.append(_on_cleanup)
+
+    # Грейсфул для Render
+    try:
+        web.run_app(application, host="0.0.0.0", port=PORT, print=None)
+    except KeyboardInterrupt:
+        pass
+
+# ----------------------- MAIN -----------------------
 if __name__ == "__main__":
     serve()
