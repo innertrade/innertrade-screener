@@ -57,9 +57,14 @@ app: web.Application | None = None
 db_pool: AsyncConnectionPool | None = None
 ws_session: aiohttp.ClientSession | None = None
 ws_task: asyncio.Task | None = None
+watchdog_task: asyncio.Task | None = None
 
-# кэш тикеров от WS (как фолбэк, пока БД не прогрелась)
+# состояние WS/кэша
 ws_cache: dict[str, dict] = {}
+ws_connected: bool = False
+ws_last_msg_ts: str | None = None
+
+VERSION = "v1.2.0-stable"
 
 # -------------------- SQL --------------------
 SQL_CREATE = """
@@ -72,7 +77,7 @@ CREATE TABLE IF NOT EXISTS ws_ticker (
 );
 """
 
-# psycopg3: используем %s-плейсхолдеры и COALESCE, чтобы не затирать отсутствующие поля
+# psycopg3: %s placeholders + COALESCE (не затираем отсутствующие поля)
 SQL_UPSERT = """
 INSERT INTO ws_ticker (symbol, last, price24h_pcnt, turnover24h, updated_at)
 VALUES (%s, %s, %s, %s, NOW())
@@ -95,10 +100,15 @@ LIMIT %s;
 
 SQL_COUNT = "SELECT COUNT(*) FROM ws_ticker;"
 
+SQL_GET_ONE = """
+SELECT symbol, last, price24h_pcnt, turnover24h, updated_at
+FROM ws_ticker
+WHERE symbol = %s;
+"""
+
 # -------------------- DB helpers --------------------
 async def init_db():
     global db_pool
-    # убираем warning: не открываем пул в конструкторе
     db_pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=4, open=False)
     await db_pool.open()
     async with db_pool.connection() as conn:
@@ -142,78 +152,124 @@ async def count_rows() -> int:
             n = (await cur.fetchone())[0]
             return int(n or 0)
 
-# -------------------- Bybit WS ingest --------------------
+async def get_one(symbol: str):
+    if db_pool is None:
+        return None
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SQL_GET_ONE, (symbol.upper(),))
+            return await cur.fetchone()
+
+# -------------------- Webhook reliability --------------------
+async def ensure_webhook(bot: Bot, url: str, retries: int = 8) -> bool:
+    delay = 1
+    for i in range(retries):
+        try:
+            ok = await bot.set_webhook(url, allowed_updates=["message", "callback_query"])
+            if ok:
+                log.info("Webhook set to %s", url)
+                return True
+        except Exception as e:
+            log.warning("set_webhook attempt %d failed: %s", i + 1, e)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 30)
+    log.error("Failed to set webhook after %d attempts", retries)
+    return False
+
+async def webhook_watchdog(bot: Bot, url: str):
+    while True:
+        try:
+            info = await bot.get_webhook_info()
+            if not info.url:
+                log.warning("Webhook empty; resetting...")
+                try:
+                    await bot.set_webhook(url, allowed_updates=["message", "callback_query"])
+                    log.info("Webhook restored by watchdog")
+                except Exception as e:
+                    log.warning("Watchdog failed to set webhook: %s", e)
+        except Exception as e:
+            log.warning("webhook_watchdog error: %s", e)
+        await asyncio.sleep(300)  # каждые 5 минут
+
+# -------------------- Bybit WS ingest with reconnect --------------------
 async def ws_consumer():
-    global ws_session
-    ws_session = aiohttp.ClientSession()
-    log.info(f"Bybit WS connecting: {BYBIT_WS_URL}")
-    try:
-        async with ws_session.ws_connect(BYBIT_WS_URL, heartbeat=30) as ws:
-            # подписка на tickers.SYMBOL
-            args = [f"tickers.{s}" for s in SYMBOLS if s]
-            await ws.send_json({"op": "subscribe", "args": args})
-            log.info(f"WS subscribed: {len(args)} topics")
+    global ws_session, ws_connected, ws_last_msg_ts
+    backoff = 1
+    while True:
+        ws_connected = False
+        ws_last_msg_ts = None
+        ws_session = aiohttp.ClientSession()
+        log.info("Bybit WS connecting: %s", BYBIT_WS_URL)
+        try:
+            async with ws_session.ws_connect(BYBIT_WS_URL, heartbeat=30) as ws:
+                args = [f"tickers.{s}" for s in SYMBOLS if s]
+                await ws.send_json({"op": "subscribe", "args": args})
+                log.info("WS subscribed: %d topics", len(args))
+                ws_connected = True
+                backoff = 1  # сброс бэкоффа после успешного коннекта
 
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = msg.json(loads=json.loads)
-                    topic = data.get("topic") or ""
-                    if topic.startswith("tickers."):
-                        payload = data.get("data")
-                        items = [payload] if isinstance(payload, dict) else (payload or [])
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = msg.json(loads=json.loads)
+                        topic = data.get("topic") or ""
+                        if topic.startswith("tickers."):
+                            payload = data.get("data")
+                            items = [payload] if isinstance(payload, dict) else (payload or [])
 
-                        for it in items:
-                            symbol = (it.get("symbol") or "").upper()
-                            if not symbol:
-                                continue
+                            for it in items:
+                                symbol = (it.get("symbol") or "").upper()
+                                if not symbol:
+                                    continue
 
-                            # берём сырые значения; если поля нет — None
-                            raw_last = it.get("lastPrice")
-                            raw_p24  = it.get("price24hPcnt")    # доля (0.0123 → 1.23%)
-                            raw_tov  = it.get("turnover24h")
+                                raw_last = it.get("lastPrice")
+                                raw_p24  = it.get("price24hPcnt")   # доля (0.0123 → 1.23%)
+                                raw_tov  = it.get("turnover24h")
 
-                            # конвертируем только если присутствуют
-                            try:
-                                last = float(raw_last) if raw_last not in (None, "") else None
-                            except Exception:
-                                last = None
-                            try:
-                                p24 = (float(raw_p24) * 100.0) if raw_p24 not in (None, "") else None
-                            except Exception:
-                                p24 = None
-                            try:
-                                tov = float(raw_tov) if raw_tov not in (None, "") else None
-                            except Exception:
-                                tov = None
+                                # конвертация только если пришло
+                                try:
+                                    last = float(raw_last) if raw_last not in (None, "") else None
+                                except Exception:
+                                    last = None
+                                try:
+                                    p24 = (float(raw_p24) * 100.0) if raw_p24 not in (None, "") else None
+                                except Exception:
+                                    p24 = None
+                                try:
+                                    tov = float(raw_tov) if raw_tov not in (None, "") else None
+                                except Exception:
+                                    tov = None
 
-                            # пропускаем пустой апдейт (ничего не обновляется)
-                            if last is None and p24 is None and tov is None:
-                                continue
+                                if last is None and p24 is None and tov is None:
+                                    continue
 
-                            # КЭШ: обновляем только пришедшие поля
-                            prev = ws_cache.get(symbol, {})
-                            ws_cache[symbol] = {
-                                "last": last if last is not None else prev.get("last", 0.0),
-                                "p24":  p24  if p24  is not None else prev.get("p24",  0.0),
-                                "tov":  tov  if tov  is not None else prev.get("tov",  0.0),
-                                "ts": datetime.now(timezone.utc).isoformat(),
-                            }
+                                prev = ws_cache.get(symbol, {})
+                                ws_cache[symbol] = {
+                                    "last": last if last is not None else prev.get("last", 0.0),
+                                    "p24":  p24  if p24  is not None else prev.get("p24",  0.0),
+                                    "tov":  tov  if tov  is not None else prev.get("tov",  0.0),
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                }
+                                await upsert_ticker(symbol, last, p24, tov)
 
-                            # БД: None → «оставить прежнее значение» благодаря COALESCE в UPSERT
-                            await upsert_ticker(symbol, last, p24, tov)
+                            ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
 
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    log.error("WS error: %s", msg.data)
-                    break
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
-                    log.warning("WS closed by server")
-                    break
-    except Exception as e:
-        log.exception("WS consumer failed: %s", e)
-    finally:
-        if ws_session:
-            await ws_session.close()
-        log.info("WS consumer finished")
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        log.warning("WS error: %s", msg.data)
+                        break
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
+                        log.warning("WS closed by server")
+                        break
+        except Exception as e:
+            log.warning("WS loop error: %s", e)
+        finally:
+            try:
+                await ws_session.close()
+            except Exception:
+                pass
+            ws_connected = False
+            log.info("WS consumer finished; reconnecting in %ss...", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)  # экспоненциальный бэкофф
 
 # -------------------- Bot --------------------
 def kb_main() -> ReplyKeyboardMarkup:
@@ -228,20 +284,22 @@ def kb_main() -> ReplyKeyboardMarkup:
 async def cmd_start(message: Message):
     await message.answer(
         "🧭 Market mood\nBTC.D: 54.1% (+0.3) | Funding avg: +0.012% | F&G: 34 (-3)\n\n"
-        "Добро пожаловать в Innertrade Screener v1.1.0-db-ws (Bybit WS + DB).",
+        f"Добро пожаловать в Innertrade Screener {VERSION} (Bybit WS + DB).",
         reply_markup=kb_main()
     )
 
 async def cmd_status(message: Message):
     n = await count_rows()
+    ws_ts = ws_last_msg_ts or "—"
     await message.answer(
         "Status\n"
         f"Time: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S (%Z)')}\n"
         "Mode: active | Quiet: False\n"
         "Source: Bybit (public WS)\n"
-        "Version: v1.1.0-db-ws\n"
+        f"Version: {VERSION}\n"
         f"Bybit WS: {BYBIT_WS_URL}\n"
-        f"WS connected: True\n"
+        f"WS connected: {ws_connected}\n"
+        f"WS last msg: {ws_ts}\n"
         f"DB rows: {n}"
     )
 
@@ -256,6 +314,26 @@ async def cmd_diag(message: Message):
         "diag\n"
         f"rows={n}\n"
         f"cache_sample:\n{sample_txt}"
+    )
+
+async def cmd_now(message: Message):
+    # /now SYMBOL
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Usage: /now SYMBOL (пример: /now BTCUSDT)")
+        return
+    sym = parts[1].upper()
+    row = await get_one(sym)
+    if not row:
+        await message.answer(f"{sym}: нет данных в БД.")
+        return
+    symbol, last, p24, tov, updated = row
+    await message.answer(
+        f"{symbol}\n"
+        f"last: {last}\n"
+        f"24h%: {p24}\n"
+        f"turnover24h: {tov}\n"
+        f"updated_at: {updated}"
     )
 
 def fmt_activity(rows: list[tuple]) -> str:
@@ -329,7 +407,7 @@ async def on_text(message: Message):
         await message.answer("WS Bubbles (24h %, size~turnover24h)")
     else:
         await message.answer(
-            f"Принял: {t}\n(команды: /start /status /activity /volatility /trend /diag)"
+            f"Принял: {t}\n(команды: /start /status /activity /volatility /trend /diag /now SYMBOL)"
         )
 
 # -------------------- HTTP endpoints --------------------
@@ -339,17 +417,18 @@ async def handle_health(request: web.Request):
 async def handle_root(request: web.Request):
     return web.Response(text="Innertrade screener is alive")
 
-# удобные HTTP-версии /status и /diag
 async def handle_status_http(request: web.Request):
     n = await count_rows()
+    ws_ts = ws_last_msg_ts or "—"
     body = (
         "Status\n"
         f"Time: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S (%Z)')}\n"
         "Mode: active | Quiet: False\n"
         "Source: Bybit (public WS)\n"
-        "Version: v1.1.0-db-ws\n"
+        f"Version: {VERSION}\n"
         f"Bybit WS: {BYBIT_WS_URL}\n"
-        f"WS connected: True\n"
+        f"WS connected: {ws_connected}\n"
+        f"WS last msg: {ws_ts}\n"
         f"DB rows: {n}\n"
     )
     return web.Response(text=body)
@@ -370,7 +449,8 @@ async def handle_webhook(request: web.Request):
         data = await request.json()
     except Exception:
         return web.Response(status=400, text="bad json")
-
+    # лог входящих апдейтов при необходимости:
+    # log.info("WEBHOOK UPDATE: %s", json.dumps(data)[:400])
     from aiogram.types import Update
     update = Update.model_validate(data)
     await dp.feed_update(bot, update)
@@ -388,6 +468,7 @@ def build_app() -> web.Application:
     dp.message.register(cmd_volatility, Command("volatility"))
     dp.message.register(cmd_trend, Command("trend"))
     dp.message.register(cmd_diag, Command("diag"))
+    dp.message.register(cmd_now, Command("now"))
     dp.message.register(on_text, F.text)
 
     app = web.Application()
@@ -400,30 +481,35 @@ def build_app() -> web.Application:
     return app
 
 async def on_startup():
-    global ws_task
+    global ws_task, watchdog_task, bot
     await init_db()
     ws_task = asyncio.create_task(ws_consumer())
+
     assert bot
     url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
-    await bot.set_webhook(url, allowed_updates=["message", "callback_query"])
-    log.info("Webhook set to %s", url)
+    await ensure_webhook(bot, url)
+    watchdog_task = asyncio.create_task(webhook_watchdog(bot, url))
 
 async def on_shutdown():
-    global ws_task, ws_session, db_pool, bot
+    global ws_task, ws_session, db_pool, bot, watchdog_task
+    # не удаляем вебхук намеренно — пусть остаётся (устойчивее на платформах)
     if bot:
-        try:
-            await bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            pass
-        await bot.session.close()
-    if ws_task:
-        ws_task.cancel()
         with contextlib.suppress(Exception):
-            await ws_task
+            await bot.session.close()
+
+    for t in (ws_task, watchdog_task):
+        if t:
+            t.cancel()
+            with contextlib.suppress(Exception):
+                await t
+
     if ws_session:
-        await ws_session.close()
+        with contextlib.suppress(Exception):
+            await ws_session.close()
+
     if db_pool:
-        await db_pool.close()
+        with contextlib.suppress(Exception):
+            await db_pool.close()
 
 def run():
     application = build_app()
