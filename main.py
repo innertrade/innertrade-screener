@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import signal
 import contextlib
 from datetime import datetime, timezone
 
@@ -12,14 +11,9 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.bot import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.types import (
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    Message,
-)
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, Message
 from aiogram.filters import Command
 
-import psycopg
 from psycopg_pool import AsyncConnectionPool
 
 # -------------------- Logging --------------------
@@ -38,8 +32,10 @@ TZ = os.getenv("TZ", "Europe/Moscow")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 BYBIT_WS_URL = os.getenv("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear").strip()
-# базовый набор USDT perp (можно расширить)
-SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT").split(",")
+SYMBOLS = os.getenv(
+    "SYMBOLS",
+    "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT",
+).split(",")
 
 # required env checks
 if not TELEGRAM_TOKEN:
@@ -76,14 +72,14 @@ CREATE TABLE IF NOT EXISTS ws_ticker (
 );
 """
 
-# psycopg3: используем %s-плейсхолдеры
+# psycopg3: используем %s-плейсхолдеры и COALESCE, чтобы не затирать отсутствующие поля
 SQL_UPSERT = """
 INSERT INTO ws_ticker (symbol, last, price24h_pcnt, turnover24h, updated_at)
 VALUES (%s, %s, %s, %s, NOW())
 ON CONFLICT (symbol) DO UPDATE
-SET last = EXCLUDED.last,
-    price24h_pcnt = EXCLUDED.price24h_pcnt,
-    turnover24h = EXCLUDED.turnover24h,
+SET last = COALESCE(EXCLUDED.last, ws_ticker.last),
+    price24h_pcnt = COALESCE(EXCLUDED.price24h_pcnt, ws_ticker.price24h_pcnt),
+    turnover24h = COALESCE(EXCLUDED.turnover24h, ws_ticker.turnover24h),
     updated_at = NOW();
 """
 
@@ -102,7 +98,8 @@ SQL_COUNT = "SELECT COUNT(*) FROM ws_ticker;"
 # -------------------- DB helpers --------------------
 async def init_db():
     global db_pool
-    db_pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=4)
+    # убираем warning: не открываем пул в конструкторе
+    db_pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=4, open=False)
     await db_pool.open()
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -121,7 +118,6 @@ async def upsert_ticker(symbol: str, last: float | None, p24: float | None, turn
 async def select_sorted(order_by: str, limit: int = 10, desc: bool = True):
     if db_pool is None:
         return []
-    # привязываем к alias (из SELECT)
     if order_by == "turnover":
         ob = "tov"
     elif order_by in ("p24", "price24h_pcnt"):
@@ -153,7 +149,8 @@ async def ws_consumer():
     log.info(f"Bybit WS connecting: {BYBIT_WS_URL}")
     try:
         async with ws_session.ws_connect(BYBIT_WS_URL, heartbeat=30) as ws:
-            args = [f"tickers.{s}" for s in SYMBOLS]
+            # подписка на tickers.SYMBOL
+            args = [f"tickers.{s}" for s in SYMBOLS if s]
             await ws.send_json({"op": "subscribe", "args": args})
             log.info(f"WS subscribed: {len(args)} topics")
 
@@ -163,33 +160,47 @@ async def ws_consumer():
                     topic = data.get("topic") or ""
                     if topic.startswith("tickers."):
                         payload = data.get("data")
-                        if isinstance(payload, dict):
-                            items = [payload]
-                        else:
-                            items = payload or []
+                        items = [payload] if isinstance(payload, dict) else (payload or [])
 
                         for it in items:
                             symbol = (it.get("symbol") or "").upper()
-                            try:
-                                last = float(it.get("lastPrice", "0") or 0)
-                            except Exception:
-                                last = 0.0
-                            try:
-                                p24 = float(it.get("price24hPcnt", "0") or 0) * 100.0
-                            except Exception:
-                                p24 = 0.0
-                            try:
-                                turnover = float(it.get("turnover24h", "0") or 0)
-                            except Exception:
-                                turnover = 0.0
+                            if not symbol:
+                                continue
 
+                            # берём сырые значения; если поля нет — None
+                            raw_last = it.get("lastPrice")
+                            raw_p24  = it.get("price24hPcnt")    # доля (0.0123 → 1.23%)
+                            raw_tov  = it.get("turnover24h")
+
+                            # конвертируем только если присутствуют
+                            try:
+                                last = float(raw_last) if raw_last not in (None, "") else None
+                            except Exception:
+                                last = None
+                            try:
+                                p24 = (float(raw_p24) * 100.0) if raw_p24 not in (None, "") else None
+                            except Exception:
+                                p24 = None
+                            try:
+                                tov = float(raw_tov) if raw_tov not in (None, "") else None
+                            except Exception:
+                                tov = None
+
+                            # пропускаем пустой апдейт (ничего не обновляется)
+                            if last is None and p24 is None and tov is None:
+                                continue
+
+                            # КЭШ: обновляем только пришедшие поля
+                            prev = ws_cache.get(symbol, {})
                             ws_cache[symbol] = {
-                                "last": last,
-                                "p24": p24,
-                                "tov": turnover,
+                                "last": last if last is not None else prev.get("last", 0.0),
+                                "p24":  p24  if p24  is not None else prev.get("p24",  0.0),
+                                "tov":  tov  if tov  is not None else prev.get("tov",  0.0),
                                 "ts": datetime.now(timezone.utc).isoformat(),
                             }
-                            await upsert_ticker(symbol, last, p24, turnover)
+
+                            # БД: None → «оставить прежнее значение» благодаря COALESCE в UPSERT
+                            await upsert_ticker(symbol, last, p24, tov)
 
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     log.error("WS error: %s", msg.data)
@@ -321,12 +332,37 @@ async def on_text(message: Message):
             f"Принял: {t}\n(команды: /start /status /activity /volatility /trend /diag)"
         )
 
-# -------------------- Webhook server --------------------
+# -------------------- HTTP endpoints --------------------
 async def handle_health(request: web.Request):
     return web.Response(text="ok")
 
 async def handle_root(request: web.Request):
     return web.Response(text="Innertrade screener is alive")
+
+# удобные HTTP-версии /status и /diag
+async def handle_status_http(request: web.Request):
+    n = await count_rows()
+    body = (
+        "Status\n"
+        f"Time: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S (%Z)')}\n"
+        "Mode: active | Quiet: False\n"
+        "Source: Bybit (public WS)\n"
+        "Version: v1.1.0-db-ws\n"
+        f"Bybit WS: {BYBIT_WS_URL}\n"
+        f"WS connected: True\n"
+        f"DB rows: {n}\n"
+    )
+    return web.Response(text=body)
+
+async def handle_diag_http(request: web.Request):
+    n = await count_rows()
+    sample = list(ws_cache.items())[:3]
+    sample_txt = "\n".join(
+        f"{k}: p24={v['p24']:.2f} last={v['last']} tov~{int(v['tov']):,}".replace(",", " ")
+        for k, v in sample
+    ) or "—"
+    body = f"diag\nrows={n}\ncache_sample:\n{sample_txt}\n"
+    return web.Response(text=body)
 
 async def handle_webhook(request: web.Request):
     assert bot and dp
@@ -357,6 +393,8 @@ def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/status", handle_status_http)
+    app.router.add_get("/diag", handle_diag_http)
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
 
     return app
