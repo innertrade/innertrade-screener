@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS ws_ticker (
+  symbol           text PRIMARY KEY,
+  last             double precision,
+  price24h_pcnt    double precision,
+  turnover24h      double precision,
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
