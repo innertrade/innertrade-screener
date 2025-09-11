@@ -31,16 +31,23 @@ PORT = int(os.getenv("PORT", "10000"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 BYBIT_WS_URL = os.getenv("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear").strip()
+BYBIT_REST_BASE = os.getenv("BYBIT_REST_BASE", "https://api.bybit.com").strip()
+
 SYMBOLS = os.getenv(
     "SYMBOLS",
     "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT",
 ).split(",")
 
+# OI polling toggles
+ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "1").strip() not in ("0", "false", "False", "")
+OI_POLL_SECONDS = int(os.getenv("OI_POLL_SECONDS", "60"))
+OI_INTERVAL = os.getenv("OI_INTERVAL", "5min").strip()  # Bybit v5: 5min,15min,30min,1h,4h,1d
+
 if not TELEGRAM_TOKEN or not WEBHOOK_BASE or not WEBHOOK_SECRET or not DATABASE_URL:
     raise RuntimeError("Missing required ENV vars")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-VERSION = "v1.4.0-orderbook"
+VERSION = "v1.5.0-oi"
 
 # -------------------- Globals --------------------
 bot: Bot | None = None
@@ -49,8 +56,11 @@ app: web.Application | None = None
 
 db_pool: AsyncConnectionPool | None = None
 ws_session: aiohttp.ClientSession | None = None
+oi_session: aiohttp.ClientSession | None = None
+
 ws_task: asyncio.Task | None = None
 watchdog_task: asyncio.Task | None = None
+oi_task: asyncio.Task | None = None
 
 # WS state + cache
 ws_cache: dict[str, dict] = {}
@@ -138,6 +148,25 @@ ORDER BY ts DESC
 LIMIT %s;
 """
 
+SQL_INSERT_OI = """
+INSERT INTO oi_1m (ts, symbol, oi_usd)
+VALUES (%s, %s, %s)
+ON CONFLICT (symbol, ts) DO UPDATE
+SET oi_usd = EXCLUDED.oi_usd;
+"""
+
+SQL_OI_LATEST = """
+SELECT ts, oi_usd
+FROM oi_1m
+WHERE symbol = %s
+ORDER BY ts DESC
+LIMIT %s;
+"""
+
+SQL_GET_LAST_PRICE = """
+SELECT last FROM ws_ticker WHERE symbol = %s;
+"""
+
 # -------------------- DB helpers --------------------
 async def init_db():
     global db_pool
@@ -176,6 +205,14 @@ async def insert_ob_batch(items: list[tuple[datetime, str, float, float, float, 
                     SQL_INSERT_OB,
                     (ts_min, sym, bid, ask, bqty, aqty, spread_bps, depth_usd),
                 )
+        await conn.commit()
+
+async def insert_oi(ts_min: datetime, symbol: str, oi_usd: float | None):
+    if oi_usd is None or db_pool is None:
+        return
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SQL_INSERT_OI, (ts_min, symbol, oi_usd))
         await conn.commit()
 
 async def select_sorted(order_by: str, limit: int = 10, desc: bool = True):
@@ -227,6 +264,34 @@ async def ob_latest(symbol: str, limit: int = 5):
         async with conn.cursor() as cur:
             await cur.execute(SQL_OB_LATEST, (symbol.upper(), limit))
             return await cur.fetchall()
+
+async def oi_latest(symbol: str, limit: int = 5):
+    if db_pool is None:
+        return []
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SQL_OI_LATEST, (symbol.upper(), limit))
+            return await cur.fetchall()
+
+async def get_last_price(symbol: str) -> float | None:
+    # 1) пробуем из кэша WS, 2) из БД
+    sym = symbol.upper()
+    v = ws_cache.get(sym)
+    if v and isinstance(v.get("last"), (int, float)) and v["last"] > 0:
+        return float(v["last"])
+    if db_pool is None:
+        return None
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SQL_GET_LAST_PRICE, (sym,))
+            row = await cur.fetchone()
+            if row and row[0]:
+                try:
+                    val = float(row[0])
+                    return val if val > 0 else None
+                except Exception:
+                    return None
+    return None
 
 # -------------------- Webhook reliability --------------------
 async def ensure_webhook(bot: Bot, url: str, retries: int = 8) -> bool:
@@ -342,14 +407,12 @@ async def ws_consumer():
 
                         # ---- orderbook.1 (best level) ----
                         elif topic.startswith("orderbook.1."):
-                            # Bybit v5 format: data = {"b":[["price","size",...],...], "a":[["price","size",...],...], ...}
                             payload = data.get("data") or {}
                             sym = (data.get("topic") or "").split(".")[-1].upper()
                             if not sym:
                                 continue
                             bids = payload.get("b") or []
                             asks = payload.get("a") or []
-                            # берем первый уровень
                             try:
                                 best_bid = float(bids[0][0]) if bids and bids[0] and bids[0][0] is not None else None
                                 bid_qty  = float(bids[0][1]) if bids and bids[0] and bids[0][1] is not None else None
@@ -426,6 +489,91 @@ async def ob_flusher_loop():
         except Exception as e:
             log.exception("ob_flusher_loop error: %s", e)
 
+# -------------------- OI polling (REST v5/market/open-interest) --------------------
+async def fetch_oi_one(symbol: str) -> tuple[datetime | None, float | None]:
+    """
+    Возвращает (ts_min_utc, oi_usd) для symbol.
+    Пытается взять openInterestValue; если нет — оценивает oi_usd = openInterest * last.
+    """
+    global oi_session
+    if oi_session is None:
+        oi_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+
+    url = f"{BYBIT_REST_BASE}/v5/market/open-interest"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": OI_INTERVAL,  # 5min/15min/30min/1h/4h/1d
+        "limit": "1",
+    }
+    try:
+        async with oi_session.get(url, params=params) as resp:
+            if resp.status != 200:
+                log.warning("OI %s http %s", symbol, resp.status)
+                return None, None
+            j = await resp.json(loads=json.loads)
+    except Exception as e:
+        log.warning("OI %s request error: %s", symbol, e)
+        return None, None
+
+    try:
+        data = ((j or {}).get("result") or {}).get("list") or []
+        if not data:
+            return None, None
+        item = data[0]
+        # возможные поля: openInterest, openInterestValue, timestamp
+        ts_ms = item.get("timestamp") or item.get("ts") or item.get("t")
+        ts = None
+        if ts_ms:
+            try:
+                ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
+            except Exception:
+                ts = None
+        ts_min = (ts or datetime.now(timezone.utc)).replace(second=0, microsecond=0)
+
+        val = item.get("openInterestValue")
+        oi_usd = None
+        if val not in (None, ""):
+            try:
+                oi_usd = float(val)
+            except Exception:
+                oi_usd = None
+
+        if oi_usd is None:
+            raw_oi = item.get("openInterest")
+            if raw_oi not in (None, ""):
+                try:
+                    oi = float(raw_oi)
+                    last = await get_last_price(symbol) or 0.0
+                    if oi > 0 and last > 0:
+                        oi_usd = oi * last
+                except Exception:
+                    oi_usd = None
+
+        return ts_min, oi_usd
+    except Exception as e:
+        log.warning("OI %s parse error: %s", symbol, e)
+        return None, None
+
+async def oi_poll_loop():
+    if not ENABLE_OI_POLL:
+        log.info("OI polling disabled by ENV")
+        return
+    log.info("OI polling enabled: every %ss, interval=%s", OI_POLL_SECONDS, OI_INTERVAL)
+    while True:
+        try:
+            start = datetime.now(timezone.utc)
+            # последовательно, мягко к API (без ключа)
+            for i, sym in enumerate([s for s in SYMBOLS if s]):
+                ts_min, oi_usd = await fetch_oi_one(sym)
+                if ts_min and oi_usd is not None:
+                    await insert_oi(ts_min, sym, float(oi_usd))
+            took = (datetime.now(timezone.utc) - start).total_seconds()
+            log.info("OI poll cycle done in %.2fs", took)
+        except Exception as e:
+            log.exception("oi_poll_loop error: %s", e)
+        await asyncio.sleep(max(1, OI_POLL_SECONDS))
+
 # -------------------- Bot --------------------
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -439,7 +587,7 @@ def kb_main() -> ReplyKeyboardMarkup:
 async def cmd_start(message: Message):
     await message.answer(
         "🧭 Market mood\n"
-        f"Добро пожаловать в Innertrade Screener {VERSION} (tickers + trades + orderbook).\n",
+        f"Добро пожаловать в Innertrade Screener {VERSION} (tickers + trades + orderbook + OI).\n",
         reply_markup=kb_main()
     )
 
@@ -449,12 +597,12 @@ async def cmd_status(message: Message):
     await message.answer(
         "Status\n"
         f"Time: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S (%Z)')}\n"
-        "Source: Bybit (public WS)\n"
+        "Source: Bybit (public WS + REST OI)\n"
         f"Version: {VERSION}\n"
         f"Bybit WS: {BYBIT_WS_URL}\n"
         f"WS connected: {ws_connected}\n"
         f"WS last msg: {ws_ts}\n"
-        f"DB rows: {n}"
+        f"DB rows (ws_ticker): {n}"
     )
 
 async def cmd_diag(message: Message):
@@ -585,6 +733,25 @@ async def cmd_diag_ob(message: Message):
         lines.append(f"{ts:%H:%M}  bid={bid}({bq})  ask={ask}({aq})  spread={sp_bps:.2f}bps  depth≈${depth:,.0f}".replace(",", " "))
     await message.answer("\n".join(lines))
 
+async def cmd_diag_oi(message: Message):
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Usage: /diag_oi SYMBOL [N]\nНапр.: /diag_oi BTCUSDT 5")
+        return
+    sym = parts[1].upper()
+    try:
+        limit = int(parts[2]) if len(parts) >= 3 else 5
+    except Exception:
+        limit = 5
+    rows = await oi_latest(sym, limit)
+    if not rows:
+        await message.answer(f"{sym}: нет строк в oi_1m (ожидайте цикл опроса).")
+        return
+    lines = [f"{sym} — последние {len(rows)} мин (OI, $):"]
+    for ts, oi_usd in rows:
+        lines.append(f"{ts:%H:%M}  oi_usd≈${oi_usd:,.0f}".replace(",", " "))
+    await message.answer("\n".join(lines))
+
 async def on_text(message: Message):
     t = (message.text or "").strip()
     if t == "📊 Активность":
@@ -598,7 +765,7 @@ async def on_text(message: Message):
     else:
         await message.answer(
             "Команды: /start /status /activity /volatility /trend /diag /now SYMBOL "
-            "/diag_trades SYMBOL [N] /diag_ob SYMBOL [N]"
+            "/diag_trades SYMBOL [N] /diag_ob SYMBOL [N] /diag_oi SYMBOL [N]"
         )
 
 # -------------------- HTTP endpoints --------------------
@@ -614,7 +781,7 @@ async def handle_status_http(request: web.Request):
     body = (
         "Status\n"
         f"Time: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S (%Z)')}\n"
-        "Source: Bybit (public WS)\n"
+        "Source: Bybit (public WS + REST OI)\n"
         f"Version: {VERSION}\n"
         f"Bybit WS: {BYBIT_WS_URL}\n"
         f"WS connected: {ws_connected}\n"
@@ -659,6 +826,7 @@ def build_app() -> web.Application:
     dp.message.register(cmd_now, Command("now"))
     dp.message.register(cmd_diag_trades, Command("diag_trades"))
     dp.message.register(cmd_diag_ob, Command("diag_ob"))
+    dp.message.register(cmd_diag_oi, Command("diag_oi"))
     dp.message.register(on_text, F.text)
 
     app = web.Application()
@@ -671,11 +839,14 @@ def build_app() -> web.Application:
     return app
 
 async def on_startup():
-    global ws_task, watchdog_task, bot
+    global ws_task, watchdog_task, bot, oi_task, oi_session
     await init_db()
     ws_task = asyncio.create_task(ws_consumer())
     asyncio.create_task(trades_flusher_loop())
     asyncio.create_task(ob_flusher_loop())
+
+    if ENABLE_OI_POLL:
+        oi_task = asyncio.create_task(oi_poll_loop())
 
     assert bot
     url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
@@ -683,13 +854,13 @@ async def on_startup():
     watchdog_task = asyncio.create_task(webhook_watchdog(bot, url))
 
 async def on_shutdown():
-    global ws_task, ws_session, db_pool, bot, watchdog_task
+    global ws_task, ws_session, db_pool, bot, watchdog_task, oi_task, oi_session
     # не удаляем вебхук — пусть остаётся
     if bot:
         with contextlib.suppress(Exception):
             await bot.session.close()
 
-    for t in (ws_task, watchdog_task):
+    for t in (ws_task, watchdog_task, oi_task):
         if t:
             t.cancel()
             with contextlib.suppress(Exception):
@@ -698,6 +869,9 @@ async def on_shutdown():
     if ws_session:
         with contextlib.suppress(Exception):
             await ws_session.close()
+    if oi_session:
+        with contextlib.suppress(Exception):
+            await oi_session.close()
 
     if db_pool:
         with contextlib.suppress(Exception):
