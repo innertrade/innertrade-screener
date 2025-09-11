@@ -32,22 +32,22 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 BYBIT_WS_URL = os.getenv("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear").strip()
 BYBIT_REST_BASE = os.getenv("BYBIT_REST_BASE", "https://api.bybit.com").strip()
+BYBIT_REST_FALLBACK = os.getenv("BYBIT_REST_FALLBACK", "https://api.bytick.com").strip()
 
 SYMBOLS = os.getenv(
     "SYMBOLS",
     "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT",
 ).split(",")
 
-# OI polling toggles
 ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "1").strip() not in ("0", "false", "False", "")
-OI_POLL_SECONDS = int(os.getenv("OI_POLL_SECONDS", "60"))
-OI_INTERVAL = os.getenv("OI_INTERVAL", "5min").strip()  # Bybit v5: 5min,15min,30min,1h,4h,1d
+OI_POLL_SECONDS = int(os.getenv("OI_POLL_SECONDS", "90"))
+OI_INTERVAL = os.getenv("OI_INTERVAL", "5min").strip()
 
 if not TELEGRAM_TOKEN or not WEBHOOK_BASE or not WEBHOOK_SECRET or not DATABASE_URL:
     raise RuntimeError("Missing required ENV vars")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-VERSION = "v1.5.0-oi"
+VERSION = "v1.5.1-oi-fallback"
 
 # -------------------- Globals --------------------
 bot: Bot | None = None
@@ -62,15 +62,11 @@ ws_task: asyncio.Task | None = None
 watchdog_task: asyncio.Task | None = None
 oi_task: asyncio.Task | None = None
 
-# WS state + cache
 ws_cache: dict[str, dict] = {}
 ws_connected: bool = False
 ws_last_msg_ts: str | None = None
 
-# trades bucket (in-memory, per 1m)
 trade_buckets: dict[tuple[str, datetime], dict] = {}
-
-# orderbook last snapshot per minute
 ob_buckets: dict[tuple[str, datetime], dict] = {}
 
 # -------------------- SQL --------------------
@@ -163,9 +159,7 @@ ORDER BY ts DESC
 LIMIT %s;
 """
 
-SQL_GET_LAST_PRICE = """
-SELECT last FROM ws_ticker WHERE symbol = %s;
-"""
+SQL_GET_LAST_PRICE = "SELECT last FROM ws_ticker WHERE symbol = %s;"
 
 # -------------------- DB helpers --------------------
 async def init_db():
@@ -201,10 +195,7 @@ async def insert_ob_batch(items: list[tuple[datetime, str, float, float, float, 
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             for (ts_min, sym, bid, ask, bqty, aqty, spread_bps, depth_usd) in items:
-                await cur.execute(
-                    SQL_INSERT_OB,
-                    (ts_min, sym, bid, ask, bqty, aqty, spread_bps, depth_usd),
-                )
+                await cur.execute(SQL_INSERT_OB, (ts_min, sym, bid, ask, bqty, aqty, spread_bps, depth_usd))
         await conn.commit()
 
 async def insert_oi(ts_min: datetime, symbol: str, oi_usd: float | None):
@@ -225,7 +216,6 @@ async def select_sorted(order_by: str, limit: int = 10, desc: bool = True):
     else:
         ob = "last"
     direction = "DESC" if desc else "ASC"
-
     sql = SQL_SELECT_SORTED.format(order_by=ob, direction=direction)
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -274,7 +264,6 @@ async def oi_latest(symbol: str, limit: int = 5):
             return await cur.fetchall()
 
 async def get_last_price(symbol: str) -> float | None:
-    # 1) пробуем из кэша WS, 2) из БД
     sym = symbol.upper()
     v = ws_cache.get(sym)
     if v and isinstance(v.get("last"), (int, float)) and v["last"] > 0:
@@ -287,8 +276,7 @@ async def get_last_price(symbol: str) -> float | None:
             row = await cur.fetchone()
             if row and row[0]:
                 try:
-                    val = float(row[0])
-                    return val if val > 0 else None
+                    val = float(row[0]);  return val if val > 0 else None
                 except Exception:
                     return None
     return None
@@ -300,14 +288,11 @@ async def ensure_webhook(bot: Bot, url: str, retries: int = 8) -> bool:
         try:
             ok = await bot.set_webhook(url, allowed_updates=["message", "callback_query"])
             if ok:
-                log.info("Webhook set to %s", url)
-                return True
+                log.info("Webhook set to %s", url);  return True
         except Exception as e:
             log.warning("set_webhook attempt %d failed: %s", i + 1, e)
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, 30)
-    log.error("Failed to set webhook after %d attempts", retries)
-    return False
+        await asyncio.sleep(delay); delay = min(delay * 2, 30)
+    log.error("Failed to set webhook after %d attempts", retries);  return False
 
 async def webhook_watchdog(bot: Bot, url: str):
     while True:
@@ -324,13 +309,12 @@ async def webhook_watchdog(bot: Bot, url: str):
             log.warning("webhook_watchdog error: %s", e)
         await asyncio.sleep(300)
 
-# -------------------- Bybit WS ingest (tickers + publicTrade + orderbook.1) --------------------
+# -------------------- WS ingest --------------------
 async def ws_consumer():
     global ws_session, ws_connected, ws_last_msg_ts
     backoff = 1
     while True:
-        ws_connected = False
-        ws_last_msg_ts = None
+        ws_connected = False; ws_last_msg_ts = None
         ws_session = aiohttp.ClientSession()
         log.info("Bybit WS connecting: %s", BYBIT_WS_URL)
         try:
@@ -342,39 +326,26 @@ async def ws_consumer():
                 )
                 await ws.send_json({"op": "subscribe", "args": args})
                 log.info("WS subscribed: %d topics", len(args))
-                ws_connected = True
-                backoff = 1
+                ws_connected = True; backoff = 1
 
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = msg.json(loads=json.loads)
-                        topic = data.get("topic") or ""
+                        data = msg.json(loads=json.loads); topic = data.get("topic") or ""
 
-                        # ---- tickers ----
                         if topic.startswith("tickers."):
                             payload = data.get("data")
                             items = [payload] if isinstance(payload, dict) else (payload or [])
                             for it in items:
                                 symbol = (it.get("symbol") or "").upper()
-                                if not symbol:
-                                    continue
-                                raw_last = it.get("lastPrice")
-                                raw_p24  = it.get("price24hPcnt")
-                                raw_tov  = it.get("turnover24h")
-                                try:
-                                    last = float(raw_last) if raw_last not in (None, "") else None
-                                except Exception:
-                                    last = None
-                                try:
-                                    p24 = (float(raw_p24) * 100.0) if raw_p24 not in (None, "") else None
-                                except Exception:
-                                    p24 = None
-                                try:
-                                    tov = float(raw_tov) if raw_tov not in (None, "") else None
-                                except Exception:
-                                    tov = None
-                                if last is None and p24 is None and tov is None:
-                                    continue
+                                if not symbol: continue
+                                raw_last = it.get("lastPrice"); raw_p24  = it.get("price24hPcnt"); raw_tov  = it.get("turnover24h")
+                                try:   last = float(raw_last) if raw_last not in (None, "") else None
+                                except: last = None
+                                try:   p24 = (float(raw_p24) * 100.0) if raw_p24 not in (None, "") else None
+                                except: p24 = None
+                                try:   tov = float(raw_tov) if raw_tov not in (None, "") else None
+                                except: tov = None
+                                if last is None and p24 is None and tov is None:  continue
                                 prev = ws_cache.get(symbol, {})
                                 ws_cache[symbol] = {
                                     "last": last if last is not None else prev.get("last", 0.0),
@@ -385,78 +356,51 @@ async def ws_consumer():
                                 await upsert_ticker(symbol, last, p24, tov)
                                 ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
 
-                        # ---- publicTrade ----
                         elif topic.startswith("publicTrade."):
                             payload = data.get("data") or []
-                            if isinstance(payload, dict):
-                                payload = [payload]
+                            if isinstance(payload, dict): payload = [payload]
                             ts_min = datetime.now(timezone.utc).replace(second=0, microsecond=0)
                             for tr in payload:
                                 sym = (tr.get("s") or "").upper()
-                                if not sym:
-                                    continue
-                                try:
-                                    qty = float(tr.get("v") or 0)
-                                except Exception:
-                                    qty = 0.0
+                                if not sym: continue
+                                try: qty = float(tr.get("v") or 0)
+                                except: qty = 0.0
                                 key = (sym, ts_min)
                                 b = trade_buckets.setdefault(key, {"count": 0, "qty": 0.0})
-                                b["count"] += 1
-                                b["qty"] += qty
+                                b["count"] += 1; b["qty"] += qty
                                 ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
 
-                        # ---- orderbook.1 (best level) ----
                         elif topic.startswith("orderbook.1."):
-                            payload = data.get("data") or {}
-                            sym = (data.get("topic") or "").split(".")[-1].upper()
-                            if not sym:
-                                continue
-                            bids = payload.get("b") or []
-                            asks = payload.get("a") or []
-                            try:
-                                best_bid = float(bids[0][0]) if bids and bids[0] and bids[0][0] is not None else None
-                                bid_qty  = float(bids[0][1]) if bids and bids[0] and bids[0][1] is not None else None
-                            except Exception:
-                                best_bid, bid_qty = None, None
-                            try:
-                                best_ask = float(asks[0][0]) if asks and asks[0] and asks[0][0] is not None else None
-                                ask_qty  = float(asks[0][1]) if asks and asks[0] and asks[0][1] is not None else None
-                            except Exception:
-                                best_ask, ask_qty = None, None
-
-                            if best_bid is None or best_ask is None:
-                                continue
-
+                            payload = data.get("data") or {}; sym = (data.get("topic") or "").split(".")[-1].upper()
+                            if not sym: continue
+                            bids = payload.get("b") or []; asks = payload.get("a") or []
+                            try:    best_bid = float(bids[0][0]); bid_qty = float(bids[0][1])
+                            except: best_bid, bid_qty = None, None
+                            try:    best_ask = float(asks[0][0]); ask_qty = float(asks[0][1])
+                            except: best_ask, ask_qty = None, None
+                            if best_bid is None or best_ask is None: continue
                             ts_min = datetime.now(timezone.utc).replace(second=0, microsecond=0)
                             key = (sym, ts_min)
-                            ob_buckets[key] = {
-                                "bid": best_bid,
-                                "ask": best_ask,
-                                "bid_qty": float(bid_qty or 0.0),
-                                "ask_qty": float(ask_qty or 0.0),
-                            }
+                            ob_buckets[key] = {"bid": float(best_bid), "ask": float(best_ask),
+                                               "bid_qty": float(bid_qty or 0.0), "ask_qty": float(ask_qty or 0.0)}
                             ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
 
                     elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
-                        log.warning("WS closed or error")
-                        break
+                        log.warning("WS closed or error"); break
         except Exception as e:
             log.warning("WS loop error: %s", e)
         finally:
-            with contextlib.suppress(Exception):
-                await ws_session.close()
+            with contextlib.suppress(Exception): await ws_session.close()
             ws_connected = False
             log.info("WS consumer finished; reconnecting in %ss...", backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+            await asyncio.sleep(backoff); backoff = min(backoff * 2, 30)
 
-# trades flusher loop (each minute)
+# -------------------- Flushers --------------------
 async def trades_flusher_loop():
     while True:
         try:
             await asyncio.sleep(60)
-            if not trade_buckets:
-                continue
+            if not trade_buckets: continue
             items = []
             for (sym, ts_min), data in list(trade_buckets.items()):
                 items.append((ts_min, sym, int(data.get("count", 0)), float(data.get("qty", 0.0))))
@@ -466,19 +410,15 @@ async def trades_flusher_loop():
         except Exception as e:
             log.exception("trades_flusher_loop error: %s", e)
 
-# orderbook flusher loop (each minute)
 async def ob_flusher_loop():
     while True:
         try:
             await asyncio.sleep(60)
-            if not ob_buckets:
-                continue
+            if not ob_buckets: continue
             items = []
             for (sym, ts_min), data in list(ob_buckets.items()):
-                bid = float(data.get("bid", 0.0))
-                ask = float(data.get("ask", 0.0))
-                bq  = float(data.get("bid_qty", 0.0))
-                aq  = float(data.get("ask_qty", 0.0))
+                bid = float(data.get("bid", 0.0)); ask = float(data.get("ask", 0.0))
+                bq  = float(data.get("bid_qty", 0.0)); aq  = float(data.get("ask_qty", 0.0))
                 mid = (bid + ask) / 2.0 if (bid and ask) else 0.0
                 spread_bps = ((ask - bid) / mid * 10000.0) if mid > 0 else 0.0
                 depth_usd  = (bq + aq) * mid
@@ -489,31 +429,52 @@ async def ob_flusher_loop():
         except Exception as e:
             log.exception("ob_flusher_loop error: %s", e)
 
-# -------------------- OI polling (REST v5/market/open-interest) --------------------
+# -------------------- OI polling with fallback --------------------
+OI_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (compatible; InnertradeScreener/1.0; +https://example.com)",
+    "Connection": "close",
+}
+
+async def fetch_oi_from(base_url: str, session: aiohttp.ClientSession, symbol: str):
+    url = f"{base_url}/v5/market/open-interest"
+    params = {"category": "linear", "symbol": symbol, "interval": OI_INTERVAL, "limit": "1"}
+    async with session.get(url, params=params, headers=OI_HEADERS) as resp:
+        if resp.status != 200:
+            return resp.status, None
+        j = await resp.json(loads=json.loads)
+        return 200, j
+
 async def fetch_oi_one(symbol: str) -> tuple[datetime | None, float | None]:
     """
     Возвращает (ts_min_utc, oi_usd) для symbol.
-    Пытается взять openInterestValue; если нет — оценивает oi_usd = openInterest * last.
+    При 403 — пробуем BYBIT_REST_FALLBACK.
     """
     global oi_session
     if oi_session is None:
-        oi_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        oi_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
 
-    url = f"{BYBIT_REST_BASE}/v5/market/open-interest"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": OI_INTERVAL,  # 5min/15min/30min/1h/4h/1d
-        "limit": "1",
-    }
+    # 1) Основной домен
     try:
-        async with oi_session.get(url, params=params) as resp:
-            if resp.status != 200:
-                log.warning("OI %s http %s", symbol, resp.status)
-                return None, None
-            j = await resp.json(loads=json.loads)
+        status, j = await fetch_oi_from(BYBIT_REST_BASE, oi_session, symbol)
     except Exception as e:
-        log.warning("OI %s request error: %s", symbol, e)
+        log.warning("OI %s base error: %s", symbol, e)
+        status, j = 599, None
+
+    # 2) Фолбэк при 403/401/5xx
+    if status in (401, 403, 429, 500, 502, 503, 504):
+        try:
+            status_fb, j_fb = await fetch_oi_from(BYBIT_REST_FALLBACK, oi_session, symbol)
+            if status_fb == 200:
+                status, j = status_fb, j_fb
+                log.info("OI %s served by fallback domain", symbol)
+            else:
+                status = status_fb
+        except Exception as e:
+            log.warning("OI %s fallback error: %s", symbol, e)
+
+    if status != 200 or not j:
+        log.warning("OI %s http %s", symbol, status)
         return None, None
 
     try:
@@ -521,7 +482,6 @@ async def fetch_oi_one(symbol: str) -> tuple[datetime | None, float | None]:
         if not data:
             return None, None
         item = data[0]
-        # возможные поля: openInterest, openInterestValue, timestamp
         ts_ms = item.get("timestamp") or item.get("ts") or item.get("t")
         ts = None
         if ts_ms:
@@ -531,8 +491,8 @@ async def fetch_oi_one(symbol: str) -> tuple[datetime | None, float | None]:
                 ts = None
         ts_min = (ts or datetime.now(timezone.utc)).replace(second=0, microsecond=0)
 
-        val = item.get("openInterestValue")
         oi_usd = None
+        val = item.get("openInterestValue")
         if val not in (None, ""):
             try:
                 oi_usd = float(val)
@@ -557,14 +517,12 @@ async def fetch_oi_one(symbol: str) -> tuple[datetime | None, float | None]:
 
 async def oi_poll_loop():
     if not ENABLE_OI_POLL:
-        log.info("OI polling disabled by ENV")
-        return
+        log.info("OI polling disabled by ENV");  return
     log.info("OI polling enabled: every %ss, interval=%s", OI_POLL_SECONDS, OI_INTERVAL)
     while True:
         try:
             start = datetime.now(timezone.utc)
-            # последовательно, мягко к API (без ключа)
-            for i, sym in enumerate([s for s in SYMBOLS if s]):
+            for sym in [s for s in SYMBOLS if s]:
                 ts_min, oi_usd = await fetch_oi_one(sym)
                 if ts_min and oi_usd is not None:
                     await insert_oi(ts_min, sym, float(oi_usd))
@@ -612,15 +570,10 @@ async def cmd_diag(message: Message):
         f"{k}: p24={v['p24']:.2f} last={v['last']} tov~{int(v['tov']):,}".replace(",", " ")
         for k, v in sample
     ) or "—"
-    await message.answer(
-        "diag\n"
-        f"rows={n}\n"
-        f"cache_sample:\n{sample_txt}"
-    )
+    await message.answer("diag\n" f"rows={n}\n" f"cache_sample:\n{sample_txt}")
 
 def fmt_activity(rows: list[tuple]) -> str:
-    if not rows:
-        return "Нет данных."
+    if not rows: return "Нет данных."
     lines = []
     for i, r in enumerate(rows, 1):
         sym, p24, tov, last = r
@@ -628,8 +581,7 @@ def fmt_activity(rows: list[tuple]) -> str:
     return "🔥 Активность (Bybit WS + DB)\n" + "\n".join(lines[:10])
 
 def fmt_volatility(rows: list[tuple]) -> str:
-    if not rows:
-        return "Нет данных."
+    if not rows: return "Нет данных."
     lines = []
     for i, r in enumerate(rows, 1):
         sym, p24, tov, last = r
@@ -637,8 +589,7 @@ def fmt_volatility(rows: list[tuple]) -> str:
     return "⚡ Волатильность (24h %, Bybit WS + DB)\n" + "\n".join(lines[:10])
 
 def fmt_trend(rows: list[tuple]) -> str:
-    if not rows:
-        return "Нет данных."
+    if not rows: return "Нет данных."
     lines = []
     for i, r in enumerate(rows, 1):
         sym, p24, tov, last = r
@@ -648,67 +599,48 @@ def fmt_trend(rows: list[tuple]) -> str:
 async def cmd_activity(message: Message):
     rows = await select_sorted("turnover", 10, desc=True)
     if not rows and ws_cache:
-        rows = sorted(
-            [(s, v["p24"], v["tov"], v["last"]) for s, v in ws_cache.items()],
-            key=lambda z: z[2],
-            reverse=True
-        )[:10]
+        rows = sorted([(s, v["p24"], v["tov"], v["last"]) for s, v in ws_cache.items()],
+                      key=lambda z: z[2], reverse=True)[:10]
     await message.answer(fmt_activity(rows))
 
 async def cmd_volatility(message: Message):
     rows = await select_sorted("p24", 50, desc=True)
     rows = sorted(rows, key=lambda r: abs(r[1]), reverse=True)[:10]
     if not rows and ws_cache:
-        rows = sorted(
-            [(s, v["p24"], v["tov"], v["last"]) for s, v in ws_cache.items()],
-            key=lambda z: abs(z[1]),
-            reverse=True
-        )[:10]
+        rows = sorted([(s, v["p24"], v["tov"], v["last"]) for s, v in ws_cache.items()],
+                      key=lambda z: abs(z[1]), reverse=True)[:10]
     await message.answer(fmt_volatility(rows))
 
 async def cmd_trend(message: Message):
     rows = await select_sorted("p24", 10, desc=True)
     if not rows and ws_cache:
-        rows = sorted(
-            [(s, v["p24"], v["tov"], v["last"]) for s, v in ws_cache.items()],
-            key=lambda z: z[1],
-            reverse=True
-        )[:10]
+        rows = sorted([(s, v["p24"], v["tov"], v["last"]) for s, v in ws_cache.items()],
+                      key=lambda z: z[1], reverse=True)[:10]
     await message.answer(fmt_trend(rows))
 
 async def cmd_now(message: Message):
     parts = (message.text or "").strip().split()
     if len(parts) < 2:
-        await message.answer("Usage: /now SYMBOL (пример: /now BTCUSDT)")
-        return
+        await message.answer("Usage: /now SYMBOL (пример: /now BTCUSDT)"); return
     sym = parts[1].upper()
     row = await get_one(sym)
     if not row:
-        await message.answer(f"{sym}: нет данных в БД.")
-        return
+        await message.answer(f"{sym}: нет данных в БД."); return
     symbol, last, p24, tov, updated = row
     await message.answer(
-        f"{symbol}\n"
-        f"last: {last}\n"
-        f"24h%: {p24}\n"
-        f"turnover24h: {tov}\n"
-        f"updated_at: {updated}"
+        f"{symbol}\nlast: {last}\n24h%: {p24}\nturnover24h: {tov}\nupdated_at: {updated}"
     )
 
 async def cmd_diag_trades(message: Message):
     parts = (message.text or "").strip().split()
     if len(parts) < 2:
-        await message.answer("Usage: /diag_trades SYMBOL [N]\nНапр.: /diag_trades BTCUSDT 5")
-        return
+        await message.answer("Usage: /diag_trades SYMBOL [N]\nНапр.: /diag_trades BTCUSDT 5"); return
     sym = parts[1].upper()
-    try:
-        limit = int(parts[2]) if len(parts) >= 3 else 5
-    except Exception:
-        limit = 5
+    try: limit = int(parts[2]) if len(parts) >= 3 else 5
+    except: limit = 5
     rows = await trades_latest(sym, limit)
     if not rows:
-        await message.answer(f"{sym}: нет строк в trades_1m (пока нет сделок/ждите минуту).")
-        return
+        await message.answer(f"{sym}: нет строк в trades_1m (пока нет сделок/ждите минуту)."); return
     lines = [f"{sym} — последние {len(rows)} мин:"]
     for ts, cnt, qty in rows:
         lines.append(f"{ts:%H:%M}  trades={cnt}  qty={qty}")
@@ -717,17 +649,13 @@ async def cmd_diag_trades(message: Message):
 async def cmd_diag_ob(message: Message):
     parts = (message.text or "").strip().split()
     if len(parts) < 2:
-        await message.answer("Usage: /diag_ob SYMBOL [N]\nНапр.: /diag_ob BTCUSDT 5")
-        return
+        await message.answer("Usage: /diag_ob SYMBOL [N]\nНапр.: /diag_ob BTCUSDT 5"); return
     sym = parts[1].upper()
-    try:
-        limit = int(parts[2]) if len(parts) >= 3 else 5
-    except Exception:
-        limit = 5
+    try: limit = int(parts[2]) if len(parts) >= 3 else 5
+    except: limit = 5
     rows = await ob_latest(sym, limit)
     if not rows:
-        await message.answer(f"{sym}: нет строк в ob_1m (ожидайте минуту).")
-        return
+        await message.answer(f"{sym}: нет строк в ob_1m (ожидайте минуту)."); return
     lines = [f"{sym} — последние {len(rows)} мин (best level):"]
     for ts, bid, ask, bq, aq, sp_bps, depth in rows:
         lines.append(f"{ts:%H:%M}  bid={bid}({bq})  ask={ask}({aq})  spread={sp_bps:.2f}bps  depth≈${depth:,.0f}".replace(",", " "))
@@ -736,17 +664,13 @@ async def cmd_diag_ob(message: Message):
 async def cmd_diag_oi(message: Message):
     parts = (message.text or "").strip().split()
     if len(parts) < 2:
-        await message.answer("Usage: /diag_oi SYMBOL [N]\nНапр.: /diag_oi BTCUSDT 5")
-        return
+        await message.answer("Usage: /diag_oi SYMBOL [N]\nНапр.: /diag_oi BTCUSDT 5"); return
     sym = parts[1].upper()
-    try:
-        limit = int(parts[2]) if len(parts) >= 3 else 5
-    except Exception:
-        limit = 5
+    try: limit = int(parts[2]) if len(parts) >= 3 else 5
+    except: limit = 5
     rows = await oi_latest(sym, limit)
     if not rows:
-        await message.answer(f"{sym}: нет строк в oi_1m (ожидайте цикл опроса).")
-        return
+        await message.answer(f"{sym}: нет строк в oi_1m (ожидайте цикл опроса)."); return
     lines = [f"{sym} — последние {len(rows)} мин (OI, $):"]
     for ts, oi_usd in rows:
         lines.append(f"{ts:%H:%M}  oi_usd≈${oi_usd:,.0f}".replace(",", " "))
@@ -754,58 +678,41 @@ async def cmd_diag_oi(message: Message):
 
 async def on_text(message: Message):
     t = (message.text or "").strip()
-    if t == "📊 Активность":
-        await cmd_activity(message)
-    elif t == "⚡ Волатильность":
-        await cmd_volatility(message)
-    elif t == "📈 Тренд":
-        await cmd_trend(message)
-    elif t == "🫧 Bubbles":
-        await message.answer("WS Bubbles (24h %, size~turnover24h)")
+    if t == "📊 Активность":   await cmd_activity(message)
+    elif t == "⚡ Волатильность": await cmd_volatility(message)
+    elif t == "📈 Тренд":      await cmd_trend(message)
+    elif t == "🫧 Bubbles":    await message.answer("WS Bubbles (24h %, size~turnover24h)")
     else:
         await message.answer(
             "Команды: /start /status /activity /volatility /trend /diag /now SYMBOL "
             "/diag_trades SYMBOL [N] /diag_ob SYMBOL [N] /diag_oi SYMBOL [N]"
         )
 
-# -------------------- HTTP endpoints --------------------
-async def handle_health(request: web.Request):
-    return web.Response(text="ok")
-
-async def handle_root(request: web.Request):
-    return web.Response(text="Innertrade screener is alive")
-
+# -------------------- HTTP --------------------
+async def handle_health(request: web.Request): return web.Response(text="ok")
+async def handle_root(request: web.Request):   return web.Response(text="Innertrade screener is alive")
 async def handle_status_http(request: web.Request):
-    n = await count_rows()
-    ws_ts = ws_last_msg_ts or "—"
-    body = (
-        "Status\n"
-        f"Time: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S (%Z)')}\n"
-        "Source: Bybit (public WS + REST OI)\n"
-        f"Version: {VERSION}\n"
-        f"Bybit WS: {BYBIT_WS_URL}\n"
-        f"WS connected: {ws_connected}\n"
-        f"WS last msg: {ws_ts}\n"
-        f"DB rows: {n}\n"
-    )
+    n = await count_rows(); ws_ts = ws_last_msg_ts or "—"
+    body = ("Status\n"
+            f"Time: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S (%Z)')}\n"
+            "Source: Bybit (public WS + REST OI)\n"
+            f"Version: {VERSION}\n"
+            f"Bybit WS: {BYBIT_WS_URL}\n"
+            f"WS connected: {ws_connected}\n"
+            f"WS last msg: {ws_ts}\n"
+            f"DB rows: {n}\n")
     return web.Response(text=body)
 
 async def handle_diag_http(request: web.Request):
-    n = await count_rows()
-    sample = list(ws_cache.items())[:3]
-    sample_txt = "\n".join(
-        f"{k}: p24={v['p24']:.2f} last={v['last']} tov~{int(v['tov']):,}".replace(",", " ")
-        for k, v in sample
-    ) or "—"
-    body = f"diag\nrows={n}\ncache_sample:\n{sample_txt}\n"
-    return web.Response(text=body)
+    n = await count_rows(); sample = list(ws_cache.items())[:3]
+    sample_txt = "\n".join(f"{k}: p24={v['p24']:.2f} last={v['last']} tov~{int(v['tov']):,}".replace(",", " ")
+                           for k, v in sample) or "—"
+    return web.Response(text=f"diag\nrows={n}\ncache_sample:\n{sample_txt}\n")
 
 async def handle_webhook(request: web.Request):
     assert bot and dp
-    try:
-        data = await request.json()
-    except Exception:
-        return web.Response(status=400, text="bad json")
+    try: data = await request.json()
+    except Exception: return web.Response(status=400, text="bad json")
     from aiogram.types import Update
     update = Update.model_validate(data)
     await dp.feed_update(bot, update)
@@ -835,16 +742,14 @@ def build_app() -> web.Application:
     app.router.add_get("/status", handle_status_http)
     app.router.add_get("/diag", handle_diag_http)
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
-
     return app
 
 async def on_startup():
-    global ws_task, watchdog_task, bot, oi_task, oi_session
+    global ws_task, watchdog_task, bot, oi_task
     await init_db()
     ws_task = asyncio.create_task(ws_consumer())
     asyncio.create_task(trades_flusher_loop())
     asyncio.create_task(ob_flusher_loop())
-
     if ENABLE_OI_POLL:
         oi_task = asyncio.create_task(oi_poll_loop())
 
@@ -855,27 +760,18 @@ async def on_startup():
 
 async def on_shutdown():
     global ws_task, ws_session, db_pool, bot, watchdog_task, oi_task, oi_session
-    # не удаляем вебхук — пусть остаётся
     if bot:
-        with contextlib.suppress(Exception):
-            await bot.session.close()
-
+        with contextlib.suppress(Exception): await bot.session.close()
     for t in (ws_task, watchdog_task, oi_task):
         if t:
             t.cancel()
-            with contextlib.suppress(Exception):
-                await t
-
+            with contextlib.suppress(Exception): await t
     if ws_session:
-        with contextlib.suppress(Exception):
-            await ws_session.close()
+        with contextlib.suppress(Exception): await ws_session.close()
     if oi_session:
-        with contextlib.suppress(Exception):
-            await oi_session.close()
-
+        with contextlib.suppress(Exception): await oi_session.close()
     if db_pool:
-        with contextlib.suppress(Exception):
-            await db_pool.close()
+        with contextlib.suppress(Exception): await db_pool.close()
 
 def run():
     application = build_app()
