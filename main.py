@@ -40,7 +40,7 @@ if not TELEGRAM_TOKEN or not WEBHOOK_BASE or not WEBHOOK_SECRET or not DATABASE_
     raise RuntimeError("Missing required ENV vars")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-VERSION = "v1.3.2-trades-diag"
+VERSION = "v1.4.0-orderbook"
 
 # -------------------- Globals --------------------
 bot: Bot | None = None
@@ -59,6 +59,9 @@ ws_last_msg_ts: str | None = None
 
 # trades bucket (in-memory, per 1m)
 trade_buckets: dict[tuple[str, datetime], dict] = {}
+
+# orderbook last snapshot per minute
+ob_buckets: dict[tuple[str, datetime], dict] = {}
 
 # -------------------- SQL --------------------
 SQL_CREATE = """
@@ -115,6 +118,26 @@ ORDER BY ts DESC
 LIMIT %s;
 """
 
+SQL_INSERT_OB = """
+INSERT INTO ob_1m (ts, symbol, best_bid, best_ask, bid_qty, ask_qty, spread_bps, depth_usd)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (symbol, ts) DO UPDATE
+SET best_bid   = EXCLUDED.best_bid,
+    best_ask   = EXCLUDED.best_ask,
+    bid_qty    = EXCLUDED.bid_qty,
+    ask_qty    = EXCLUDED.ask_qty,
+    spread_bps = EXCLUDED.spread_bps,
+    depth_usd  = EXCLUDED.depth_usd;
+"""
+
+SQL_OB_LATEST = """
+SELECT ts, best_bid, best_ask, bid_qty, ask_qty, spread_bps, depth_usd
+FROM ob_1m
+WHERE symbol = %s
+ORDER BY ts DESC
+LIMIT %s;
+"""
+
 # -------------------- DB helpers --------------------
 async def init_db():
     global db_pool
@@ -141,6 +164,18 @@ async def insert_trades_batch(items: list[tuple[datetime, str, int, float]]):
         async with conn.cursor() as cur:
             for ts_min, sym, cnt, qty in items:
                 await cur.execute(SQL_INSERT_TRADES, (ts_min, sym, cnt, qty))
+        await conn.commit()
+
+async def insert_ob_batch(items: list[tuple[datetime, str, float, float, float, float, float, float]]):
+    if not items or db_pool is None:
+        return
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            for (ts_min, sym, bid, ask, bqty, aqty, spread_bps, depth_usd) in items:
+                await cur.execute(
+                    SQL_INSERT_OB,
+                    (ts_min, sym, bid, ask, bqty, aqty, spread_bps, depth_usd),
+                )
         await conn.commit()
 
 async def select_sorted(order_by: str, limit: int = 10, desc: bool = True):
@@ -185,6 +220,14 @@ async def trades_latest(symbol: str, limit: int = 5):
             await cur.execute(SQL_TRADES_LATEST, (symbol.upper(), limit))
             return await cur.fetchall()
 
+async def ob_latest(symbol: str, limit: int = 5):
+    if db_pool is None:
+        return []
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SQL_OB_LATEST, (symbol.upper(), limit))
+            return await cur.fetchall()
+
 # -------------------- Webhook reliability --------------------
 async def ensure_webhook(bot: Bot, url: str, retries: int = 8) -> bool:
     delay = 1
@@ -216,7 +259,7 @@ async def webhook_watchdog(bot: Bot, url: str):
             log.warning("webhook_watchdog error: %s", e)
         await asyncio.sleep(300)
 
-# -------------------- Bybit WS ingest (tickers + publicTrade) w/ reconnect --------------------
+# -------------------- Bybit WS ingest (tickers + publicTrade + orderbook.1) --------------------
 async def ws_consumer():
     global ws_session, ws_connected, ws_last_msg_ts
     backoff = 1
@@ -227,7 +270,11 @@ async def ws_consumer():
         log.info("Bybit WS connecting: %s", BYBIT_WS_URL)
         try:
             async with ws_session.ws_connect(BYBIT_WS_URL, heartbeat=30) as ws:
-                args = [f"tickers.{s}" for s in SYMBOLS if s] + [f"publicTrade.{s}" for s in SYMBOLS if s]
+                args = (
+                    [f"tickers.{s}" for s in SYMBOLS if s]
+                    + [f"publicTrade.{s}" for s in SYMBOLS if s]
+                    + [f"orderbook.1.{s}" for s in SYMBOLS if s]
+                )
                 await ws.send_json({"op": "subscribe", "args": args})
                 log.info("WS subscribed: %d topics", len(args))
                 ws_connected = True
@@ -238,6 +285,7 @@ async def ws_consumer():
                         data = msg.json(loads=json.loads)
                         topic = data.get("topic") or ""
 
+                        # ---- tickers ----
                         if topic.startswith("tickers."):
                             payload = data.get("data")
                             items = [payload] if isinstance(payload, dict) else (payload or [])
@@ -272,6 +320,7 @@ async def ws_consumer():
                                 await upsert_ticker(symbol, last, p24, tov)
                                 ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
 
+                        # ---- publicTrade ----
                         elif topic.startswith("publicTrade."):
                             payload = data.get("data") or []
                             if isinstance(payload, dict):
@@ -290,6 +339,40 @@ async def ws_consumer():
                                 b["count"] += 1
                                 b["qty"] += qty
                                 ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
+
+                        # ---- orderbook.1 (best level) ----
+                        elif topic.startswith("orderbook.1."):
+                            # Bybit v5 format: data = {"b":[["price","size",...],...], "a":[["price","size",...],...], ...}
+                            payload = data.get("data") or {}
+                            sym = (data.get("topic") or "").split(".")[-1].upper()
+                            if not sym:
+                                continue
+                            bids = payload.get("b") or []
+                            asks = payload.get("a") or []
+                            # берем первый уровень
+                            try:
+                                best_bid = float(bids[0][0]) if bids and bids[0] and bids[0][0] is not None else None
+                                bid_qty  = float(bids[0][1]) if bids and bids[0] and bids[0][1] is not None else None
+                            except Exception:
+                                best_bid, bid_qty = None, None
+                            try:
+                                best_ask = float(asks[0][0]) if asks and asks[0] and asks[0][0] is not None else None
+                                ask_qty  = float(asks[0][1]) if asks and asks[0] and asks[0][1] is not None else None
+                            except Exception:
+                                best_ask, ask_qty = None, None
+
+                            if best_bid is None or best_ask is None:
+                                continue
+
+                            ts_min = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+                            key = (sym, ts_min)
+                            ob_buckets[key] = {
+                                "bid": best_bid,
+                                "ask": best_ask,
+                                "bid_qty": float(bid_qty or 0.0),
+                                "ask_qty": float(ask_qty or 0.0),
+                            }
+                            ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
 
                     elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
                         log.warning("WS closed or error")
@@ -320,6 +403,29 @@ async def trades_flusher_loop():
         except Exception as e:
             log.exception("trades_flusher_loop error: %s", e)
 
+# orderbook flusher loop (each minute)
+async def ob_flusher_loop():
+    while True:
+        try:
+            await asyncio.sleep(60)
+            if not ob_buckets:
+                continue
+            items = []
+            for (sym, ts_min), data in list(ob_buckets.items()):
+                bid = float(data.get("bid", 0.0))
+                ask = float(data.get("ask", 0.0))
+                bq  = float(data.get("bid_qty", 0.0))
+                aq  = float(data.get("ask_qty", 0.0))
+                mid = (bid + ask) / 2.0 if (bid and ask) else 0.0
+                spread_bps = ((ask - bid) / mid * 10000.0) if mid > 0 else 0.0
+                depth_usd  = (bq + aq) * mid
+                items.append((ts_min, sym, bid, ask, bq, aq, spread_bps, depth_usd))
+                ob_buckets.pop((sym, ts_min), None)
+            await insert_ob_batch(items)
+            log.info("Flushed %d orderbook buckets", len(items))
+        except Exception as e:
+            log.exception("ob_flusher_loop error: %s", e)
+
 # -------------------- Bot --------------------
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -333,7 +439,7 @@ def kb_main() -> ReplyKeyboardMarkup:
 async def cmd_start(message: Message):
     await message.answer(
         "🧭 Market mood\n"
-        f"Добро пожаловать в Innertrade Screener {VERSION} (Bybit WS + DB + trades).\n",
+        f"Добро пожаловать в Innertrade Screener {VERSION} (tickers + trades + orderbook).\n",
         reply_markup=kb_main()
     )
 
@@ -460,6 +566,25 @@ async def cmd_diag_trades(message: Message):
         lines.append(f"{ts:%H:%M}  trades={cnt}  qty={qty}")
     await message.answer("\n".join(lines))
 
+async def cmd_diag_ob(message: Message):
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Usage: /diag_ob SYMBOL [N]\nНапр.: /diag_ob BTCUSDT 5")
+        return
+    sym = parts[1].upper()
+    try:
+        limit = int(parts[2]) if len(parts) >= 3 else 5
+    except Exception:
+        limit = 5
+    rows = await ob_latest(sym, limit)
+    if not rows:
+        await message.answer(f"{sym}: нет строк в ob_1m (ожидайте минуту).")
+        return
+    lines = [f"{sym} — последние {len(rows)} мин (best level):"]
+    for ts, bid, ask, bq, aq, sp_bps, depth in rows:
+        lines.append(f"{ts:%H:%M}  bid={bid}({bq})  ask={ask}({aq})  spread={sp_bps:.2f}bps  depth≈${depth:,.0f}".replace(",", " "))
+    await message.answer("\n".join(lines))
+
 async def on_text(message: Message):
     t = (message.text or "").strip()
     if t == "📊 Активность":
@@ -472,7 +597,8 @@ async def on_text(message: Message):
         await message.answer("WS Bubbles (24h %, size~turnover24h)")
     else:
         await message.answer(
-            f"Принял: {t}\n(команды: /start /status /activity /volatility /trend /diag /now SYMBOL /diag_trades SYMBOL [N])"
+            "Команды: /start /status /activity /volatility /trend /diag /now SYMBOL "
+            "/diag_trades SYMBOL [N] /diag_ob SYMBOL [N]"
         )
 
 # -------------------- HTTP endpoints --------------------
@@ -532,6 +658,7 @@ def build_app() -> web.Application:
     dp.message.register(cmd_diag, Command("diag"))
     dp.message.register(cmd_now, Command("now"))
     dp.message.register(cmd_diag_trades, Command("diag_trades"))
+    dp.message.register(cmd_diag_ob, Command("diag_ob"))
     dp.message.register(on_text, F.text)
 
     app = web.Application()
@@ -548,6 +675,7 @@ async def on_startup():
     await init_db()
     ws_task = asyncio.create_task(ws_consumer())
     asyncio.create_task(trades_flusher_loop())
+    asyncio.create_task(ob_flusher_loop())
 
     assert bot
     url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
