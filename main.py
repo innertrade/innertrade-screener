@@ -40,7 +40,7 @@ if not TELEGRAM_TOKEN or not WEBHOOK_BASE or not WEBHOOK_SECRET or not DATABASE_
     raise RuntimeError("Missing required ENV vars")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-VERSION = "v1.3.1-trades-fix"
+VERSION = "v1.3.2-trades-diag"
 
 # -------------------- Globals --------------------
 bot: Bot | None = None
@@ -71,7 +71,6 @@ CREATE TABLE IF NOT EXISTS ws_ticker (
 );
 """
 
-# psycopg3 uses %s placeholders; COALESCE keeps previous values when we pass None
 SQL_UPSERT = """
 INSERT INTO ws_ticker (symbol, last, price24h_pcnt, turnover24h, updated_at)
 VALUES (%s, %s, %s, %s, NOW())
@@ -108,10 +107,17 @@ FROM ws_ticker
 WHERE symbol = %s;
 """
 
+SQL_TRADES_LATEST = """
+SELECT ts, trades_count, qty_sum
+FROM trades_1m
+WHERE symbol = %s
+ORDER BY ts DESC
+LIMIT %s;
+"""
+
 # -------------------- DB helpers --------------------
 async def init_db():
     global db_pool
-    # open=False + await open() — убираем warning
     db_pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=4, open=False)
     await db_pool.open()
     async with db_pool.connection() as conn:
@@ -171,6 +177,14 @@ async def get_one(symbol: str):
             await cur.execute(SQL_GET_ONE, (symbol.upper(),))
             return await cur.fetchone()
 
+async def trades_latest(symbol: str, limit: int = 5):
+    if db_pool is None:
+        return []
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SQL_TRADES_LATEST, (symbol.upper(), limit))
+            return await cur.fetchall()
+
 # -------------------- Webhook reliability --------------------
 async def ensure_webhook(bot: Bot, url: str, retries: int = 8) -> bool:
     delay = 1
@@ -224,7 +238,6 @@ async def ws_consumer():
                         data = msg.json(loads=json.loads)
                         topic = data.get("topic") or ""
 
-                        # ---- tickers ----
                         if topic.startswith("tickers."):
                             payload = data.get("data")
                             items = [payload] if isinstance(payload, dict) else (payload or [])
@@ -232,12 +245,9 @@ async def ws_consumer():
                                 symbol = (it.get("symbol") or "").upper()
                                 if not symbol:
                                     continue
-
                                 raw_last = it.get("lastPrice")
-                                raw_p24  = it.get("price24hPcnt")   # доля (0.0123 → 1.23%)
+                                raw_p24  = it.get("price24hPcnt")
                                 raw_tov  = it.get("turnover24h")
-
-                                # конвертация только если пришло значение
                                 try:
                                     last = float(raw_last) if raw_last not in (None, "") else None
                                 except Exception:
@@ -250,10 +260,8 @@ async def ws_consumer():
                                     tov = float(raw_tov) if raw_tov not in (None, "") else None
                                 except Exception:
                                     tov = None
-
                                 if last is None and p24 is None and tov is None:
                                     continue
-
                                 prev = ws_cache.get(symbol, {})
                                 ws_cache[symbol] = {
                                     "last": last if last is not None else prev.get("last", 0.0),
@@ -262,10 +270,8 @@ async def ws_consumer():
                                     "ts": datetime.now(timezone.utc).isoformat(),
                                 }
                                 await upsert_ticker(symbol, last, p24, tov)
-
                                 ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
 
-                        # ---- publicTrade ----
                         elif topic.startswith("publicTrade."):
                             payload = data.get("data") or []
                             if isinstance(payload, dict):
@@ -275,7 +281,6 @@ async def ws_consumer():
                                 sym = (tr.get("s") or "").upper()
                                 if not sym:
                                     continue
-                                # Bybit v5 publicTrade: v (qty), p (price), T (trade time ms) etc.
                                 try:
                                     qty = float(tr.get("v") or 0)
                                 except Exception:
@@ -284,7 +289,6 @@ async def ws_consumer():
                                 b = trade_buckets.setdefault(key, {"count": 0, "qty": 0.0})
                                 b["count"] += 1
                                 b["qty"] += qty
-
                                 ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
 
                     elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
@@ -307,7 +311,6 @@ async def trades_flusher_loop():
             await asyncio.sleep(60)
             if not trade_buckets:
                 continue
-            # собрать и очистить
             items = []
             for (sym, ts_min), data in list(trade_buckets.items()):
                 items.append((ts_min, sym, int(data.get("count", 0)), float(data.get("qty", 0.0))))
@@ -438,6 +441,25 @@ async def cmd_now(message: Message):
         f"updated_at: {updated}"
     )
 
+async def cmd_diag_trades(message: Message):
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Usage: /diag_trades SYMBOL [N]\nНапр.: /diag_trades BTCUSDT 5")
+        return
+    sym = parts[1].upper()
+    try:
+        limit = int(parts[2]) if len(parts) >= 3 else 5
+    except Exception:
+        limit = 5
+    rows = await trades_latest(sym, limit)
+    if not rows:
+        await message.answer(f"{sym}: нет строк в trades_1m (пока нет сделок/ждите минуту).")
+        return
+    lines = [f"{sym} — последние {len(rows)} мин:"]
+    for ts, cnt, qty in rows:
+        lines.append(f"{ts:%H:%M}  trades={cnt}  qty={qty}")
+    await message.answer("\n".join(lines))
+
 async def on_text(message: Message):
     t = (message.text or "").strip()
     if t == "📊 Активность":
@@ -450,7 +472,7 @@ async def on_text(message: Message):
         await message.answer("WS Bubbles (24h %, size~turnover24h)")
     else:
         await message.answer(
-            f"Принял: {t}\n(команды: /start /status /activity /volatility /trend /diag /now SYMBOL)"
+            f"Принял: {t}\n(команды: /start /status /activity /volatility /trend /diag /now SYMBOL /diag_trades SYMBOL [N])"
         )
 
 # -------------------- HTTP endpoints --------------------
@@ -509,6 +531,7 @@ def build_app() -> web.Application:
     dp.message.register(cmd_trend, Command("trend"))
     dp.message.register(cmd_diag, Command("diag"))
     dp.message.register(cmd_now, Command("now"))
+    dp.message.register(cmd_diag_trades, Command("diag_trades"))
     dp.message.register(on_text, F.text)
 
     app = web.Application()
