@@ -39,6 +39,7 @@ SYMBOLS = os.getenv(
     "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT",
 ).split(",")
 
+# OI polling toggles (REST is optional now)
 ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "1").strip() not in ("0", "false", "False", "")
 OI_POLL_SECONDS = int(os.getenv("OI_POLL_SECONDS", "90"))
 OI_INTERVAL = os.getenv("OI_INTERVAL", "5min").strip()
@@ -47,7 +48,7 @@ if not TELEGRAM_TOKEN or not WEBHOOK_BASE or not WEBHOOK_SECRET or not DATABASE_
     raise RuntimeError("Missing required ENV vars")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-VERSION = "v1.5.1-oi-fallback"
+VERSION = "v1.6.0-oi-ws"
 
 # -------------------- Globals --------------------
 bot: Bot | None = None
@@ -68,6 +69,9 @@ ws_last_msg_ts: str | None = None
 
 trade_buckets: dict[tuple[str, datetime], dict] = {}
 ob_buckets: dict[tuple[str, datetime], dict] = {}
+
+# NEW: OI from WS buckets (per minute, last value in minute)
+oi_ws_buckets: dict[tuple[str, datetime], float] = {}
 
 # -------------------- SQL --------------------
 SQL_CREATE = """
@@ -173,16 +177,14 @@ async def init_db():
     log.info("DB ready")
 
 async def upsert_ticker(symbol: str, last: float | None, p24: float | None, turnover: float | None):
-    if db_pool is None:
-        return
+    if db_pool is None: return
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(SQL_UPSERT, (symbol, last, p24, turnover))
             await conn.commit()
 
 async def insert_trades_batch(items: list[tuple[datetime, str, int, float]]):
-    if not items or db_pool is None:
-        return
+    if not items or db_pool is None: return
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             for ts_min, sym, cnt, qty in items:
@@ -190,8 +192,7 @@ async def insert_trades_batch(items: list[tuple[datetime, str, int, float]]):
         await conn.commit()
 
 async def insert_ob_batch(items: list[tuple[datetime, str, float, float, float, float, float, float]]):
-    if not items or db_pool is None:
-        return
+    if not items or db_pool is None: return
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             for (ts_min, sym, bid, ask, bqty, aqty, spread_bps, depth_usd) in items:
@@ -199,22 +200,17 @@ async def insert_ob_batch(items: list[tuple[datetime, str, float, float, float, 
         await conn.commit()
 
 async def insert_oi(ts_min: datetime, symbol: str, oi_usd: float | None):
-    if oi_usd is None or db_pool is None:
-        return
+    if oi_usd is None or db_pool is None: return
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(SQL_INSERT_OI, (ts_min, symbol, oi_usd))
         await conn.commit()
 
 async def select_sorted(order_by: str, limit: int = 10, desc: bool = True):
-    if db_pool is None:
-        return []
-    if order_by == "turnover":
-        ob = "tov"
-    elif order_by in ("p24", "price24h_pcnt"):
-        ob = "p24"
-    else:
-        ob = "last"
+    if db_pool is None: return []
+    if order_by == "turnover": ob = "tov"
+    elif order_by in ("p24", "price24h_pcnt"): ob = "p24"
+    else: ob = "last"
     direction = "DESC" if desc else "ASC"
     sql = SQL_SELECT_SORTED.format(order_by=ob, direction=direction)
     async with db_pool.connection() as conn:
@@ -223,8 +219,7 @@ async def select_sorted(order_by: str, limit: int = 10, desc: bool = True):
             return await cur.fetchall()
 
 async def count_rows() -> int:
-    if db_pool is None:
-        return 0
+    if db_pool is None: return 0
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(SQL_COUNT)
@@ -232,32 +227,28 @@ async def count_rows() -> int:
             return int(n or 0)
 
 async def get_one(symbol: str):
-    if db_pool is None:
-        return None
+    if db_pool is None: return None
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(SQL_GET_ONE, (symbol.upper(),))
             return await cur.fetchone()
 
 async def trades_latest(symbol: str, limit: int = 5):
-    if db_pool is None:
-        return []
+    if db_pool is None: return []
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(SQL_TRADES_LATEST, (symbol.upper(), limit))
             return await cur.fetchall()
 
 async def ob_latest(symbol: str, limit: int = 5):
-    if db_pool is None:
-        return []
+    if db_pool is None: return []
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(SQL_OB_LATEST, (symbol.upper(), limit))
             return await cur.fetchall()
 
 async def oi_latest(symbol: str, limit: int = 5):
-    if db_pool is None:
-        return []
+    if db_pool is None: return []
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(SQL_OI_LATEST, (symbol.upper(), limit))
@@ -268,8 +259,7 @@ async def get_last_price(symbol: str) -> float | None:
     v = ws_cache.get(sym)
     if v and isinstance(v.get("last"), (int, float)) and v["last"] > 0:
         return float(v["last"])
-    if db_pool is None:
-        return None
+    if db_pool is None: return None
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(SQL_GET_LAST_PRICE, (sym,))
@@ -332,20 +322,49 @@ async def ws_consumer():
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = msg.json(loads=json.loads); topic = data.get("topic") or ""
 
+                        # ---- tickers ----
                         if topic.startswith("tickers."):
                             payload = data.get("data")
                             items = [payload] if isinstance(payload, dict) else (payload or [])
                             for it in items:
                                 symbol = (it.get("symbol") or "").upper()
                                 if not symbol: continue
-                                raw_last = it.get("lastPrice"); raw_p24  = it.get("price24hPcnt"); raw_tov  = it.get("turnover24h")
+                                raw_last = it.get("lastPrice")
+                                raw_p24  = it.get("price24hPcnt")
+                                raw_tov  = it.get("turnover24h")
+                                raw_oi_v = it.get("openInterestValue")
+                                raw_oi   = it.get("openInterest")
+
+                                # last / p24 / turnover
                                 try:   last = float(raw_last) if raw_last not in (None, "") else None
                                 except: last = None
                                 try:   p24 = (float(raw_p24) * 100.0) if raw_p24 not in (None, "") else None
                                 except: p24 = None
                                 try:   tov = float(raw_tov) if raw_tov not in (None, "") else None
                                 except: tov = None
-                                if last is None and p24 is None and tov is None:  continue
+
+                                # ---- OI USD from WS ----
+                                oi_usd = None
+                                if raw_oi_v not in (None, ""):
+                                    try: oi_usd = float(raw_oi_v)
+                                    except: oi_usd = None
+                                if oi_usd is None and raw_oi not in (None, ""):
+                                    try:
+                                        oi = float(raw_oi)
+                                        _last = None
+                                        if last is not None: _last = last
+                                        else:
+                                            _last = await get_last_price(symbol)
+                                        if _last and oi > 0:
+                                            oi_usd = oi * _last
+                                    except: oi_usd = None
+                                if oi_usd is not None:
+                                    ts_min = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+                                    oi_ws_buckets[(symbol, ts_min)] = float(oi_usd)
+
+                                if last is None and p24 is None and tov is None and oi_usd is None:
+                                    continue
+
                                 prev = ws_cache.get(symbol, {})
                                 ws_cache[symbol] = {
                                     "last": last if last is not None else prev.get("last", 0.0),
@@ -356,6 +375,7 @@ async def ws_consumer():
                                 await upsert_ticker(symbol, last, p24, tov)
                                 ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
 
+                        # ---- publicTrade ----
                         elif topic.startswith("publicTrade."):
                             payload = data.get("data") or []
                             if isinstance(payload, dict): payload = [payload]
@@ -370,6 +390,7 @@ async def ws_consumer():
                                 b["count"] += 1; b["qty"] += qty
                                 ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
 
+                        # ---- orderbook.1 ----
                         elif topic.startswith("orderbook.1."):
                             payload = data.get("data") or {}; sym = (data.get("topic") or "").split(".")[-1].upper()
                             if not sym: continue
@@ -429,10 +450,31 @@ async def ob_flusher_loop():
         except Exception as e:
             log.exception("ob_flusher_loop error: %s", e)
 
-# -------------------- OI polling with fallback --------------------
+# NEW: OI from WS flusher loop
+async def oi_ws_flusher_loop():
+    while True:
+        try:
+            await asyncio.sleep(60)
+            if not oi_ws_buckets: continue
+            to_write = []
+            for (sym, ts_min), oi_val in list(oi_ws_buckets.items()):
+                to_write.append((ts_min, sym, float(oi_val)))
+                oi_ws_buckets.pop((sym, ts_min), None)
+            # write
+            if to_write:
+                async with db_pool.connection() as conn:
+                    async with conn.cursor() as cur:
+                        for ts_min, sym, oi_val in to_write:
+                            await cur.execute(SQL_INSERT_OI, (ts_min, sym, oi_val))
+                    await conn.commit()
+                log.info("Flushed %d OI(WS) buckets", len(to_write))
+        except Exception as e:
+            log.exception("oi_ws_flusher_loop error: %s", e)
+
+# -------------------- OI polling with fallback (REST, optional) --------------------
 OI_HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0 (compatible; InnertradeScreener/1.0; +https://example.com)",
+    "User-Agent": "Mozilla/5.0 (compatible; InnertradeScreener/1.0)",
     "Connection": "close",
 }
 
@@ -446,22 +488,18 @@ async def fetch_oi_from(base_url: str, session: aiohttp.ClientSession, symbol: s
         return 200, j
 
 async def fetch_oi_one(symbol: str) -> tuple[datetime | None, float | None]:
-    """
-    Возвращает (ts_min_utc, oi_usd) для symbol.
-    При 403 — пробуем BYBIT_REST_FALLBACK.
-    """
     global oi_session
     if oi_session is None:
         oi_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
 
-    # 1) Основной домен
+    # base
     try:
         status, j = await fetch_oi_from(BYBIT_REST_BASE, oi_session, symbol)
     except Exception as e:
         log.warning("OI %s base error: %s", symbol, e)
         status, j = 599, None
 
-    # 2) Фолбэк при 403/401/5xx
+    # fallback if needed
     if status in (401, 403, 429, 500, 502, 503, 504):
         try:
             status_fb, j_fb = await fetch_oi_from(BYBIT_REST_FALLBACK, oi_session, symbol)
@@ -485,31 +523,22 @@ async def fetch_oi_one(symbol: str) -> tuple[datetime | None, float | None]:
         ts_ms = item.get("timestamp") or item.get("ts") or item.get("t")
         ts = None
         if ts_ms:
-            try:
-                ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
-            except Exception:
-                ts = None
+            try: ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
+            except Exception: ts = None
         ts_min = (ts or datetime.now(timezone.utc)).replace(second=0, microsecond=0)
 
         oi_usd = None
         val = item.get("openInterestValue")
         if val not in (None, ""):
-            try:
-                oi_usd = float(val)
-            except Exception:
-                oi_usd = None
-
+            try: oi_usd = float(val)
+            except Exception: oi_usd = None
         if oi_usd is None:
             raw_oi = item.get("openInterest")
             if raw_oi not in (None, ""):
                 try:
-                    oi = float(raw_oi)
-                    last = await get_last_price(symbol) or 0.0
-                    if oi > 0 and last > 0:
-                        oi_usd = oi * last
-                except Exception:
-                    oi_usd = None
-
+                    oi = float(raw_oi); last = await get_last_price(symbol) or 0.0
+                    if oi > 0 and last > 0: oi_usd = oi * last
+                except Exception: oi_usd = None
         return ts_min, oi_usd
     except Exception as e:
         log.warning("OI %s parse error: %s", symbol, e)
@@ -545,7 +574,7 @@ def kb_main() -> ReplyKeyboardMarkup:
 async def cmd_start(message: Message):
     await message.answer(
         "🧭 Market mood\n"
-        f"Добро пожаловать в Innertrade Screener {VERSION} (tickers + trades + orderbook + OI).\n",
+        f"Добро пожаловать в Innertrade Screener {VERSION} (tickers + trades + orderbook + OI via WS/REST).\n",
         reply_markup=kb_main()
     )
 
@@ -670,7 +699,7 @@ async def cmd_diag_oi(message: Message):
     except: limit = 5
     rows = await oi_latest(sym, limit)
     if not rows:
-        await message.answer(f"{sym}: нет строк в oi_1m (ожидайте цикл опроса)."); return
+        await message.answer(f"{sym}: нет строк в oi_1m (ожидайте цикл)."); return
     lines = [f"{sym} — последние {len(rows)} мин (OI, $):"]
     for ts, oi_usd in rows:
         lines.append(f"{ts:%H:%M}  oi_usd≈${oi_usd:,.0f}".replace(",", " "))
@@ -750,6 +779,7 @@ async def on_startup():
     ws_task = asyncio.create_task(ws_consumer())
     asyncio.create_task(trades_flusher_loop())
     asyncio.create_task(ob_flusher_loop())
+    asyncio.create_task(oi_ws_flusher_loop())  # NEW: OI from WS
     if ENABLE_OI_POLL:
         oi_task = asyncio.create_task(oi_poll_loop())
 
