@@ -37,13 +37,13 @@ SYMBOLS = os.getenv(
     "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT",
 ).split(",")
 
-# OI REST polling (optional)
-ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "1").strip() not in ("0", "false", "False", "")
+# OI REST polling (optional; WS остаётся основным)
+ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "1").strip().lower() not in ("0", "false", "")
 OI_POLL_SECONDS = int(os.getenv("OI_POLL_SECONDS", "90"))
 OI_INTERVAL = os.getenv("OI_INTERVAL", "5min").strip()
 
-# OPTIONAL: hourly candles (for price Δ24h / Δ7d)
-ENABLE_PRICE_POLL = os.getenv("ENABLE_PRICE_POLL", "1").strip() not in ("0", "false", "False", "")
+# Hourly prices (для Δ24h/Δ7d)
+ENABLE_PRICE_POLL = os.getenv("ENABLE_PRICE_POLL", "1").strip().lower() not in ("0", "false", "")
 PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "1800"))          # ~30 мин
 PRICE_HISTORY_HOURS = int(os.getenv("PRICE_HISTORY_HOURS", "192"))         # ~8 суток
 
@@ -54,7 +54,7 @@ if not TELEGRAM_TOKEN or not WEBHOOK_BASE or not WEBHOOK_SECRET or not DATABASE_
     raise RuntimeError("Missing required ENV vars")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-VERSION = "v1.8.2-diag-handlers"
+VERSION = "v1.8.3-price-flag"
 
 # -------------------- Globals --------------------
 bot: Bot | None = None
@@ -469,7 +469,7 @@ async def ws_consumer():
                                 try: tov = float(raw_tov) if raw_tov not in (None,"") else None
                                 except: tov = None
 
-                                # OI (WS)
+                                # OI (WS → minute buckets)
                                 oi_usd = None
                                 if raw_oi_v not in (None,""):
                                     try: oi_usd = float(raw_oi_v)
@@ -717,7 +717,9 @@ async def cmd_status(message: Message):
         f"Bybit WS: {BYBIT_WS_URL}\n"
         f"WS connected: {ws_connected}\n"
         f"WS last msg: {ws_ts}\n"
-        f"DB rows (ws_ticker): {n}"
+        f"DB rows (ws_ticker): {n}\n"
+        f"OI poll: {'enabled' if ENABLE_OI_POLL else 'disabled'} ({OI_INTERVAL}, every {OI_POLL_SECONDS}s)\n"
+        f"Price poll: {'enabled' if ENABLE_PRICE_POLL else 'disabled'} (every {PRICE_POLL_SECONDS}s, ~{PRICE_HISTORY_HOURS}h back)"
     )
 
 async def cmd_diag(message: Message):
@@ -934,8 +936,8 @@ async def cmd_diag_trades(message: Message):
     if len(parts) < 2:
         await message.answer("Usage: /diag_trades SYMBOL [N]\nНапр.: /diag_trades BTCUSDT 10"); return
     sym = parts[1].upper()
-    try: n = int(parts[2]) if len(parts) >= 3 else 5
-    except: n = 5
+    try: n = int(parts[2]) if len(parts) >= 3 else 10
+    except: n = 10
     rows = await trades_latest_db(sym, n)
     if not rows:
         await message.answer(f"{sym}: нет строк в trades_1m."); return
@@ -966,8 +968,8 @@ async def cmd_diag_oi(message: Message):
     if len(parts) < 2:
         await message.answer("Usage: /diag_oi SYMBOL [N]\nНапр.: /diag_oi BTCUSDT 10"); return
     sym = parts[1].upper()
-    try: n = int(parts[2]) if len(parts) >= 3 else 5
-    except: n = 5
+    try: n = int(parts[2]) if len(parts) >= 3 else 10
+    except: n = 10
     rows = await oi_latest(sym, n)
     if not rows:
         await message.answer(f"{sym}: нет строк в oi_1m."); return
@@ -1003,7 +1005,9 @@ async def handle_status_http(_: web.Request):
             f"Bybit WS: {BYBIT_WS_URL}\n"
             f"WS connected: {ws_connected}\n"
             f"WS last msg: {ws_ts}\n"
-            f"DB rows: {n}\n")
+            f"DB rows: {n}\n"
+            f"OI poll: {'enabled' if ENABLE_OI_POLL else 'disabled'} ({OI_INTERVAL}, every {OI_POLL_SECONDS}s)\n"
+            f"Price poll: {'enabled' if ENABLE_PRICE_POLL else 'disabled'} (every {PRICE_POLL_SECONDS}s, ~{PRICE_HISTORY_HOURS}h back)\n")
     return web.Response(text=body)
 
 async def handle_diag_http(_: web.Request):
