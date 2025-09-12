@@ -32,17 +32,20 @@ BYBIT_WS_URL = os.getenv("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linea
 BYBIT_REST_BASE = os.getenv("BYBIT_REST_BASE", "https://api.bybit.com").strip()
 BYBIT_REST_FALLBACK = os.getenv("BYBIT_REST_FALLBACK", "https://api.bytick.com").strip()
 
-SYMBOLS = os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT").split(",")
+SYMBOLS = os.getenv(
+    "SYMBOLS",
+    "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT",
+).split(",")
 
 # OI REST polling (optional)
-ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "1").strip() not in ("0","false","False","")
+ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "1").strip() not in ("0", "false", "False", "")
 OI_POLL_SECONDS = int(os.getenv("OI_POLL_SECONDS", "90"))
 OI_INTERVAL = os.getenv("OI_INTERVAL", "5min").strip()
 
 # OPTIONAL: hourly candles (for price Δ24h / Δ7d)
-ENABLE_PRICE_POLL = os.getenv("ENABLE_PRICE_POLL", "1").strip() not in ("0","false","False","")
-PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "1800"))  # каждые ~30 мин подтянем часовки
-PRICE_HISTORY_HOURS = int(os.getenv("PRICE_HISTORY_HOURS", "192"))  # подтягиваем ~8 суток часовок
+ENABLE_PRICE_POLL = os.getenv("ENABLE_PRICE_POLL", "1").strip() not in ("0", "false", "False", "")
+PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "1800"))          # ~30 мин
+PRICE_HISTORY_HOURS = int(os.getenv("PRICE_HISTORY_HOURS", "192"))         # ~8 суток
 
 # Activity default window (hours)
 ACTIVITY_HOURS = int(os.getenv("ACTIVITY_HOURS", "24"))
@@ -51,7 +54,7 @@ if not TELEGRAM_TOKEN or not WEBHOOK_BASE or not WEBHOOK_SECRET or not DATABASE_
     raise RuntimeError("Missing required ENV vars")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-VERSION = "v1.8.0-passport"
+VERSION = "v1.8.1-passport-fix"
 
 # -------------------- Globals --------------------
 bot: Bot | None = None
@@ -383,7 +386,6 @@ async def price_delta_pct(symbol: str, hours: int) -> float | None:
     start_ts = end_ts - timedelta(hours=hours)
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
-            # берем ближайшую "до или на" конец и "после или на" старт
             await cur.execute(SQL_PRICE_BOUND, (symbol.upper(), end_ts))
             row_end = await cur.fetchone()
             await cur.execute(SQL_PRICE_AFTER, (symbol.upper(), start_ts))
@@ -435,16 +437,19 @@ async def ws_consumer():
         log.info("Bybit WS connecting: %s", BYBIT_WS_URL)
         try:
             async with ws_session.ws_connect(BYBIT_WS_URL, heartbeat=30) as ws:
-                args = ([f"tickers.{s}" for s in SYMBOLS if s]
-                        + [f"publicTrade.{s}" for s in SYMBOLS if s]
-                        + [f"orderbook.1.{s}" for s in SYMBOLS if s])
-                await ws.send_json({"op":"subscribe","args":args})
+                args = (
+                    [f"tickers.{s}" for s in SYMBOLS if s]
+                    + [f"publicTrade.{s}" for s in SYMBOLS if s]
+                    + [f"orderbook.1.{s}" for s in SYMBOLS if s]
+                )
+                await ws.send_json({"op": "subscribe", "args": args})
                 log.info("WS subscribed: %d topics", len(args))
                 ws_connected = True; backoff = 1
 
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = msg.json(loads=json.loads); topic = data.get("topic") or ""
+
                         # tickers
                         if topic.startswith("tickers."):
                             payload = data.get("data")
@@ -609,7 +614,7 @@ async def fetch_oi_one(symbol: str):
     if status != 200 or not j:
         log.warning("OI %s http %s", symbol, status); return None, None
     try:
-        data = ((j or {}).get("result") or {}).get("list") or []
+        data = (((j or {}).get("result") or {}).get("list") or [])
         if not data: return None, None
         item = data[0]
         ts_ms = item.get("timestamp") or item.get("ts") or item.get("t")
@@ -870,7 +875,6 @@ async def cmd_passport(message: Message):
     oi_7d_pct = oi_delta_pct(oi_7d)  # Δ% за 7д
     oi_last = None
     try:
-        # возьмём "конец" 24ч как прокси текущего OI
         oi_last = float(oi_24[1]) if (oi_24 and oi_24[1] is not None) else None
     except:
         oi_last = None
@@ -879,11 +883,10 @@ async def cmd_passport(message: Message):
     price_24h = await price_delta_pct(sym, 24)
     price_7d  = await price_delta_pct(sym, 168)
     if price_24h is None and p24 is not None:
-        # фолбэк — p24 уже в процентах
         try: price_24h = float(p24)
         except: price_24h = None
 
-    # trades/min из суммарных бакетов (оценка)
+    # trades/min
     tr5_cnt  = int(tr_5m[0] or 0) if tr_5m else 0
     tr60_cnt = int(tr_60m[0] or 0) if tr_60m else 0
     tpm5  = tr5_cnt / 5.0
@@ -894,9 +897,7 @@ async def cmd_passport(message: Message):
     depth60  = float(ob_60m[0] or 0) if ob_60m else 0.0
     spread60 = float(ob_60m[1] or 0) if ob_60m else 0.0
 
-    # render
-    def pct(x):
-        return f"{x:+.2f}%" if x is not None else "—"
+    def pct(x): return f"{x:+.2f}%" if x is not None else "—"
     def usd(x):
         try: return f"${int(x):,}".replace(",", " ")
         except: return "—"
@@ -915,6 +916,18 @@ async def cmd_passport(message: Message):
     ]
     await message.answer("\n".join(lines))
 
+# ---------- Simple now ----------
+async def cmd_now(message: Message):
+    parts = (message.text or "").strip().split()
+    sym = parts[1].upper() if len(parts) >= 2 else "BTCUSDT"
+    row = await get_one(sym)
+    if not row:
+        await message.answer(f"{sym}: нет данных"); return
+    _, last, p24, tov, ts = row
+    await message.answer(
+        f"{sym}\nlast: {last}\n24h%: {p24}\nturnover24h: {tov}\nupdated_at: {ts}"
+    )
+
 # -------------------- Router --------------------
 async def on_text(message: Message):
     t = (message.text or "").strip()
@@ -926,7 +939,7 @@ async def on_text(message: Message):
     else:
         await message.answer(
             "Команды: /start /status /activity /volatility /trend /activity2 [H] /passport SYMBOL /diag "
-            "/now SYMBOL /diag_trades SYMBOL [N] /diag_ob SYMBOL [N] /diag_oi SYMBOL [N]"
+            "/now [SYMBOL] /diag_trades SYMBOL [N] /diag_ob SYMBOL [N] /diag_oi SYMBOL [N]"
         )
 
 # -------------------- HTTP --------------------
@@ -974,6 +987,7 @@ def build_app() -> web.Application:
     dp.message.register(cmd_passport, Command("passport"))
     dp.message.register(cmd_diag, Command("diag"))
     dp.message.register(cmd_now, Command("now"))
+    dp.message.register(trades_latest, Command("diag_trades"))  # not used directly as handler, keep next line:
     dp.message.register(cmd_diag_trades, Command("diag_trades"))
     dp.message.register(cmd_diag_ob, Command("diag_ob"))
     dp.message.register(cmd_diag_oi, Command("diag_oi"))
