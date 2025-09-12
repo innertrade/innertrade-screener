@@ -54,7 +54,7 @@ if not TELEGRAM_TOKEN or not WEBHOOK_BASE or not WEBHOOK_SECRET or not DATABASE_
     raise RuntimeError("Missing required ENV vars")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-VERSION = "v1.8.1-passport-fix"
+VERSION = "v1.8.2-diag-handlers"
 
 # -------------------- Globals --------------------
 bot: Bot | None = None
@@ -306,7 +306,7 @@ async def get_one(symbol: str):
             await cur.execute(SQL_GET_ONE, (symbol.upper(),))
             return await cur.fetchone()
 
-async def trades_latest(symbol: str, limit: int = 5):
+async def trades_latest_db(symbol: str, limit: int = 5):
     if db_pool is None: return []
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -928,6 +928,55 @@ async def cmd_now(message: Message):
         f"{sym}\nlast: {last}\n24h%: {p24}\nturnover24h: {tov}\nupdated_at: {ts}"
     )
 
+# ---------- Diagnostics handlers ----------
+async def cmd_diag_trades(message: Message):
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Usage: /diag_trades SYMBOL [N]\nНапр.: /diag_trades BTCUSDT 10"); return
+    sym = parts[1].upper()
+    try: n = int(parts[2]) if len(parts) >= 3 else 5
+    except: n = 5
+    rows = await trades_latest_db(sym, n)
+    if not rows:
+        await message.answer(f"{sym}: нет строк в trades_1m."); return
+    lines = [f"trades_1m {sym} (latest {len(rows)})"]
+    for ts, cnt, qty in rows:
+        lines.append(f"{ts.isoformat()}  count={int(cnt or 0)}  qty_sum={qty or 0}")
+    await message.answer("\n".join(lines))
+
+async def cmd_diag_ob(message: Message):
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Usage: /diag_ob SYMBOL [N]\nНапр.: /diag_ob BTCUSDT 10"); return
+    sym = parts[1].upper()
+    try: n = int(parts[2]) if len(parts) >= 3 else 5
+    except: n = 5
+    rows = await ob_latest(sym, n)
+    if not rows:
+        await message.answer(f"{sym}: нет строк в ob_1m."); return
+    lines = [f"ob_1m {sym} (latest {len(rows)})"]
+    for ts, bid, ask, bq, aq, spr, depth in rows:
+        lines.append(
+            f"{ts.isoformat()}  bid={bid} ask={ask}  bq={bq} aq={aq}  spread={spr:.2f}bps  depth≈{int(depth or 0):,}".replace(",", " ")
+        )
+    await message.answer("\n".join(lines))
+
+async def cmd_diag_oi(message: Message):
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Usage: /diag_oi SYMBOL [N]\nНапр.: /diag_oi BTCUSDT 10"); return
+    sym = parts[1].upper()
+    try: n = int(parts[2]) if len(parts) >= 3 else 5
+    except: n = 5
+    rows = await oi_latest(sym, n)
+    if not rows:
+        await message.answer(f"{sym}: нет строк в oi_1m."); return
+    lines = [f"oi_1m {sym} (latest {len(rows)})"]
+    for ts, oi_usd in rows:
+        v = f"{int(oi_usd):,}".replace(",", " ") if oi_usd is not None else "—"
+        lines.append(f"{ts.isoformat()}  oi≈${v}")
+    await message.answer("\n".join(lines))
+
 # -------------------- Router --------------------
 async def on_text(message: Message):
     t = (message.text or "").strip()
@@ -987,7 +1036,6 @@ def build_app() -> web.Application:
     dp.message.register(cmd_passport, Command("passport"))
     dp.message.register(cmd_diag, Command("diag"))
     dp.message.register(cmd_now, Command("now"))
-    dp.message.register(trades_latest, Command("diag_trades"))  # not used directly as handler, keep next line:
     dp.message.register(cmd_diag_trades, Command("diag_trades"))
     dp.message.register(cmd_diag_ob, Command("diag_ob"))
     dp.message.register(cmd_diag_oi, Command("diag_oi"))
