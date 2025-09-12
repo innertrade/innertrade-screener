@@ -3,7 +3,8 @@ import json
 import logging
 import os
 import contextlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from statistics import mean, pstdev
 
 import aiohttp
 from aiohttp import web
@@ -39,16 +40,20 @@ SYMBOLS = os.getenv(
     "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT",
 ).split(",")
 
-# OI polling toggles (REST is optional now)
+# REST OI polling (остался как резерв)
 ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "1").strip() not in ("0", "false", "False", "")
 OI_POLL_SECONDS = int(os.getenv("OI_POLL_SECONDS", "90"))
 OI_INTERVAL = os.getenv("OI_INTERVAL", "5min").strip()
+
+# Activity окна
+ACTIVITY_HOURS = int(os.getenv("ACTIVITY_HOURS", "24"))   # окно для /activity2
+# для 7d сделаем задел, но исторические цены пока не храним
 
 if not TELEGRAM_TOKEN or not WEBHOOK_BASE or not WEBHOOK_SECRET or not DATABASE_URL:
     raise RuntimeError("Missing required ENV vars")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-VERSION = "v1.6.0-oi-ws"
+VERSION = "v1.7.0-activity2"
 
 # -------------------- Globals --------------------
 bot: Bot | None = None
@@ -69,8 +74,6 @@ ws_last_msg_ts: str | None = None
 
 trade_buckets: dict[tuple[str, datetime], dict] = {}
 ob_buckets: dict[tuple[str, datetime], dict] = {}
-
-# NEW: OI from WS buckets (per minute, last value in minute)
 oi_ws_buckets: dict[tuple[str, datetime], float] = {}
 
 # -------------------- SQL --------------------
@@ -164,6 +167,51 @@ LIMIT %s;
 """
 
 SQL_GET_LAST_PRICE = "SELECT last FROM ws_ticker WHERE symbol = %s;"
+
+# агрегаты для окна
+SQL_AGG_TRADES_WINDOW = """
+SELECT
+  COALESCE(SUM(trades_count), 0) AS trades_cnt,
+  COALESCE(SUM(qty_sum), 0)      AS qty_sum
+FROM trades_1m
+WHERE symbol = %s AND ts >= %s;
+"""
+
+SQL_AGG_OI_WINDOW = """
+WITH start_val AS (
+  SELECT oi_usd FROM oi_1m
+  WHERE symbol = %s AND ts >= %s
+  ORDER BY ts ASC LIMIT 1
+),
+end_val AS (
+  SELECT oi_usd FROM oi_1m
+  WHERE symbol = %s
+  ORDER BY ts DESC LIMIT 1
+)
+SELECT
+  (SELECT oi_usd FROM start_val) AS oi_start,
+  (SELECT oi_usd FROM end_val)   AS oi_end;
+"""
+
+SQL_AGG_OB_WINDOW = """
+SELECT
+  COALESCE(AVG(depth_usd), 0)   AS depth_avg,
+  COALESCE(AVG(spread_bps), 0)  AS spread_avg
+FROM ob_1m
+WHERE symbol = %s AND ts >= %s;
+"""
+
+# -------------------- utils --------------------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def zscore(values: list[float], x: float) -> float:
+    if not values: return 0.0
+    if len(values) == 1: return 0.0
+    m = mean(values)
+    s = pstdev(values)  # population std
+    if s == 0: return 0.0
+    return (x - m) / s
 
 # -------------------- DB helpers --------------------
 async def init_db():
@@ -271,6 +319,55 @@ async def get_last_price(symbol: str) -> float | None:
                     return None
     return None
 
+# ---- window aggregations for activity2 ----
+async def agg_window_all(symbols: list[str], hours: int):
+    """
+    Возвращает словарь по символам с агрегатами за окно:
+    trades_cnt, qty_sum, depth_avg, spread_avg, oi_start, oi_end, turnover24h (из ws_ticker)
+    """
+    since = now_utc() - timedelta(hours=hours)
+    out: dict[str, dict] = {}
+
+    async with db_pool.connection() as conn:
+        for sym in symbols:
+            s = sym.upper().strip()
+            out[s] = {
+                "turnover24h": 0.0, "trades_cnt": 0.0, "qty_sum": 0.0,
+                "depth_avg": 0.0, "spread_avg": 0.0,
+                "oi_start": None, "oi_end": None
+            }
+            async with conn.cursor() as cur:
+                # turnover из ws_ticker
+                await cur.execute("SELECT COALESCE(turnover24h,0) FROM ws_ticker WHERE symbol=%s;", (s,))
+                row = await cur.fetchone()
+                if row and row[0] is not None:
+                    try: out[s]["turnover24h"] = float(row[0])
+                    except: pass
+
+                # trades
+                await cur.execute(SQL_AGG_TRADES_WINDOW, (s, since))
+                row = await cur.fetchone()
+                if row:
+                    out[s]["trades_cnt"] = float(row[0] or 0)
+                    out[s]["qty_sum"]    = float(row[1] or 0)
+
+                # ob (liquidity)
+                await cur.execute(SQL_AGG_OB_WINDOW, (s, since))
+                row = await cur.fetchone()
+                if row:
+                    out[s]["depth_avg"]  = float(row[0] or 0)
+                    out[s]["spread_avg"] = float(row[1] or 0)
+
+                # oi
+                await cur.execute(SQL_AGG_OI_WINDOW, (s, since, s))
+                row = await cur.fetchone()
+                if row:
+                    oi_start = row[0]; oi_end = row[1]
+                    out[s]["oi_start"] = float(oi_start) if oi_start not in (None, "") else None
+                    out[s]["oi_end"]   = float(oi_end) if oi_end not in (None, "") else None
+
+    return out
+
 # -------------------- Webhook reliability --------------------
 async def ensure_webhook(bot: Bot, url: str, retries: int = 8) -> bool:
     delay = 1
@@ -335,7 +432,6 @@ async def ws_consumer():
                                 raw_oi_v = it.get("openInterestValue")
                                 raw_oi   = it.get("openInterest")
 
-                                # last / p24 / turnover
                                 try:   last = float(raw_last) if raw_last not in (None, "") else None
                                 except: last = None
                                 try:   p24 = (float(raw_p24) * 100.0) if raw_p24 not in (None, "") else None
@@ -343,7 +439,7 @@ async def ws_consumer():
                                 try:   tov = float(raw_tov) if raw_tov not in (None, "") else None
                                 except: tov = None
 
-                                # ---- OI USD from WS ----
+                                # OI из WS (в минутный буфер)
                                 oi_usd = None
                                 if raw_oi_v not in (None, ""):
                                     try: oi_usd = float(raw_oi_v)
@@ -351,15 +447,12 @@ async def ws_consumer():
                                 if oi_usd is None and raw_oi not in (None, ""):
                                     try:
                                         oi = float(raw_oi)
-                                        _last = None
-                                        if last is not None: _last = last
-                                        else:
-                                            _last = await get_last_price(symbol)
+                                        _last = last if last is not None else await get_last_price(symbol)
                                         if _last and oi > 0:
                                             oi_usd = oi * _last
                                     except: oi_usd = None
                                 if oi_usd is not None:
-                                    ts_min = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+                                    ts_min = now_utc().replace(second=0, microsecond=0)
                                     oi_ws_buckets[(symbol, ts_min)] = float(oi_usd)
 
                                 if last is None and p24 is None and tov is None and oi_usd is None:
@@ -370,16 +463,16 @@ async def ws_consumer():
                                     "last": last if last is not None else prev.get("last", 0.0),
                                     "p24":  p24  if p24  is not None else prev.get("p24",  0.0),
                                     "tov":  tov  if tov  is not None else prev.get("tov",  0.0),
-                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                    "ts": now_utc().isoformat(),
                                 }
                                 await upsert_ticker(symbol, last, p24, tov)
-                                ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
+                                ws_last_msg_ts = now_utc().isoformat()
 
                         # ---- publicTrade ----
                         elif topic.startswith("publicTrade."):
                             payload = data.get("data") or []
                             if isinstance(payload, dict): payload = [payload]
-                            ts_min = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+                            ts_min = now_utc().replace(second=0, microsecond=0)
                             for tr in payload:
                                 sym = (tr.get("s") or "").upper()
                                 if not sym: continue
@@ -388,7 +481,7 @@ async def ws_consumer():
                                 key = (sym, ts_min)
                                 b = trade_buckets.setdefault(key, {"count": 0, "qty": 0.0})
                                 b["count"] += 1; b["qty"] += qty
-                                ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
+                                ws_last_msg_ts = now_utc().isoformat()
 
                         # ---- orderbook.1 ----
                         elif topic.startswith("orderbook.1."):
@@ -400,11 +493,11 @@ async def ws_consumer():
                             try:    best_ask = float(asks[0][0]); ask_qty = float(asks[0][1])
                             except: best_ask, ask_qty = None, None
                             if best_bid is None or best_ask is None: continue
-                            ts_min = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+                            ts_min = now_utc().replace(second=0, microsecond=0)
                             key = (sym, ts_min)
                             ob_buckets[key] = {"bid": float(best_bid), "ask": float(best_ask),
                                                "bid_qty": float(bid_qty or 0.0), "ask_qty": float(ask_qty or 0.0)}
-                            ws_last_msg_ts = datetime.now(timezone.utc).isoformat()
+                            ws_last_msg_ts = now_utc().isoformat()
 
                     elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
                         log.warning("WS closed or error"); break
@@ -450,7 +543,6 @@ async def ob_flusher_loop():
         except Exception as e:
             log.exception("ob_flusher_loop error: %s", e)
 
-# NEW: OI from WS flusher loop
 async def oi_ws_flusher_loop():
     while True:
         try:
@@ -460,7 +552,6 @@ async def oi_ws_flusher_loop():
             for (sym, ts_min), oi_val in list(oi_ws_buckets.items()):
                 to_write.append((ts_min, sym, float(oi_val)))
                 oi_ws_buckets.pop((sym, ts_min), None)
-            # write
             if to_write:
                 async with db_pool.connection() as conn:
                     async with conn.cursor() as cur:
@@ -471,7 +562,7 @@ async def oi_ws_flusher_loop():
         except Exception as e:
             log.exception("oi_ws_flusher_loop error: %s", e)
 
-# -------------------- OI polling with fallback (REST, optional) --------------------
+# -------------------- OI polling with fallback (optional REST) --------------------
 OI_HEADERS = {
     "Accept": "application/json",
     "User-Agent": "Mozilla/5.0 (compatible; InnertradeScreener/1.0)",
@@ -525,7 +616,7 @@ async def fetch_oi_one(symbol: str) -> tuple[datetime | None, float | None]:
         if ts_ms:
             try: ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
             except Exception: ts = None
-        ts_min = (ts or datetime.now(timezone.utc)).replace(second=0, microsecond=0)
+        ts_min = (ts or now_utc()).replace(second=0, microsecond=0)
 
         oi_usd = None
         val = item.get("openInterestValue")
@@ -550,12 +641,12 @@ async def oi_poll_loop():
     log.info("OI polling enabled: every %ss, interval=%s", OI_POLL_SECONDS, OI_INTERVAL)
     while True:
         try:
-            start = datetime.now(timezone.utc)
+            start = now_utc()
             for sym in [s for s in SYMBOLS if s]:
                 ts_min, oi_usd = await fetch_oi_one(sym)
                 if ts_min and oi_usd is not None:
                     await insert_oi(ts_min, sym, float(oi_usd))
-            took = (datetime.now(timezone.utc) - start).total_seconds()
+            took = (now_utc() - start).total_seconds()
             log.info("OI poll cycle done in %.2fs", took)
         except Exception as e:
             log.exception("oi_poll_loop error: %s", e)
@@ -567,6 +658,7 @@ def kb_main() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📊 Активность"), KeyboardButton(text="⚡ Волатильность")],
             [KeyboardButton(text="📈 Тренд"), KeyboardButton(text="🫧 Bubbles")],
+            [KeyboardButton(text="🔍 Активность+")],
         ],
         resize_keyboard=True
     )
@@ -647,6 +739,81 @@ async def cmd_trend(message: Message):
                       key=lambda z: z[1], reverse=True)[:10]
     await message.answer(fmt_trend(rows))
 
+# ---------- Activity v2 ----------
+def fmt_activity2(items: list[dict]) -> str:
+    if not items: return "Нет данных."
+    lines = ["🔍 Активность+ (композит за ~24ч)\n"]
+    for i, it in enumerate(items, 1):
+        sym = it["symbol"]
+        score = it["score"]
+        tov = it["turnover24h"]
+        trades = it["trades_cnt"]
+        depth = it["depth_avg"]
+        spread = it["spread_avg"]
+        oi_delta_pct = it["oi_delta_pct"]
+        lines.append(
+            f"{i}) {sym}  score {score:+.2f}  | "
+            f"turnover ~ {int(tov):,} | trades ~ {int(trades):,} | "
+            f"depth≈${int(depth):,} | spread≈{spread:.1f}bps | OIΔ {oi_delta_pct:+.1f}%"
+            .replace(",", " ")
+        )
+    return "\n".join(lines[:11])
+
+async def cmd_activity2(message: Message):
+    syms = [s for s in SYMBOLS if s]
+    agg = await agg_window_all(syms, ACTIVITY_HOURS)
+
+    # collect vectors
+    turnovers = [agg[s]["turnover24h"] for s in syms]
+    trades    = [agg[s]["trades_cnt"]  for s in syms]
+    depths    = [agg[s]["depth_avg"]   for s in syms]
+    spreads   = [agg[s]["spread_avg"]  for s in syms]
+    oi_deltas = []
+    per_symbol = []
+    for s in syms:
+        a = agg[s]
+        oi_start = a["oi_start"]; oi_end = a["oi_end"]
+        if oi_start and oi_start > 0 and oi_end:
+            oi_delta_pct = (oi_end - oi_start) / oi_start * 100.0
+        else:
+            oi_delta_pct = 0.0
+        oi_deltas.append(oi_delta_pct)
+        per_symbol.append({"symbol": s, **a, "oi_delta_pct": oi_delta_pct})
+
+    # z-scores
+    z_turnover = {s: zscore(turnovers, agg[s]["turnover24h"]) for s in syms}
+    z_trades   = {s: zscore(trades,    agg[s]["trades_cnt"])  for s in syms}
+    z_depth    = {s: zscore(depths,    agg[s]["depth_avg"])   for s in syms}
+    z_spread   = {s: zscore(spreads,   agg[s]["spread_avg"])  for s in syms}  # хуже = выше z
+    z_oi       = {s: zscore(oi_deltas, next(p["oi_delta_pct"] for p in per_symbol if p["symbol"]==s)) for s in syms}
+
+    # weights
+    w_turn, w_trd, w_dep, w_spr, w_oi = 0.40, 0.30, 0.15, 0.10, 0.05
+
+    items = []
+    for p in per_symbol:
+        s = p["symbol"]
+        score = (
+            w_turn * z_turnover[s] +
+            w_trd  * z_trades[s] +
+            w_dep  * z_depth[s] +
+            w_spr  * (-z_spread[s]) +   # уже инвертируем: меньше спред -> выше скор
+            w_oi   * z_oi[s]
+        )
+        items.append({
+            "symbol": s,
+            "score": score,
+            "turnover24h": p["turnover24h"],
+            "trades_cnt": p["trades_cnt"],
+            "depth_avg": p["depth_avg"],
+            "spread_avg": p["spread_avg"],
+            "oi_delta_pct": p["oi_delta_pct"],
+        })
+
+    items.sort(key=lambda x: x["score"], reverse=True)
+    await message.answer(fmt_activity2(items[:10]))
+
+# ---------- Diagnostics / helpers ----------
 async def cmd_now(message: Message):
     parts = (message.text or "").strip().split()
     if len(parts) < 2:
@@ -707,13 +874,14 @@ async def cmd_diag_oi(message: Message):
 
 async def on_text(message: Message):
     t = (message.text or "").strip()
-    if t == "📊 Активность":   await cmd_activity(message)
-    elif t == "⚡ Волатильность": await cmd_volatility(message)
-    elif t == "📈 Тренд":      await cmd_trend(message)
-    elif t == "🫧 Bubbles":    await message.answer("WS Bubbles (24h %, size~turnover24h)")
+    if t == "📊 Активность":       await cmd_activity(message)
+    elif t == "⚡ Волатильность":  await cmd_volatility(message)
+    elif t == "📈 Тренд":          await cmd_trend(message)
+    elif t == "🫧 Bubbles":        await message.answer("WS Bubbles (24h %, size~turnover24h)")
+    elif t == "🔍 Активность+":    await cmd_activity2(message)
     else:
         await message.answer(
-            "Команды: /start /status /activity /volatility /trend /diag /now SYMBOL "
+            "Команды: /start /status /activity /volatility /trend /activity2 /diag /now SYMBOL "
             "/diag_trades SYMBOL [N] /diag_ob SYMBOL [N] /diag_oi SYMBOL [N]"
         )
 
@@ -758,6 +926,7 @@ def build_app() -> web.Application:
     dp.message.register(cmd_activity, Command("activity"))
     dp.message.register(cmd_volatility, Command("volatility"))
     dp.message.register(cmd_trend, Command("trend"))
+    dp.message.register(cmd_activity2, Command("activity2"))
     dp.message.register(cmd_diag, Command("diag"))
     dp.message.register(cmd_now, Command("now"))
     dp.message.register(cmd_diag_trades, Command("diag_trades"))
@@ -779,7 +948,7 @@ async def on_startup():
     ws_task = asyncio.create_task(ws_consumer())
     asyncio.create_task(trades_flusher_loop())
     asyncio.create_task(ob_flusher_loop())
-    asyncio.create_task(oi_ws_flusher_loop())  # NEW: OI from WS
+    asyncio.create_task(oi_ws_flusher_loop())
     if ENABLE_OI_POLL:
         oi_task = asyncio.create_task(oi_poll_loop())
 
