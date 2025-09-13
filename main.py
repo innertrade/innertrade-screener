@@ -1,744 +1,617 @@
-# main.py — v1.8.4-schema-fix (psycopg3 %s + trades_count/ts)
-
-import asyncio
-import json
-import logging
 import os
-from datetime import datetime, timezone, timedelta
+import json
+import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.bot import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.types import (
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    Message,
-)
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.types import Message, Update
 
 import psycopg
+from psycopg.rows import tuple_row
 from psycopg_pool import AsyncConnectionPool
 
-# -------------------- Logging --------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-log = logging.getLogger("screener")
-
-# -------------------- ENV --------------------
+# ----------------------------
+# Конфиг / ENV
+# ----------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # https://your-app.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-PORT = int(os.getenv("PORT", "10000"))
-TZ = os.getenv("TZ", "Europe/Moscow")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "G7-ADVmM").strip()
+SERVICE_URL = os.getenv("SERVICE_URL", "https://innertrade-screener-bot.onrender.com").rstrip("/")
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-BYBIT_WS_URL = os.getenv("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear").strip()
-SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT").split(",")
-
-# Optional REST (могут отдавать 403 для некоторых эндпоинтов без ключей)
-BYBIT_REST_BASE = os.getenv("BYBIT_REST_BASE", "https://api.bytick.com").rstrip("/")
+BYBIT_WS_URL = os.getenv("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear")
+BYBIT_REST_BASE = os.getenv("BYBIT_REST_BASE", "https://api.bybit.com").rstrip("/")
 BYBIT_REST_FALLBACK = os.getenv("BYBIT_REST_FALLBACK", "https://api.bybit.com").rstrip("/")
 
-ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "true").lower() in ("1", "true", "yes")
-ENABLE_PRICE_POLL = os.getenv("ENABLE_PRICE_POLL", "false").lower() in ("1", "true", "yes")
-OI_POLL_SECONDS = int(os.getenv("OI_POLL_SECONDS", "90"))       # период опроса OI
-PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "1800"))  # период опроса свечей 1h
+ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "1").lower() in ("1", "true", "yes", "y")
+ENABLE_PRICE_POLL = os.getenv("ENABLE_PRICE_POLL", "1").lower() in ("1", "true", "yes", "y")
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is required")
-if not WEBHOOK_BASE or not WEBHOOK_BASE.startswith("http"):
-    raise RuntimeError("WEBHOOK_BASE is required (https://...)")
-if not WEBHOOK_SECRET:
-    raise RuntimeError("WEBHOOK_SECRET is required (any non-empty string)")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is required (postgres)")
+OI_POLL_SECONDS = int(os.getenv("OI_POLL_SECONDS", "90"))
+OI_INTERVAL_MIN = int(os.getenv("OI_INTERVAL_MIN", "5"))  # интервал агрегации REST OI
 
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
+PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "1800"))  # 30 мин
+PRICE_BACK_HOURS = int(os.getenv("PRICE_BACK_HOURS", "192"))       # 8 дней часовыми свечами
 
-# -------------------- Globals --------------------
+SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,TONUSDT") \
+    .replace(" ", "").split(",")
+
+TOP_N = int(os.getenv("TOP_N", "10"))
+
+# ----------------------------
+# Логирование
+# ----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger(__name__)
+
+# ----------------------------
+# Глобальные объекты
+# ----------------------------
 bot: Bot | None = None
 dp: Dispatcher | None = None
-app: web.Application | None = None
+pool: AsyncConnectionPool | None = None
 
-db_pool: AsyncConnectionPool | None = None
-ws_session: aiohttp.ClientSession | None = None
-ws_task: asyncio.Task | None = None
-oi_task: asyncio.Task | None = None
-price_task: asyncio.Task | None = None
-
-ws_cache: dict[str, dict] = {}  # фолбэк, пока БД не прогрелась
-_last_ws_msg_iso: str | None = None
-
-# -------------------- SQL --------------------
-SQL_CREATE_WS = """
-CREATE TABLE IF NOT EXISTS ws_ticker (
-  symbol           text PRIMARY KEY,
-  last             double precision,
-  price24h_pcnt    double precision,
-  turnover24h      double precision,
-  updated_at       timestamptz NOT NULL DEFAULT now()
-);
-"""
-
-# важное: psycopg3 placeholder style -> %s
-SQL_UPSERT = """
+# ----------------------------
+# SQL (все плейсхолдеры — %s!)
+# ----------------------------
+SQL_UPSERT_TICKER = """
 INSERT INTO ws_ticker (symbol, last, price24h_pcnt, turnover24h, updated_at)
 VALUES (%s, %s, %s, %s, NOW())
-ON CONFLICT (symbol) DO UPDATE
-SET last = EXCLUDED.last,
-    price24h_pcnt = EXCLUDED.price24h_pcnt,
-    turnover24h = EXCLUDED.turnover24h,
-    updated_at = NOW();
+ON CONFLICT (symbol) DO UPDATE SET
+  last = EXCLUDED.last,
+  price24h_pcnt = EXCLUDED.price24h_pcnt,
+  turnover24h = EXCLUDED.turnover24h,
+  updated_at = NOW();
 """
 
-SQL_SELECT_SORTED_FMT = """
-SELECT symbol,
-       COALESCE(price24h_pcnt, 0) AS p24,
-       COALESCE(turnover24h, 0)   AS tov,
-       COALESCE(last, 0)          AS last
+SQL_GET_TICKER = """
+SELECT symbol, last, COALESCE(price24h_pcnt,0), COALESCE(turnover24h,0), updated_at
 FROM ws_ticker
-ORDER BY {order_by} {direction}
-LIMIT %s;
+WHERE symbol = %s;
 """
 
-SQL_COUNT = "SELECT COUNT(*) FROM ws_ticker;"
-
-# Диагностики и композит под фактическую схему:
-# trades_1m: ts, symbol, trades_count, qty_sum
-SQL_TRADES_LATEST = """
-SELECT ts, trades_count, qty_sum
-FROM trades_1m
-WHERE symbol = %s
-ORDER BY ts DESC
-LIMIT %s;
-"""
-
-SQL_OB_LATEST = """
-SELECT ts, best_bid, best_ask, bid_qty, ask_qty, spread_bps, depth_usd
-FROM ob_1m
-WHERE symbol = %s
-ORDER BY ts DESC
-LIMIT %s;
-"""
-
-SQL_OI_LATEST = """
-SELECT ts, oi_usd
-FROM oi_1m
-WHERE symbol = %s
-ORDER BY ts DESC
-LIMIT %s;
-"""
-
-SQL_PRICE_LATEST = """
-SELECT ts, close
-FROM price_1h
-WHERE symbol = %s
-ORDER BY ts DESC
-LIMIT %s;
-"""
-
-# агрегаты за 24ч для activity+ (используем trades_count, не "count")
 SQL_TRADES_24H_SUM = """
 SELECT
-  COALESCE(SUM(trades_count), 0) AS tcnt,
-  COALESCE(SUM(qty_sum), 0)      AS qsum
+  COALESCE(SUM(trades_count),0) AS trades,
+  COALESCE(SUM(qty_sum),0)      AS qty
 FROM trades_1m
-WHERE symbol = %s AND ts >= NOW() - INTERVAL '24 hours';
+WHERE symbol = %s AND ts >= NOW() - interval '24 hours';
 """
 
-SQL_TRADES_24H_SUM_ALL = """
-SELECT symbol,
-       COALESCE(SUM(trades_count), 0) AS tcnt,
-       COALESCE(SUM(qty_sum), 0)      AS qsum
-FROM trades_1m
-WHERE ts >= NOW() - INTERVAL '24 hours'
-GROUP BY symbol;
-"""
-
-SQL_OB_24H_STATS = """
+SQL_OB_24H_METRICS = """
 SELECT
-  AVG(depth_usd)   AS depth_avg,
-  AVG(spread_bps)  AS spread_avg
+  COALESCE(AVG(depth_usd),0)   AS depth_avg,
+  COALESCE(AVG(spread_bps),0)  AS spread_avg
 FROM ob_1m
-WHERE symbol = %s AND ts >= NOW() - INTERVAL '24 hours';
+WHERE symbol = %s AND ts >= NOW() - interval '24 hours';
 """
 
 SQL_OI_DELTA_24H = """
-WITH w AS (
-  SELECT oi_usd
+WITH o AS (
+  SELECT ts, oi_usd
   FROM oi_1m
-  WHERE symbol = %s AND ts >= NOW() - INTERVAL '24 hours'
+  WHERE symbol = %s AND ts >= NOW() - interval '24 hours'
   ORDER BY ts
 )
 SELECT
   CASE
     WHEN COUNT(*) >= 2 THEN
       (MAX(oi_usd) - MIN(oi_usd)) / NULLIF(MIN(oi_usd), 0) * 100.0
-    ELSE NULL
+    ELSE 0
   END AS oi_delta_pct
-FROM w;
+FROM o;
 """
 
-# -------------------- DB helpers --------------------
-async def init_db():
-    global db_pool
-    db_pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=4)
-    await db_pool.open()
-    async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(SQL_CREATE_WS)
-            await conn.commit()
-    log.info("DB ready")
+SQL_PRICES_7D = """
+SELECT ts, close
+FROM prices_1h
+WHERE symbol = %s AND ts >= NOW() - interval '7 days'
+ORDER BY ts;
+"""
 
-async def upsert_ticker(symbol: str, last: float | None, p24: float | None, turnover: float | None):
-    if db_pool is None:
-        return
-    async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(SQL_UPSERT, (symbol, last, p24, turnover))
-            await conn.commit()
-
-async def select_sorted(order_by: str, limit: int = 10, desc: bool = True):
-    if db_pool is None:
-        return []
-    # белый список алиасов из SELECT
-    ob = "last"
-    if order_by == "turnover":
-        ob = "tov"
-    elif order_by in ("p24", "price24h_pcnt"):
-        ob = "p24"
-    direction = "DESC" if desc else "ASC"
-    sql = SQL_SELECT_SORTED_FMT.format(order_by=ob, direction=direction)
-    async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(sql, (limit,))
-            rows = await cur.fetchall()
-            return rows
-
-async def count_rows() -> int:
-    if db_pool is None:
-        return 0
-    async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(SQL_COUNT)
-            n = (await cur.fetchone())[0]
-            return int(n or 0)
-
-# -------------------- Bybit WS ingest (tickers only) --------------------
-async def ws_consumer():
-    global ws_session, _last_ws_msg_iso
-    ws_session = aiohttp.ClientSession()
-    log.info(f"Bybit WS connecting: {BYBIT_WS_URL}")
+# ----------------------------
+# Утилиты
+# ----------------------------
+def fmt_usd(v: float) -> str:
     try:
-        async with ws_session.ws_connect(BYBIT_WS_URL, heartbeat=30) as ws:
-            args = [f"tickers.{s}" for s in SYMBOLS]
-            await ws.send_json({"op": "subscribe", "args": args})
-            log.info(f"WS subscribed: {len(args)} topics")
+        return f"{v:,.0f}".replace(",", " ")
+    except Exception:
+        return str(v)
 
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = msg.json(loads=json.loads)
-                    topic = data.get("topic") or ""
-                    if topic.startswith("tickers."):
-                        payload = data.get("data")
-                        items = [payload] if isinstance(payload, dict) else (payload or [])
-                        for it in items:
-                            symbol = (it.get("symbol") or "").upper()
-                            try:
-                                last = float(it.get("lastPrice") or 0)
-                            except Exception:
-                                last = 0.0
-                            try:
-                                p24 = float(it.get("price24hPcnt") or 0) * 100.0
-                            except Exception:
-                                p24 = 0.0
-                            try:
-                                turnover = float(it.get("turnover24h") or 0)
-                            except Exception:
-                                turnover = 0.0
+def fmt_bps(x: float) -> str:
+    try:
+        return f"{x:.1f}bps"
+    except Exception:
+        return "0.0bps"
 
-                            ws_cache[symbol] = {
-                                "last": last,
-                                "p24": p24,
-                                "tov": turnover,
-                                "ts": datetime.now(timezone.utc).isoformat(),
-                            }
-                            await upsert_ticker(symbol, last, p24, turnover)
-                        _last_ws_msg_iso = datetime.now(timezone.utc).isoformat()
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    log.error("WS error: %s", msg.data)
-                    break
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
-                    log.warning("WS closed by server")
-                    break
-    except Exception as e:
-        log.exception("WS consumer failed: %s", e)
-    finally:
-        if ws_session:
-            await ws_session.close()
-        log.info("WS consumer finished")
+def score_activity(turnover: float, trades: int, depth: float, spread_bps: float, oi_delta_pct: float) -> float:
+    """
+    Простейший нормализованный скор:
+    - оборот (лог)
+    - кол-во сделок (лог)
+    - глубина (лог)
+    - спред (наоборот)
+    - OI delta (в %)
+    веса подогнаны грубо, чтобы совпадало с интуитивной сортировкой.
+    """
+    import math
+    t = math.log10(max(turnover, 1.0))
+    c = math.log10(max(trades, 1.0))
+    d = math.log10(max(depth, 1.0))
+    s = -min(spread_bps, 10.0) / 10.0  # чем меньше спред, тем лучше
+    oi = oi_delta_pct / 20.0           # масштабируем
+    return round(t*0.5 + c*0.4 + d*0.2 + s*0.2 + oi*0.2, 2)
 
-# -------------------- (Опционально) простые REST pollers --------------------
-async def rest_get_json(session: aiohttp.ClientSession, path: str, params: dict) -> tuple[int, dict | None]:
-    """Опробуем base и fallback. Возвращаем (status, json_or_none)"""
-    url1 = f"{BYBIT_REST_BASE}{path}"
-    url2 = f"{BYBIT_REST_FALLBACK}{path}"
-    for url in (url1, url2):
+# ----------------------------
+# WS Ticker consumer (минимум)
+# ----------------------------
+async def upsert_ticker(symbol: str, last: float, p24: float, turnover: float):
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SQL_UPSERT_TICKER, (symbol, last, p24, turnover))
+
+async def ws_consumer():
+    """
+    Подписка только на тикеры (чтобы поддерживать /now и /status).
+    Остальные метрики берём из БД (их наполняют твои аггрегаторы/ws/cron — как сейчас).
+    """
+    topics = [f"tickers.{sym}" for sym in SYMBOLS]
+    sub_msg = {
+        "op": "subscribe",
+        "args": topics
+    }
+    url = BYBIT_WS_URL
+    log.info(f"Bybit WS connecting: {url}")
+    while True:
         try:
-            async with session.get(url, params=params, timeout=10) as r:
-                if r.status == 200:
-                    return 200, await r.json()
-                else:
-                    log.warning("REST %s %s -> HTTP %s", "base" if url==url1 else "fallback", url, r.status)
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(url, heartbeat=20) as ws:
+                    log.info(f"WS subscribed: {len(topics)} topics")
+                    await ws.send_json(sub_msg)
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = msg.json()
+                            # ожидаем формат Bybit v5 tickers
+                            if data.get("topic", "").startswith("tickers."):
+                                d = data.get("data") or {}
+                                symbol = d.get("symbol")
+                                last = float(d.get("lastPrice", 0) or 0)
+                                p24 = float(d.get("price24hPcnt", 0) or 0) * 100.0
+                                turnover = float(d.get("turnover24h", 0) or 0)
+                                if symbol:
+                                    await upsert_ticker(symbol, last, p24, turnover)
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"WS error: {e}")
+            await asyncio.sleep(5.0)
+
+# ----------------------------
+# Периодические REST опросы (по желанию; Bybit часто даёт 403 без ключей)
+# ----------------------------
+async def fetch_json(session: aiohttp.ClientSession, url: str, params: dict) -> tuple[int, dict|None]:
+    try:
+        async with session.get(url, params=params, timeout=15) as r:
+            code = r.status
+            if code == 200:
+                return code, await r.json()
+            return code, None
+    except Exception:
+        return -1, None
+
+async def poll_oi():
+    log.info(f"OI polling enabled: every {OI_POLL_SECONDS}s, interval={OI_INTERVAL_MIN}min")
+    base_url = f"{BYBIT_REST_BASE}/v5/market/open-interest"
+    fb_url = f"{BYBIT_REST_FALLBACK}/v5/market/open-interest"
+    params_tpl = {"category": "linear", "intervalTime": f"{OI_INTERVAL_MIN}min"}
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                for sym in SYMBOLS:
+                    p = params_tpl | {"symbol": sym}
+                    code, _ = await fetch_json(s, base_url, p)
+                    if code != 200:
+                        log.warning(f"REST base {base_url} -> HTTP {code}")
+                        code2, _ = await fetch_json(s, fb_url, p)
+                        if code2 != 200:
+                            log.warning(f"REST fallback {fb_url} -> HTTP {code2}")
+                            log.warning(f"OI {sym} http {code2 if code2!=200 else code}")
+                log.info("OI poll cycle done in ~OK")
         except Exception:
-            log.warning("REST %s request failed", url, exc_info=False)
-    return 403, None
+            pass
+        await asyncio.sleep(OI_POLL_SECONDS)
 
-async def oi_poll_loop():
-    if not ENABLE_OI_POLL:
-        return
-    log.info("OI polling enabled: every %ss, interval=5min", OI_POLL_SECONDS)
-    async with aiohttp.ClientSession() as session:
-        while True:
-            t0 = datetime.now()
-            for sym in SYMBOLS:
-                status, js = await rest_get_json(session, "/v5/market/open-interest", {
-                    "category": "linear",
-                    "symbol": sym,
-                    "intervalTime": "5min",
-                    "limit": 1,
-                })
-                if status != 200 or not js or js.get("retCode") != 0:
-                    log.warning("OI %s http %s", sym, status)
-                    continue
-                try:
-                    rows = js["result"]["list"]
-                    if not rows:
-                        continue
-                    row = rows[0]
-                    oi_usd = float(row.get("openInterestUsd", 0) or 0)
-                    ts_str = row.get("timestamp") or row.get("ts")
-                    ts = datetime.fromtimestamp(int(ts_str)//1000, tz=timezone.utc) if ts_str else datetime.now(timezone.utc)
-                except Exception:
-                    continue
-                # вставим в oi_1m, если нужно — сделайте upsert
-                # здесь простая вставка через ON CONFLICT DO NOTHING по (symbol, ts)
-                async with db_pool.connection() as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute("""
-                        CREATE TABLE IF NOT EXISTS oi_1m (
-                          ts timestamptz NOT NULL,
-                          symbol text NOT NULL,
-                          oi_usd double precision,
-                          PRIMARY KEY (symbol, ts)
-                        );
-                        """)
-                        await cur.execute("""
-                        INSERT INTO oi_1m (ts, symbol, oi_usd)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (symbol, ts) DO UPDATE
-                        SET oi_usd = EXCLUDED.oi_usd;
-                        """, (ts, sym, oi_usd))
-                        await conn.commit()
-            log.info("OI poll cycle done in %.2fs", (datetime.now() - t0).total_seconds())
-            await asyncio.sleep(OI_POLL_SECONDS)
+async def poll_prices():
+    log.info(f"Price polling enabled: every {PRICE_POLL_SECONDS}s (1h candles ~{PRICE_BACK_HOURS}h back)")
+    base_url = f"{BYBIT_REST_BASE}/v5/market/kline"
+    fb_url = f"{BYBIT_REST_FALLBACK}/v5/market/kline"
+    params_tpl = {"category": "linear", "interval": "60"}
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                for sym in SYMBOLS:
+                    p = params_tpl | {"symbol": sym, "limit": str(min(PRICE_BACK_HOURS, 200))}
+                    code, _ = await fetch_json(s, base_url, p)
+                    if code != 200:
+                        log.warning(f"REST base {base_url} -> HTTP {code}")
+                        code2, _ = await fetch_json(s, fb_url, p)
+                        if code2 != 200:
+                            log.warning(f"REST fallback {fb_url} -> HTTP {code2}")
+                            log.warning(f"Kline {sym} fetch failed (both)")
+                log.info("Price poll cycle done")
+        except Exception:
+            pass
+        await asyncio.sleep(PRICE_POLL_SECONDS)
 
-async def price_poll_loop():
-    if not ENABLE_PRICE_POLL:
-        return
-    log.info("Price polling enabled: every %ss (1h candles ~192h back)", PRICE_POLL_SECONDS)
-    async with aiohttp.ClientSession() as session:
-        while True:
-            for sym in SYMBOLS:
-                status, js = await rest_get_json(session, "/v5/market/kline", {
-                    "category": "linear",
-                    "symbol": sym,
-                    "interval": "60",
-                    "limit": 192,
-                })
-                if status != 200 or not js or js.get("retCode") != 0:
-                    log.warning("Kline %s fetch failed (both)", sym)
-                    continue
-                try:
-                    kl = js["result"]["list"]  # [[start,open,high,low,close,vol,turnover], ...]
-                    if not kl:
-                        continue
-                    rows = []
-                    for item in kl:
-                        ts = datetime.fromtimestamp(int(item[0])//1000, tz=timezone.utc)
-                        close = float(item[4])
-                        rows.append((ts, sym, close))
-                except Exception:
-                    continue
-                async with db_pool.connection() as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute("""
-                        CREATE TABLE IF NOT EXISTS price_1h (
-                          ts timestamptz NOT NULL,
-                          symbol text NOT NULL,
-                          close double precision,
-                          PRIMARY KEY (symbol, ts)
-                        );
-                        """)
-                        await cur.executemany("""
-                        INSERT INTO price_1h (ts, symbol, close)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (symbol, ts) DO UPDATE
-                        SET close = EXCLUDED.close;
-                        """, rows)
-                        await conn.commit()
-            log.info("Price poll cycle done")
-            await asyncio.sleep(PRICE_POLL_SECONDS)
-
-# -------------------- Bot UI --------------------
-def kb_main() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📊 Активность"), KeyboardButton(text="⚡ Волатильность")],
-            [KeyboardButton(text="📈 Тренд"), KeyboardButton(text="🫧 Bubbles")],
-            [KeyboardButton(text="🔍 Активность+")]
-        ],
-        resize_keyboard=True
-    )
-
-def fmt_activity(rows: list[tuple]) -> str:
-    if not rows:
-        return "Нет данных."
-    lines = []
-    for i, r in enumerate(rows, 1):
-        sym, p24, tov, last = r
-        lines.append(f"{i}) {sym}  24h% {p24:.2f}  | turnover24h ~ {int(tov):,}".replace(",", " "))
-    return "🔥 Активность (Bybit WS + DB)\n" + "\n".join(lines[:10])
-
-def fmt_volatility(rows: list[tuple]) -> str:
-    if not rows:
-        return "Нет данных."
-    lines = []
-    for i, r in enumerate(rows, 1):
-        sym, p24, tov, last = r
-        lines.append(f"{i}) {sym}  24h% {p24:.2f}  | last {last}")
-    return "⚡ Волатильность (24h %, Bybit WS + DB)\n" + "\n".join(lines[:10])
-
-def fmt_trend(rows: list[tuple]) -> str:
-    if not rows:
-        return "Нет данных."
-    lines = []
-    for i, r in enumerate(rows, 1):
-        sym, p24, tov, last = r
-        lines.append(f"{i}) {sym}  ≈  24h% {p24:.2f}  | last {last}")
-    return "📈 Тренд (упрощённо по 24h%, Bybit WS + DB)\n" + "\n".join(lines[:10])
-
-# -------------------- Handlers --------------------
+# ----------------------------
+# Хэндлеры бота
+# ----------------------------
 async def cmd_start(message: Message):
-    await message.answer(
+    txt = (
         "🧭 Market mood\n"
-        "Добро пожаловать в Innertrade Screener v1.8.4-schema-fix "
-        "(WS tickers + trades/orderbook/OI/price diagnostics).",
-        reply_markup=kb_main()
+        f"Добро пожаловать в Innertrade Screener v1.8.4-ops.\n\n"
+        "Доступные команды:\n"
+        "/status — состояние сервиса\n"
+        "/now [SYMBOL] — текущие данные по тикеру (по умолчанию BTCUSDT)\n"
+        "/activity2 — Активность+ (композит ~24ч)\n"
+        "/diag_trades SYMBOL [N] — последние N минут по сделкам\n"
+        "/diag_ob SYMBOL [N] — последние N минут по стакану\n"
+        "/diag_oi SYMBOL [N] — последние N минут по OI\n"
     )
+    await message.answer(txt)
 
 async def cmd_status(message: Message):
-    n = await count_rows()
-    await message.answer(
+    ws_line = f"Bybit WS: {BYBIT_WS_URL}"
+    oi_line = f"OI poll: {'enabled' if ENABLE_OI_POLL else 'disabled'} ({OI_INTERVAL_MIN}min, every {OI_POLL_SECONDS}s)"
+    pr_line = f"Price poll: {'enabled' if ENABLE_PRICE_POLL else 'disabled'} (every {PRICE_POLL_SECONDS}s, ~{PRICE_BACK_HOURS}h back)"
+    # БД строки в ws_ticker
+    rows = 0
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute("SELECT COUNT(*) FROM ws_ticker;")
+            r = await cur.fetchone()
+            rows = r[0] if r else 0
+    txt = (
         "Status\n"
-        f"Time: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S (%Z)')}\n"
+        f"Time: {datetime.now(tz=timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')} (MSK)\n"
         "Source: Bybit (public WS + REST OI/Prices)\n"
-        "Version: v1.8.4-schema-fix\n"
-        f"Bybit WS: {BYBIT_WS_URL}\n"
-        f"WS connected: True\n"
-        f"WS last msg: {_last_ws_msg_iso or 'n/a'}\n"
-        f"DB rows (ws_ticker): {n}\n"
-        f"OI poll: {'enabled' if ENABLE_OI_POLL else 'disabled'} "
-        f"(5min, every {OI_POLL_SECONDS}s)\n"
-        f"Price poll: {'enabled' if ENABLE_PRICE_POLL else 'disabled'} "
-        f"(every {PRICE_POLL_SECONDS}s, ~192h back)\n"
+        "Version: v1.8.4-ops\n"
+        f"{ws_line}\n"
+        f"{oi_line}\n"
+        f"{pr_line}\n"
+        f"DB rows (ws_ticker): {rows}\n"
     )
+    await message.answer(txt)
 
-async def cmd_diag(message: Message):
-    n = await count_rows()
-    sample = list(ws_cache.items())[:3]
-    sample_txt = "\n".join(
-        f"{k}: p24={v['p24']:.2f} last={v['last']} tov~{int(v['tov']):,}".replace(",", " ")
-        for k, v in sample
-    ) or "—"
-    await message.answer(
-        "diag\n"
-        f"rows={n}\n"
-        f"cache_sample:\n{sample_txt}"
+async def cmd_now(message: Message):
+    parts = (message.text or "").split()
+    sym = parts[1].upper() if len(parts) >= 2 else "BTCUSDT"
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute(SQL_GET_TICKER, (sym,))
+            row = await cur.fetchone()
+    if not row:
+        await message.answer(f"{sym}: нет данных.")
+        return
+    symbol, last, p24, turnover, updated_at = row
+    txt = (
+        f"{symbol}\n"
+        f"last: {last}\n"
+        f"24h%: {round(p24, 4)}\n"
+        f"turnover24h: {turnover}\n"
+        f"updated_at: {updated_at}\n"
     )
-
-async def cmd_activity(message: Message):
-    rows = await select_sorted("turnover", 10, desc=True)
-    if not rows and ws_cache:
-        rows = sorted(
-            [(s, v["p24"], v["tov"], v["last"]) for s, v in ws_cache.items()],
-            key=lambda z: z[2], reverse=True
-        )[:10]
-    await message.answer(fmt_activity(rows))
-
-async def cmd_volatility(message: Message):
-    rows = await select_sorted("p24", 50, desc=True)
-    rows = sorted(rows, key=lambda r: abs(r[1]), reverse=True)[:10]
-    if not rows and ws_cache:
-        rows = sorted(
-            [(s, v["p24"], v["tov"], v["last"]) for s, v in ws_cache.items()],
-            key=lambda z: abs(z[1]), reverse=True
-        )[:10]
-    await message.answer(fmt_volatility(rows))
-
-async def cmd_trend(message: Message):
-    rows = await select_sorted("p24", 10, desc=True)
-    if not rows and ws_cache:
-        rows = sorted(
-            [(s, v["p24"], v["tov"], v["last"]) for s, v in ws_cache.items()],
-            key=lambda z: z[1], reverse=True
-        )[:10]
-    await message.answer(fmt_trend(rows))
-
-def _fmt_money(x: float | None) -> str:
-    try:
-        return f"{int(x):,}".replace(",", " ")
-    except Exception:
-        return "0"
-
-async def cmd_activity2(message: Message):
-    # Композит по 24ч: оборот из ws_ticker, сумма trades_count/qty_sum из trades_1m,
-    # ликвидность/спред из ob_1m, OIΔ из oi_1m. Итоговое ранжирование — простая нормировка.
-    out = []
-    async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            # 1) берем топ по обороту (ws_ticker)
-            await cur.execute("""
-                SELECT symbol,
-                       COALESCE(turnover24h,0) AS tov,
-                       COALESCE(price24h_pcnt,0) AS p24
-                FROM ws_ticker
-                ORDER BY tov DESC
-                LIMIT 50;
-            """)
-            tick = await cur.fetchall()
-            sym_list = [r[0] for r in tick] or SYMBOLS
-
-            # предварительно притащим агрегаты по всем символам за 24ч (trades_1m)
-            await cur.execute(SQL_TRADES_24H_SUM_ALL)
-            tmap: dict[str, tuple[float, float]] = {r[0]: (float(r[1] or 0), float(r[2] or 0)) for r in await cur.fetchall()}
-
-            for sym, tov, p24 in tick:
-                # trades
-                tcnt, qsum = tmap.get(sym, (0.0, 0.0))
-
-                # ob stats
-                await cur.execute(SQL_OB_24H_STATS, (sym,))
-                obrow = await cur.fetchone()
-                depth_avg = float((obrow[0] or 0)) if obrow else 0.0
-                spread_avg = float((obrow[1] or 0)) if obrow else 0.0
-
-                # oi delta
-                await cur.execute(SQL_OI_DELTA_24H, (sym,))
-                oi_delta = (await cur.fetchone())[0] if cur.rowcount != 0 else None
-                oi_delta = 0.0 if oi_delta is None else float(oi_delta)
-
-                # простой скор (веса можно потом калибровать)
-                score = 0.0
-                # нормировки грубые: делим на «типичные» масштабы
-                score += (tov / 1e9) * 0.6
-                score += (tcnt / 1e5) * 0.3
-                score += (depth_avg / 5e5) * 0.2
-                score -= (spread_avg / 1.0) * 0.2
-                score += (oi_delta / 10.0) * 0.2
-                # добавим слабый бонус за п24>0
-                score += (max(p24, 0) / 10.0) * 0.1
-
-                out.append((sym, score, tov, tcnt, depth_avg, spread_avg, oi_delta))
-
-    out.sort(key=lambda z: z[1], reverse=True)
-    lines = ["🔍 Активность+ (композит за ~24ч)\n"]
-    for i, (sym, score, tov, tcnt, depth, spr, oi_d) in enumerate(out[:10], 1):
-        lines.append(
-            f"{i}) {sym}  score {score:+.2f}  | turnover ~ {_fmt_money(tov)} | "
-            f"trades ~ {_fmt_money(tcnt)} | depth≈${_fmt_money(depth)} | "
-            f"spread≈{spr:.1f}bps | OIΔ {oi_d:+.1f}%"
-        )
-    await message.answer("\n".join(lines))
+    await message.answer(txt)
 
 async def cmd_diag_trades(message: Message):
     parts = (message.text or "").split()
-    sym = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
-    limit = int(parts[2]) if len(parts) > 2 else 10
-    async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(SQL_TRADES_LATEST, (sym, limit))
+    if len(parts) < 2:
+        await message.answer("Usage: /diag_trades SYMBOL [N]\nНапр.: /diag_trades BTCUSDT 10")
+        return
+    sym = parts[1].upper()
+    n = int(parts[2]) if len(parts) > 2 else 10
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute("""
+                SELECT ts, trades_count, qty_sum
+                FROM trades_1m
+                WHERE symbol = %s
+                ORDER BY ts DESC
+                LIMIT %s;
+            """, (sym, n))
             rows = await cur.fetchall()
     if not rows:
-        await message.answer(f"trades_1m {sym}: нет данных")
+        await message.answer(f"trades_1m {sym}: нет данных.")
         return
-    lines = [f"trades_1m {sym} (latest {len(rows)})"]
-    for ts, tcnt, qsum in rows:
-        lines.append(f"{ts.isoformat()}  count={tcnt}  qty_sum={qsum}")
-    await message.answer("\n".join(lines))
+    rows = list(reversed(rows))
+    out = [f"trades_1m {sym} (latest {len(rows)})"]
+    for ts, c, q in rows:
+        out.append(f"{ts.isoformat()}  count={c}  qty_sum={q}")
+    await message.answer("\n".join(out))
 
 async def cmd_diag_ob(message: Message):
     parts = (message.text or "").split()
-    sym = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
-    limit = int(parts[2]) if len(parts) > 2 else 5
-    async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(SQL_OB_LATEST, (sym, limit))
+    if len(parts) < 2:
+        await message.answer("Usage: /diag_ob SYMBOL [N]\nНапр.: /diag_ob BTCUSDT 5")
+        return
+    sym = parts[1].upper()
+    n = int(parts[2]) if len(parts) > 2 else 5
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute("""
+                SELECT ts, best_bid, best_ask, bid_qty, ask_qty, spread_bps, depth_usd
+                FROM ob_1m
+                WHERE symbol = %s
+                ORDER BY ts DESC
+                LIMIT %s;
+            """, (sym, n))
             rows = await cur.fetchall()
     if not rows:
-        await message.answer(f"ob_1m {sym}: нет данных")
+        await message.answer(f"ob_1m {sym}: нет данных.")
         return
-    lines = [f"ob_1m {sym} (latest {len(rows)})"]
+    rows = list(reversed(rows))
+    out = [f"ob_1m {sym} (latest {len(rows)})"]
     for ts, bb, ba, bq, aq, sp, depth in rows:
-        lines.append(
-            f"{ts.isoformat()}  bid={bb} ask={ba}  bq={bq} aq={aq}  "
-            f"spread={sp:.2f}bps  depth≈{_fmt_money(depth)}"
-        )
-    await message.answer("\n".join(lines))
+        out.append(f"{ts.isoformat()}  bid={bb} ask={ba}  bq={bq} aq={aq}  spread={fmt_bps(sp)}  depth≈{fmt_usd(depth)}")
+    await message.answer("\n".join(out))
 
 async def cmd_diag_oi(message: Message):
     parts = (message.text or "").split()
-    sym = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
-    limit = int(parts[2]) if len(parts) > 2 else 10
-    async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(SQL_OI_LATEST, (sym, limit))
+    if len(parts) < 2:
+        await message.answer("Usage: /diag_oi SYMBOL [N]\nНапр.: /diag_oi BTCUSDT 10")
+        return
+    sym = parts[1].upper()
+    n = int(parts[2]) if len(parts) > 2 else 10
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute("""
+                SELECT ts, oi_usd
+                FROM oi_1m
+                WHERE symbol = %s
+                ORDER BY ts DESC
+                LIMIT %s;
+            """, (sym, n))
             rows = await cur.fetchall()
     if not rows:
         await message.answer(f"{sym}: нет строк в oi_1m (ожидайте цикл опроса).")
         return
-    lines = [f"oi_1m {sym} (latest {len(rows)})"]
-    for ts, oi_usd in rows:
-        lines.append(f"{ts.isoformat()}  oi≈${_fmt_money(oi_usd)}")
+    rows = list(reversed(rows))
+    out = [f"oi_1m {sym} (latest {len(rows)})"]
+    for ts, oi in rows:
+        out.append(f"{ts.isoformat()}  oi≈${fmt_usd(oi)}")
+    await message.answer("\n".join(out))
+
+async def cmd_activity2(message: Message):
+    # Композит за 24ч по всем SYMBOLS
+    entries = []
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            for sym in SYMBOLS:
+                # ticker
+                await cur.execute("SELECT COALESCE(turnover24h,0) FROM ws_ticker WHERE symbol=%s;", (sym,))
+                r = await cur.fetchone()
+                turnover = float(r[0]) if r else 0.0
+                # trades
+                await cur.execute(SQL_TRADES_24H_SUM, (sym,))
+                r = await cur.fetchone()
+                trades = int(r[0]) if r else 0
+                # orderbook
+                await cur.execute(SQL_OB_24H_METRICS, (sym,))
+                r = await cur.fetchone()
+                depth_avg = float(r[0]) if r else 0.0
+                spread_avg = float(r[1]) if r else 0.0
+                # oi delta
+                await cur.execute(SQL_OI_DELTA_24H, (sym,))
+                r = await cur.fetchone()
+                oi_delta_pct = float(r[0]) if r and r[0] is not None else 0.0
+
+                sc = score_activity(turnover, trades, depth_avg, spread_avg, oi_delta_pct)
+                entries.append((sym, sc, turnover, trades, depth_avg, spread_avg, oi_delta_pct))
+
+    # сортируем по score убыв.
+    entries.sort(key=lambda x: x[1], reverse=True)
+    entries = entries[:TOP_N]
+
+    lines = ["🔍 Активность+ (композит за ~24ч)", ""]
+    rank = 1
+    for sym, sc, turnover, trades, depth, spread, oi_d in entries:
+        lines.append(
+            f"{rank}) {sym}  score {sc:+.2f}  | turnover ~ {fmt_usd(turnover)} | trades ~ {fmt_usd(trades)} | "
+            f"depth≈${fmt_usd(depth)} | spread≈{fmt_bps(spread)} | OIΔ {oi_d:+.1f}%"
+        )
+        rank += 1
+
     await message.answer("\n".join(lines))
 
-async def cmd_now(message: Message):
-    parts = (message.text or "").split()
-    sym = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
-    async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("""
-            SELECT symbol, last, price24h_pcnt, turnover24h, updated_at
-            FROM ws_ticker WHERE symbol=%s;
-            """, (sym,))
-            row = await cur.fetchone()
-    if not row:
-        await message.answer(f"{sym}: нет в таблице ws_ticker")
-        return
-    _, last, p24, tov, updated = row
-    await message.answer(
-        f"{sym}\nlast: {last}\n24h%: {p24}\nturnover24h: {tov}\nupdated_at: {updated}"
-    )
-
 async def on_text(message: Message):
-    t = (message.text or "").strip()
-    if t == "📊 Активность":
-        await cmd_activity(message)
-    elif t == "⚡ Волатильность":
-        await cmd_volatility(message)
-    elif t == "📈 Тренд":
-        await cmd_trend(message)
-    elif t == "🫧 Bubbles":
-        await message.answer("WS Bubbles (24h %, size~turnover24h)")
-    elif t == "🔍 Активность+":
-        await cmd_activity2(message)
-    else:
-        await message.answer(
-            "Команды: /start /status /activity /volatility /trend /activity2 "
-            "/diag_trades BTCUSDT 5 /diag_ob BTCUSDT 5 /diag_oi BTCUSDT 10 /now BTCUSDT"
-        )
+    t = (message.text or "").strip().lower()
+    if "активность+" in t or "activity+" in t or "activity2" in t:
+        return await cmd_activity2(message)
+    if "status" in t or "статус" in t:
+        return await cmd_status(message)
+    return await cmd_start(message)
 
-# -------------------- Webhook server --------------------
-async def handle_health(request: web.Request):
-    return web.Response(text="ok")
+# ----------------------------
+# HTTP ручки
+# ----------------------------
+async def health(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "service": "innertrade-screener", "bot_id": bot.id if bot else None})
 
-async def handle_root(request: web.Request):
-    return web.Response(text="Innertrade screener is alive")
+async def root(request: web.Request) -> web.Response:
+    return web.Response(text="Innertrade Screener Bot is running.\n")
 
-async def handle_webhook(request: web.Request):
-    assert bot and dp
+# TG webhook
+async def handle_webhook(request: web.Request) -> web.Response:
+    global dp, bot
+    if request.match_info.get("secret") != WEBHOOK_SECRET:
+        return web.Response(status=404, text="Not found")
+    raw = await request.text()
     try:
-        data = await request.json()
+        data = json.loads(raw)
     except Exception:
-        return web.Response(status=400, text="bad json")
-    from aiogram.types import Update
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
-    return web.Response(text="ok")
+        data = {}
+    upd = Update.model_validate(data)
+    await dp.feed_update(bot, upd)
+    return web.json_response({"ok": True})
 
+# Вспомогательные ПРОКСИ-ручки, чтобы дергать Telegram API С СЕРВЕРА (у тебя с телефона блокируется api.telegram.org)
+async def tg_whinfo(request: web.Request) -> web.Response:
+    if not TELEGRAM_TOKEN:
+        return web.json_response({"ok": False, "error": "TELEGRAM_TOKEN missing"}, status=500)
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo"
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, timeout=15) as r:
+            try:
+                data = await r.json()
+            except Exception:
+                txt = await r.text()
+                data = {"ok": False, "status": r.status, "text": txt}
+            return web.json_response(data)
+
+async def tg_whset(request: web.Request) -> web.Response:
+    if not TELEGRAM_TOKEN:
+        return web.json_response({"ok": False, "error": "TELEGRAM_TOKEN missing"}, status=500)
+    wh_url = f"{SERVICE_URL}/webhook/{WEBHOOK_SECRET}"
+    api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+    params = {
+        "url": wh_url,
+        "allowed_updates": '["message","callback_query"]',
+        "max_connections": "40",
+    }
+    async with aiohttp.ClientSession() as s:
+        async with s.get(api, params=params, timeout=15) as r:
+            try:
+                data = await r.json()
+            except Exception:
+                txt = await r.text()
+                data = {"ok": False, "status": r.status, "text": txt}
+            return web.json_response({"request": {"url": wh_url}, "telegram": data})
+
+async def tg_send(request: web.Request) -> web.Response:
+    if not TELEGRAM_TOKEN:
+        return web.json_response({"ok": False, "error": "TELEGRAM_TOKEN missing"}, status=500)
+    chat_id = request.query.get("chat_id")
+    text = request.query.get("text", "ping from server")
+    if not chat_id:
+        return web.json_response({"ok": False, "error": "chat_id query param required"}, status=400)
+    api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    params = {"chat_id": chat_id, "text": text}
+    async with aiohttp.ClientSession() as s:
+        async with s.get(api, params=params, timeout=15) as r:
+            try:
+                data = await r.json()
+            except Exception:
+                txt = await r.text()
+                data = {"ok": False, "status": r.status, "text": txt}
+            return web.json_response(data)
+
+# ----------------------------
+# Сборка приложения
+# ----------------------------
 def build_app() -> web.Application:
-    global bot, dp, app
-    tg_session = AiohttpSession()
-    bot = Bot(TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode="HTML"), session=tg_session)
+    application = web.Application()
+    # HTTP
+    application.router.add_get("/", root)
+    application.router.add_head("/", root)
+    application.router.add_get("/health", health)
+    application.router.add_head("/health", health)
+    application.router.add_post(f"/webhook/{{secret}}", handle_webhook)
+    # Служебные
+    application.router.add_get("/tg/whinfo", tg_whinfo)
+    application.router.add_get("/tg/whset", tg_whset)
+    application.router.add_get("/tg/send", tg_send)  # опционально
+
+    return application
+
+# ----------------------------
+# Инициализация бота/роутов
+# ----------------------------
+def setup_bot() -> Dispatcher:
+    global bot, dp
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN is empty")
+    bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
     dp = Dispatcher()
 
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_status, Command("status"))
-    dp.message.register(cmd_activity, Command("activity"))
-    dp.message.register(cmd_volatility, Command("volatility"))
-    dp.message.register(cmd_trend, Command("trend"))
+    dp.message.register(cmd_now, Command("now"))
     dp.message.register(cmd_activity2, Command("activity2"))
     dp.message.register(cmd_diag_trades, Command("diag_trades"))
     dp.message.register(cmd_diag_ob, Command("diag_ob"))
     dp.message.register(cmd_diag_oi, Command("diag_oi"))
-    dp.message.register(cmd_now, Command("now"))
     dp.message.register(on_text, F.text)
 
-    app = web.Application()
-    app.router.add_get("/", handle_root)
-    app.router.add_get("/health", handle_health)
-    app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    return app
+    return dp
 
-async def on_startup():
-    global ws_task, oi_task, price_task
-    await init_db()
-    ws_task = asyncio.create_task(ws_consumer())
-    if ENABLE_OI_POLL:
-        oi_task = asyncio.create_task(oi_poll_loop())
-    if ENABLE_PRICE_POLL:
-        price_task = asyncio.create_task(price_poll_loop())
-    assert bot
-    url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
-    # на старте вебхук может не установиться с первого раза (таймаут) — это ок, бот сам попробует еще раз при рестарте
+# ----------------------------
+# Старт/главный run
+# ----------------------------
+async def set_webhook_from_server():
+    # Пытаемся сразу поставить вебхук с сервера, чтобы не зависеть от клиента
     try:
-        await bot.set_webhook(url, allowed_updates=["message", "callback_query"])
-        log.info("Webhook set to %s", url)
+        wh_url = f"{SERVICE_URL}/webhook/{WEBHOOK_SECRET}"
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+        params = {"url": wh_url, "allowed_updates": '["message","callback_query"]', "max_connections": "40"}
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params=params, timeout=15) as r:
+                txt = await r.text()
+                log.info(f"Webhook set to {wh_url}: HTTP {r.status} body={txt[:200]}")
     except Exception as e:
-        log.warning("set_webhook attempt failed: %s", e)
+        log.warning(f"set_webhook attempt failed: {e}")
 
-async def on_shutdown():
-    global ws_task, ws_session, db_pool, bot, oi_task, price_task
-    if bot:
-        try:
-            await bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            pass
-        await bot.session.close()
-    for task in (ws_task, oi_task, price_task):
+async def on_startup(app: web.Application):
+    global pool
+    # DB
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is empty")
+    pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=5, max_idle=300)
+    log.info("DB ready")
+
+    # Bot/DP
+    setup_bot()
+
+    # Фоново: ws + опросы
+    app["ws_task"] = asyncio.create_task(ws_consumer())
+    if ENABLE_OI_POLL:
+        app["oi_task"] = asyncio.create_task(poll_oi())
+    if ENABLE_PRICE_POLL:
+        app["price_task"] = asyncio.create_task(poll_prices())
+
+    # Ставим вебхук с сервера
+    await set_webhook_from_server()
+
+async def on_cleanup(app: web.Application):
+    for key in ("ws_task", "oi_task", "price_task"):
+        task = app.get(key)
         if task:
             task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-    if ws_session:
-        await ws_session.close()
-    if db_pool:
-        await db_pool.close()
+    if pool:
+        await pool.close()
 
 def run():
     application = build_app()
-    application.on_startup.append(lambda app: on_startup())
-    application.on_shutdown.append(lambda app: on_shutdown())
-    web.run_app(application, host="0.0.0.0", port=PORT)
+    application.on_startup.append(on_startup)
+    application.on_cleanup.append(on_cleanup)
+    port = int(os.getenv("PORT", "10000"))
+    log.info("======== Running on http://0.0.0.0:%d ========", port)
+    web.run_app(application, host="0.0.0.0", port=port)
 
+# ---------------
+# entrypoint
+# ---------------
 if __name__ == "__main__":
     import contextlib
-    try:
-        run()
-    except KeyboardInterrupt:
-        pass
+    run()
