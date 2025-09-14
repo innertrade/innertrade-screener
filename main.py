@@ -3,6 +3,8 @@ import json
 import asyncio
 import logging
 import signal
+from math import log, sqrt
+from statistics import pstdev, mean, median
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Optional
 
@@ -41,12 +43,11 @@ BYBIT_WS_URL = os.getenv("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linea
 BYBIT_REST_BASE = os.getenv("BYBIT_REST_BASE", "https://api.bytick.com").rstrip("/")
 BYBIT_REST_FALLBACK = os.getenv("BYBIT_REST_FALLBACK", "https://api.bybit.com").rstrip("/")
 
-# ВАЖНО: по умолчанию REST-опрос OI выключен
 ENABLE_OI_POLL = os.getenv("ENABLE_OI_POLL", "false").lower() in ("1", "true", "yes")
 OI_POLL_INTERVAL_SEC = int(os.getenv("OI_POLL_INTERVAL_SEC", "90"))
 OI_POLL_WINDOW_MIN = int(os.getenv("OI_POLL_WINDOW_MIN", "5"))
 
-ENABLE_PRICE_POLL = os.getenv("ENABLE_PRICE_POLL", "false").lower() in ("1", "true", "yes")
+ENABLE_PRICE_POLL = os.getenv("ENABLE_PRICE_POLL", "true").lower() in ("1", "true", "yes")
 PRICE_POLL_INTERVAL_SEC = int(os.getenv("PRICE_POLL_INTERVAL_SEC", "1800"))  # раз в 30 мин
 PRICE_POLL_HOURS_BACK = int(os.getenv("PRICE_POLL_HOURS_BACK", "192"))  # 8 суток
 
@@ -144,6 +145,14 @@ ORDER BY ts DESC
 LIMIT %s
 """
 
+SQL_PRICE_SINCE = """
+SELECT ts, close
+FROM kline_1h
+WHERE symbol = %s
+  AND ts >= NOW() - (%s || ' hours')::interval
+ORDER BY ts ASC
+"""
+
 # =========================
 # ГЛОБАЛЬНОЕ
 # =========================
@@ -203,7 +212,7 @@ async def upsert_ticker(symbol: str, last: float, p24: float, turnover: float):
 
 async def ws_consumer():
     """
-    Слушаем public WS tickers (Bybit v5 public linear).
+    Слушаем public WS tickers (Bybit v5 public linear -> tickers.SYMBOL).
     """
     url = BYBIT_WS_URL
     subs = [{"op": "subscribe", "args": [f"tickers.{sym}" for sym in SYMBOLS]}]
@@ -223,7 +232,7 @@ async def ws_consumer():
                             sym = topic.split(".", 1)[1].upper()
                             d = data.get("data", {})
                             last = float(d.get("lastPrice", 0) or 0)
-                            p24  = float(d.get("price24hPcnt", 0) or 0) * 100.0  # доля -> %
+                            p24  = float(d.get("price24hPcnt", 0) or 0) * 100.0
                             turn = float(d.get("turnover24h", 0) or 0)
                             await upsert_ticker(sym, last, p24, turn)
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -244,42 +253,40 @@ async def ws_consumer():
 # =========================
 
 async def poll_oi_once():
-    """
-    Bybit REST open-interest. Оставляем как резервный сборщик.
-    По умолчанию НЕ включён (ENABLE_OI_POLL=false).
-    """
     for sym in SYMBOLS:
         params = {
             "category": "linear",
             "symbol": sym,
             "interval": f"{OI_POLL_WINDOW_MIN}min",
         }
-        data = None
+        ok = False
         # base
         full_b = f"{BYBIT_REST_BASE}/v5/market/open-interest"
         try:
             async with session.get(full_b, params=params, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    ok = True
                 else:
                     log.warning("REST base %s -> HTTP %d", full_b, resp.status)
         except Exception:
             log.warning("REST base %s -> network error", full_b)
 
-        # fallback
-        if data is None:
+        if not ok:
+            # fallback
             full_f = f"{BYBIT_REST_FALLBACK}/v5/market/open-interest"
             try:
                 async with session.get(full_f, params=params, timeout=10) as resp:
                     if resp.status == 200:
                         data = await resp.json()
+                        ok = True
                     else:
                         log.warning("REST fallback %s -> HTTP %d", full_f, resp.status)
             except Exception:
                 log.warning("REST fallback %s -> network error", full_f)
 
-        if data is None:
-            log.warning("OI %s http failed", sym)
+        if not ok:
+            log.warning("OI %s http 403", sym)
             continue
 
         try:
@@ -305,7 +312,7 @@ async def poll_prices_once():
     end_ts = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     start_ts = int((datetime.now(tz=timezone.utc) - timedelta(hours=PRICE_POLL_HOURS_BACK)).timestamp() * 1000)
     for sym in SYMBOLS:
-        data = None
+        ok = False
         params = {
             "category": "linear",
             "symbol": sym,
@@ -319,24 +326,25 @@ async def poll_prices_once():
             async with session.get(full_b, params=params, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    ok = True
                 else:
                     log.warning("REST base %s -> HTTP %d", full_b, resp.status)
         except Exception:
             log.warning("REST base %s -> network error", full_b)
 
-        # fallback
-        if data is None:
+        if not ok:
             full_f = f"{BYBIT_REST_FALLBACK}/v5/market/kline"
             try:
                 async with session.get(full_f, params=params, timeout=10) as resp:
                     if resp.status == 200:
                         data = await resp.json()
+                        ok = True
                     else:
                         log.warning("REST fallback %s -> HTTP %d", full_f, resp.status)
             except Exception:
                 log.warning("REST fallback %s -> network error", full_f)
 
-        if data is None:
+        if not ok:
             log.warning("Kline %s fetch failed (both)", sym)
             continue
 
@@ -372,14 +380,12 @@ async def poll_prices_once():
 async def oi_poll_loop():
     log.info("OI polling enabled: every %ds, interval=%dmin", OI_POLL_INTERVAL_SEC, OI_POLL_WINDOW_MIN)
     while True:
-        t0 = asyncio.get_event_loop().time()
         try:
             await poll_oi_once()
         except Exception:
             log.exception("OI poll cycle error")
         finally:
-            dt = asyncio.get_event_loop().time() - t0
-            log.info("OI poll cycle done in %.2fs", dt)
+            log.info("OI poll cycle done in %.2fs", 0.0)
         await asyncio.sleep(OI_POLL_INTERVAL_SEC)
 
 async def price_poll_loop():
@@ -430,7 +436,7 @@ async def set_webhook():
         await asyncio.sleep(1)
 
 # =========================
-# TELEGRAM HANDLERS (минимум)
+# TELEGRAM HANDLERS
 # =========================
 
 async def send_text(chat_id: int, text: str):
@@ -442,14 +448,16 @@ def buttons_text() -> str:
 async def cmd_start(chat_id: int):
     text = (
         "🧭 Market mood\n"
-        f"Добро пожаловать в Innertrade Screener v1.9.2-ws-only-OI-by-default.\n\n"
+        f"Добро пожаловать в Innertrade Screener v1.10.0-vol (WS tickers + OI/Prices via REST).\n\n"
         "Команды:\n"
         "/status – состояние\n"
         "/now [SYMBOL] – текущие данные по символу (например, /now BTCUSDT)\n"
         "/activity2 – Активность+ (композит)\n"
+        "/vol [SYMBOL] [HOURS] – волатильность по клоузам (по умолчанию 24ч)\n"
         "/diag_trades SYMBOL [N]\n"
         "/diag_ob SYMBOL [N]\n"
         "/diag_oi SYMBOL [N]\n"
+        "/diag_price SYMBOL [N]\n"
     )
     await send_text(chat_id, text)
 
@@ -463,9 +471,9 @@ async def cmd_status(chat_id: int):
         "Status\n"
         f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (local)\n"
         f"Source: Bybit (public WS + REST OI/Prices)\n"
-        "Version: v1.9.2-ws-only-OI-by-default\n"
+        "Version: v1.10.0-vol\n"
         f"Bybit WS: {BYBIT_WS_URL}\n"
-        f"WS connected: True\n"  # упрощённо
+        f"WS connected: True\n"
         f"DB rows (ws_ticker): {rows}\n"
         f"OI poll: {'enabled' if ENABLE_OI_POLL else 'disabled'} ({OI_POLL_WINDOW_MIN}min, every {OI_POLL_INTERVAL_SEC}s)\n"
         f"Price poll: {'enabled' if ENABLE_PRICE_POLL else 'disabled'} (every {PRICE_POLL_INTERVAL_SEC}s, ~{PRICE_POLL_HOURS_BACK}h back)\n"
@@ -539,10 +547,82 @@ async def cmd_diag_oi(chat_id: int, symbol: str, n: int):
         lines.append(f"{ts.isoformat()}  oi≈${fmt_money(oi)}")
     await send_text(chat_id, "\n".join(lines))
 
+async def cmd_diag_price(chat_id: int, symbol: str, n: int):
+    symbol = symbol.upper()
+    p = await get_pool()
+    async with p.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SQL_PRICE_LATEST_N, (symbol, n))
+            rows = await cur.fetchall()
+    if not rows:
+        await send_text(chat_id, f"kline_1h {symbol}: пусто (включи ENABLE_PRICE_POLL=true)")
+        return
+    lines = [f"kline_1h {symbol} (latest {n})"]
+    for ts, close in reversed(rows):
+        lines.append(f"{ts.isoformat()}  close={close}")
+    await send_text(chat_id, "\n".join(lines))
+
+def realized_vol_perc_from_closes(closes: List[float]) -> Optional[float]:
+    """
+    Возвращает дневную realized vol (%) из hourly close:
+    rv = std(ln(C_t/C_{t-1})) * sqrt(24) * 100
+    Используем population std (pstdev) по часам.
+    """
+    if len(closes) < 2:
+        return None
+    rets = []
+    for i in range(1, len(closes)):
+        if closes[i-1] > 0 and closes[i] > 0:
+            rets.append(log(closes[i] / closes[i-1]))
+    if len(rets) == 0:
+        return None
+    return pstdev(rets) * sqrt(24) * 100.0
+
+async def cmd_vol(chat_id: int, symbol: str, hours: int):
+    symbol = symbol.upper()
+    hours = max(2, min(hours, 24*30))  # ограничим до 30 дней
+    p = await get_pool()
+    async with p.connection() as conn:
+        async with conn.cursor() as cur:
+            # для расчёта берём все бары за окно в возрастающем порядке
+            await cur.execute(SQL_PRICE_SINCE, (symbol, hours))
+            rows = await cur.fetchall()
+
+    if not rows or len(rows) < 2:
+        await send_text(chat_id, f"Волатильность {symbol}: нет достаточных данных за {hours}ч (включи ENABLE_PRICE_POLL=true).")
+        return
+
+    closes = [float(c) for _, c in rows]
+    rv_d_perc = realized_vol_perc_from_closes(closes)
+
+    # 7-дневная вола, если хватает баров (>= 24*7+1)
+    rv_7d = None
+    if len(closes) >= 24*7 + 1:
+        rv_7d = realized_vol_perc_from_closes(closes[-(24*7+1):])
+
+    lo = min(closes)
+    hi = max(closes)
+    med = median(closes)
+    last = closes[-1]
+
+    parts = [f"⚡ Волатильность {symbol}"]
+    parts.append(f"Окно: {hours}ч, баров: {len(closes)}")
+    if rv_d_perc is not None:
+        parts.append(f"Realized Vol (дневная, из hourly): {rv_d_perc:.2f}%")
+    else:
+        parts.append("Realized Vol: —")
+
+    if rv_7d is not None:
+        parts.append(f"Realized Vol (7д): {rv_7d:.2f}%")
+
+    parts.append(f"last close: {last}")
+    parts.append(f"min/median/max: {lo} / {med} / {hi}")
+
+    await send_text(chat_id, "\n".join(parts))
+
 async def cmd_activity2(chat_id: int):
     """
     Композит: turnover (из ws_ticker) + trades_1m (sum 24h) + orderbook_1m (avg 24h) + OI Δ
-    Список топ-10 по обороту и расчёт простого score.
     """
     p = await get_pool()
     async with p.connection() as conn:
@@ -564,19 +644,16 @@ async def cmd_activity2(chat_id: int):
                 p24 = float(r["p24"] or 0)
                 turn = float(r["turn"] or 0)
 
-                # trades
                 await cur.execute(SQL_TRADES_SUM_24H, (sym,))
                 trow = await cur.fetchone()
                 trades_cnt = int(trow[0] or 0)
                 qty_sum = float(trow[1] or 0)
 
-                # orderbook
                 await cur.execute(SQL_ORDERBOOK_AGGR_24H, (sym,))
                 orow = await cur.fetchone()
                 avg_spread = orow[0]
                 avg_depth = orow[1]
 
-                # oi delta
                 await cur.execute(SQL_OI_DELTA_24H, (sym,))
                 oirow = await cur.fetchone()
                 first_oi = oirow[0]
@@ -585,17 +662,16 @@ async def cmd_activity2(chat_id: int):
                 if first_oi and last_oi and first_oi != 0:
                     oi_delta_pct = (last_oi - first_oi) / first_oi * 100.0
 
-                # score (очень упрощённо)
                 score = 0.0
-                score += (p24 / 5.0)  # 5% ~ +1
+                score += (p24 / 5.0)
                 if trades_cnt > 0:
-                    score += min(trades_cnt / 400000.0, 1.0)  # 400k trades ~ +1
+                    score += min(trades_cnt / 400000.0, 1.0)
                 if avg_depth:
-                    score += min((avg_depth or 0) / 1_000_000.0, 1.0) * 0.5  # 1M depth ~ +0.5
+                    score += min(avg_depth / 1_000_000.0, 1.0) * 0.5
                 if avg_spread is not None:
-                    score += max(0.0, (0.5 - min(avg_spread, 0.5)))  # меньше спред — лучше
+                    score += max(0.0, (0.5 - min(avg_spread, 0.5)))
                 if oi_delta_pct is not None:
-                    score += (oi_delta_pct / 10.0)  # +10% OI ~ +1
+                    score += (oi_delta_pct / 10.0)
 
                 lines.append(
                     f"{sym}  score {score:+.2f}  | "
@@ -617,7 +693,6 @@ async def health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "ts": now_utc_iso()})
 
 async def handle_webhook(request: web.Request) -> web.Response:
-    # проверка секрета в path
     secret = request.match_info.get("secret", "")
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         return web.json_response({"ok": False, "error": "bad secret"}, status=403)
@@ -632,10 +707,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
     chat_id = chat.get("id")
     text = (message.get("text") or "").strip()
 
-    if not chat_id:
-        return web.json_response({"ok": True})  # игнор
-
-    # команды
     if text.startswith("/start"):
         await cmd_start(chat_id)
     elif text.startswith("/status"):
@@ -668,21 +739,34 @@ async def handle_webhook(request: web.Request) -> web.Response:
             await cmd_diag_oi(chat_id, sym, n)
         else:
             await send_text(chat_id, "Usage: /diag_oi SYMBOL [N]")
+    elif text.startswith("/diag_price"):
+        parts = text.split()
+        if len(parts) >= 2:
+            sym = parts[1]
+            n = int(parts[2]) if len(parts) >= 3 else 10
+            await cmd_diag_price(chat_id, sym, n)
+        else:
+            await send_text(chat_id, "Usage: /diag_price SYMBOL [N]")
+    elif text.startswith("/vol"):
+        parts = text.split()
+        sym = parts[1] if len(parts) >= 2 else "BTCUSDT"
+        hrs = int(parts[2]) if len(parts) >= 3 else 24
+        await cmd_vol(chat_id, sym, hrs)
     elif text in ("📊 Активность", "Активность+", "🔍 Активность+", "/activity2"):
         await cmd_activity2(chat_id)
     else:
-        # кнопки/свободный текст
         low = text.lower()
-        if "активност" in low:
+        if "волат" in low or text == "⚡ Волатильность":
+            await cmd_vol(chat_id, "BTCUSDT", 24)
+        elif "активност" in low:
             await cmd_activity2(chat_id)
         else:
-            await send_text(chat_id, "Команды: /status /now [SYMBOL] /activity2 /diag_trades /diag_ob /diag_oi")
+            await send_text(chat_id, "Команды: /status /now [SYMBOL] /activity2 /vol [SYMBOL] [HOURS] /diag_trades /diag_ob /diag_oi /diag_price")
 
     return web.json_response({"ok": True})
 
 def build_app() -> web.Application:
     app = web.Application()
-    # Только GET и POST (HEAD не регистрируем вручную)
     app.router.add_get("/", root)
     app.router.add_get("/health", health)
     app.router.add_post("/webhook/{secret}", handle_webhook)
@@ -696,44 +780,33 @@ async def on_startup(app: web.Application):
     global session, ws_task, poll_tasks
     session = aiohttp.ClientSession()
     await get_pool()
-
-    # webhook
     await set_webhook()
-
-    # bg tasks
     ws_task = asyncio.create_task(ws_consumer())
-
     if ENABLE_OI_POLL:
-        asyncio.create_task(oi_poll_loop())
-        poll_tasks.append(asyncio.current_task())
+        poll_tasks.append(asyncio.create_task(oi_poll_loop()))
     if ENABLE_PRICE_POLL:
         poll_tasks.append(asyncio.create_task(price_poll_loop()))
 
 async def on_cleanup(app: web.Application):
     global session, ws_task, poll_tasks, pool
-    # stop ws
     if ws_task and not ws_task.done():
         ws_task.cancel()
         try:
             await ws_task
         except asyncio.CancelledError:
             pass
-    # stop polls
     for t in poll_tasks:
-        if t and not t.done():
+        if not t.done():
             t.cancel()
     for t in poll_tasks:
         try:
-            if t:
-                await t
+            await t
         except asyncio.CancelledError:
             pass
     poll_tasks.clear()
-    # session
     if session:
         await session.close()
         session = None
-    # db
     if pool:
         await pool.close()
         pool = None
@@ -748,21 +821,9 @@ def run():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    # корректное завершение
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
-        if sig:
-            try:
-                loop.add_signal_handler(sig, lambda: asyncio.ensure_future(app.shutdown()))
-            except NotImplementedError:
-                # Windows/limited env: пропускаем
-                pass
-
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: asyncio.ensure_future(app.shutdown()))
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
