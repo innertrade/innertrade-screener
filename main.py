@@ -37,7 +37,6 @@ SYMBOLS = [s.strip().upper() for s in os.getenv(
 ).split(",") if s.strip()]
 
 BYBIT_WS_URL = os.getenv("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear")
-
 BYBIT_REST_BASE = os.getenv("BYBIT_REST_BASE", "https://api.bybit.com").rstrip("/")
 BYBIT_REST_FALLBACK = os.getenv("BYBIT_REST_FALLBACK", "https://api.bytick.com").rstrip("/")
 
@@ -48,6 +47,11 @@ OI_POLL_WINDOW_MIN = int(os.getenv("OI_POLL_WINDOW_MIN", "5"))
 ENABLE_PRICE_POLL = os.getenv("ENABLE_PRICE_POLL", "false").lower() in ("1", "true", "yes")
 PRICE_POLL_INTERVAL_SEC = int(os.getenv("PRICE_POLL_INTERVAL_SEC", "1800"))
 PRICE_POLL_HOURS_BACK = int(os.getenv("PRICE_POLL_HOURS_BACK", "192"))
+
+# === Новые ОПЦИОНАЛЬНЫЕ env для почасовых свечей ===
+OUTBOUND_PROXY = os.getenv("OUTBOUND_PROXY", "").strip()  # напр.: http://user:pass@host:port
+PRICE_FALLBACK_BINANCE = os.getenv("PRICE_FALLBACK_BINANCE", "false").lower() in ("1", "true", "yes")
+BINANCE_REST_BASE = os.getenv("BINANCE_REST_BASE", "https://api.binance.com").rstrip("/")
 
 # =========================
 # SQL
@@ -236,24 +240,42 @@ async def ws_consumer():
             log.info("WS consumer finished")
 
 # =========================
-# REST helpers
+# REST helpers (Bybit + Proxy)
 # =========================
 
-async def bybit_get_json(url_path: str, params: dict) -> Optional[dict]:
+def _ua() -> dict:
+    # более «человеческий» UA — некоторые CDN режут кастомные
+    return {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
+
+async def http_get_json(full_url: str, params: dict) -> Tuple[Optional[dict], Optional[int]]:
+    try:
+        async with session.get(full_url, params=params, timeout=20, headers=_ua(),
+                               proxy=(OUTBOUND_PROXY or None)) as resp:
+            status = resp.status
+            if status == 200:
+                return await resp.json(), status
+            else:
+                log.warning("REST %s -> HTTP %d", full_url, status)
+                return None, status
+    except Exception as e:
+        log.warning("REST %s -> network error: %s", full_url, e)
+        return None, None
+
+async def bybit_get_json(url_path: str, params: dict) -> Tuple[Optional[dict], Optional[int]]:
     # порядок: BASE -> FALLBACK
     for base in (BYBIT_REST_BASE, BYBIT_REST_FALLBACK):
         if not base:
             continue
         full = f"{base}{url_path}"
-        try:
-            async with session.get(full, params=params, timeout=15, headers={"User-Agent":"innertrade/1.0"}) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    log.warning("REST %s -> HTTP %d", full, resp.status)
-        except Exception as e:
-            log.warning("REST %s -> network error: %s", full, e)
-    return None
+        data, status = await http_get_json(full, params)
+        if data is not None:
+            return data, 200
+        # если 403 — сразу пробуем следующий base
+        if status and status != 403:
+            # не 403, но ошибка — всё равно попробуем следующий
+            continue
+    return None, None
 
 # =========================
 # OI poll
@@ -262,7 +284,7 @@ async def bybit_get_json(url_path: str, params: dict) -> Optional[dict]:
 async def poll_oi_once():
     for sym in SYMBOLS:
         params = {"category":"linear","symbol":sym,"interval":f"{OI_POLL_WINDOW_MIN}min"}
-        data = await bybit_get_json("/v5/market/open-interest", params)
+        data, _ = await bybit_get_json("/v5/market/open-interest", params)
         if not data:
             log.warning("OI %s fetch failed", sym); continue
         try:
@@ -293,35 +315,56 @@ async def oi_poll_loop():
         await asyncio.sleep(OI_POLL_INTERVAL_SEC)
 
 # =========================
-# Price poll (last N by limit)
+# Price: Bybit + (опц.) Binance fallback
 # =========================
 
-async def fetch_kline_last_n(symbol: str, n: int) -> List[Tuple[int,float]]:
-    """
-    Возвращает список [(start_ms, close), ...] последних N часов без указания start/end.
-    """
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": "60",
-        "limit": max(1, min(n, 1000)),  # bybit limit up to 1000
-    }
-    data = await bybit_get_json("/v5/market/kline", params)
+async def fetch_kline_last_n_bybit(symbol: str, n: int) -> List[Tuple[int,float]]:
+    params = {"category":"linear", "symbol":symbol, "interval":"60", "limit": max(1, min(n, 1000))}
+    data, _ = await bybit_get_json("/v5/market/kline", params)
     if not data:
         return []
     try:
         lst = (data.get("result") or {}).get("list") or []
         out = []
         for item in lst:
-            # [startTime, open, high, low, close, volume, turnover]
             start_ms = int(item[0])
             close = float(item[4])
             out.append((start_ms, close))
-        # API отдаёт от старых к новым, нам это ок — вставка по ts происходит с upsert
         return out
     except Exception:
-        log.exception("Kline parse failed for %s", symbol)
+        log.exception("Kline parse failed (Bybit) for %s", symbol)
         return []
+
+async def fetch_kline_last_n_binance(symbol: str, n: int) -> List[Tuple[int,float]]:
+    # Binance SPOT 1h klines, символы совпадают (BTCUSDT, ETHUSDT, ...)
+    url = f"{BINANCE_REST_BASE}/api/v3/klines"
+    params = {"symbol": symbol, "interval": "1h", "limit": max(1, min(n, 1000))}
+    data, status = await http_get_json(url, params)
+    if data is None:
+        return []
+    try:
+        # формат: [ openTime, open, high, low, close, volume, closeTime, ... ]
+        out = []
+        for it in data:
+            start_ms = int(it[0])
+            close = float(it[4])
+            out.append((start_ms, close))
+        return out
+    except Exception:
+        log.exception("Kline parse failed (Binance) for %s", symbol)
+        return []
+
+async def fetch_kline_last_n(symbol: str, n: int) -> Tuple[str, List[Tuple[int,float]]]:
+    # сначала пробуем Bybit
+    rows = await fetch_kline_last_n_bybit(symbol, n)
+    if rows:
+        return "bybit", rows
+    # если Bybit пусто и включен фолбэк — пробуем Binance
+    if PRICE_FALLBACK_BINANCE:
+        rows = await fetch_kline_last_n_binance(symbol, n)
+        if rows:
+            return "binance", rows
+    return "none", []
 
 async def upsert_klines(symbol: str, rows: List[Tuple[int,float]]) -> int:
     if not rows:
@@ -339,19 +382,21 @@ async def upsert_klines(symbol: str, rows: List[Tuple[int,float]]) -> int:
                     """,
                     (start_ms, symbol, close),
                 )
-                cnt += cur.rowcount  # для INSERT rowcount=1, для DO UPDATE — 0 (psycopg)
+                cnt += cur.rowcount  # INSERT -> 1, UPDATE -> 0
     return cnt
 
 async def poll_prices_once():
     total = 0
     for sym in SYMBOLS:
-        rows = await fetch_kline_last_n(sym, 200)  # фон: берём ~200 часовых
+        src, rows = await fetch_kline_last_n(sym, 200)
         up = await upsert_klines(sym, rows)
         total += up
+        log.info("Price poll %s: src=%s rows=%d upserted≈%d", sym, src, len(rows), up)
     log.info("Price poll upserts: %d", total)
 
 async def price_poll_loop():
-    log.info("Price polling enabled: every %ds (last-N by limit)", PRICE_POLL_INTERVAL_SEC)
+    log.info("Price polling enabled: every %ds (last-N by limit, fallback=%s)",
+             PRICE_POLL_INTERVAL_SEC, "binance" if PRICE_FALLBACK_BINANCE else "none")
     while True:
         try:
             await poll_prices_once()
@@ -405,7 +450,7 @@ def buttons_text() -> str:
 async def cmd_start(chat_id: int):
     text = (
         "🧭 Market mood\n"
-        f"Добро пожаловать в Innertrade Screener v1.11.2-klinepull.\n\n"
+        f"Добро пожаловать в Innertrade Screener v1.11.3-proxy-fallback.\n\n"
         "Команды:\n"
         "/status – состояние\n"
         "/now [SYMBOL]\n"
@@ -429,12 +474,12 @@ async def cmd_status(chat_id: int):
         "Status\n"
         f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (local)\n"
         f"Source: Bybit (public WS + REST OI/Prices)\n"
-        "Version: v1.11.2-klinepull\n"
+        "Version: v1.11.3-proxy-fallback\n"
         f"Bybit WS: {BYBIT_WS_URL}\n"
         f"WS connected: True\n"
         f"DB rows (ws_ticker): {rows}\n"
         f"OI poll: {'enabled' if ENABLE_OI_POLL else 'disabled'} ({OI_POLL_WINDOW_MIN}min, every {OI_POLL_INTERVAL_SEC}s)\n"
-        f"Price poll: {'enabled' if ENABLE_PRICE_POLL else 'disabled'} (every {PRICE_POLL_INTERVAL_SEC}s, last-N by limit)\n"
+        f"Price poll: {'enabled' if ENABLE_PRICE_POLL else 'disabled'} (every {PRICE_POLL_INTERVAL_SEC}s, last-N; fallback={'binance' if PRICE_FALLBACK_BINANCE else 'none'})\n"
     )
     await send_text(chat_id, text)
 
@@ -524,15 +569,17 @@ async def cmd_pull_prices(chat_id: int, symbol: Optional[str], n: int):
     symbols = [symbol.upper()] if symbol else SYMBOLS
     total_up = 0
     total_rows = 0
+    src_used = set()
     for sym in symbols:
-        rows = await fetch_kline_last_n(sym, n)
+        src, rows = await fetch_kline_last_n(sym, n)
+        src_used.add(src)
         total_rows += len(rows)
         up = await upsert_klines(sym, rows)
         total_up += up
-    await send_text(chat_id, f"Загрузка клоузов: symbols={len(symbols)}, limit={n}, rows={total_rows}, upserted≈{total_up}")
+    src_txt = ",".join(sorted(src_used))
+    await send_text(chat_id, f"Загрузка клоузов: symbols={len(symbols)}, limit={n}, src={src_txt}, rows={total_rows}, upserted≈{total_up}")
 
 def calc_vol(pct_series: List[float]) -> float:
-    # простая реализация: стандартное отклонение процентов закрытия (час к часу)
     if len(pct_series) < 2:
         return 0.0
     mean = sum(pct_series)/len(pct_series)
@@ -541,7 +588,7 @@ def calc_vol(pct_series: List[float]) -> float:
 
 async def cmd_vol(chat_id: int, symbol: str, hours: int):
     symbol = symbol.upper()
-    need = max(2, hours)  # нужно минимум 2 точки для std
+    need = max(2, hours)
     p = await get_pool()
     async with p.connection() as conn:
         async with conn.cursor() as cur:
@@ -550,13 +597,75 @@ async def cmd_vol(chat_id: int, symbol: str, hours: int):
     if len(rows) < need+1:
         await send_text(chat_id, f"Волатильность {symbol}: нет достаточных данных за {hours}ч (используй /pull_prices {symbol} 120).")
         return
-    closes = [r[1] for r in rows][::-1]  # во временном порядке
+    closes = [r[1] for r in rows][::-1]
     rets = []
     for i in range(1, len(closes)):
         if closes[i-1] != 0:
             rets.append((closes[i]/closes[i-1]-1)*100.0)
     vol = calc_vol(rets[-hours:]) if len(rets) >= hours else calc_vol(rets)
     await send_text(chat_id, f"Волатильность {symbol} за {hours}ч ≈ {vol:.2f}% (σ часовых доходностей).")
+
+# =========================
+# Активность+
+# =========================
+
+async def cmd_activity2(chat_id: int):
+    p = await get_pool()
+    async with p.connection() as conn:
+        async with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            await cur.execute(SQL_TOP_TURNOVER, (10,))
+            top = await cur.fetchall()
+
+    if not top:
+        await send_text(chat_id, "Нет данных для Активность+")
+        return
+
+    lines = ["🔍 Активность+ (композит за ~24ч)\n"]
+
+    p = await get_pool()
+    async with p.connection() as conn:
+        async with conn.cursor() as cur:
+            for r in top:
+                sym = r["symbol"]
+                p24 = float(r["p24"] or 0)
+                turn = float(r["turn"] or 0)
+
+                await cur.execute(SQL_TRADES_SUM_24H, (sym,))
+                trow = await cur.fetchone()
+                trades_cnt = int(trow[0] or 0)
+                qty_sum = float(trow[1] or 0)
+
+                await cur.execute(SQL_ORDERBOOK_AGGR_24H, (sym,))
+                orow = await cur.fetchone()
+                avg_spread = orow[0]
+                avg_depth = orow[1]
+
+                await cur.execute(SQL_OI_DELTA_24H, (sym,))
+                oirow = await cur.fetchone()
+                first_oi = oirow[0]; last_oi = oirow[1]
+                oi_delta_pct = None
+                if first_oi and last_oi and first_oi != 0:
+                    oi_delta_pct = (last_oi - first_oi) / first_oi * 100.0
+
+                score = 0.0
+                score += (p24 / 5.0)
+                if trades_cnt > 0:
+                    score += min(trades_cnt / 400000.0, 1.0)
+                if avg_depth:
+                    score += min(avg_depth / 1_000_000.0, 1.0) * 0.5
+                if avg_spread is not None:
+                    score += max(0.0, (0.5 - min(avg_spread, 0.5)))
+                if oi_delta_pct is not None:
+                    score += (oi_delta_pct / 10.0)
+
+                lines.append(
+                    f"{sym}  score {score:+.2f}  | "
+                    f"turnover ~ {fmt_money(turn)} | trades ~ {fmt_money(trades_cnt)} | "
+                    f"depth≈${fmt_money(avg_depth or 0)} | spread≈{fmt_bps(avg_spread)} | "
+                    f"OIΔ {fmt_pct(oi_delta_pct)}"
+                )
+
+    await send_text(chat_id, "\n".join(lines))
 
 # =========================
 # AIOHTTP APP / WEBHOOK
@@ -648,68 +757,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
             await send_text(chat_id, "Команды: /status /now [SYMBOL] /activity2 /diag_trades /diag_ob /diag_oi /diag_price /pull_prices /vol")
 
     return web.json_response({"ok": True})
-
-# =========================
-# Активность+ (как было)
-# =========================
-
-async def cmd_activity2(chat_id: int):
-    p = await get_pool()
-    async with p.connection() as conn:
-        async with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            await cur.execute(SQL_TOP_TURNOVER, (10,))
-            top = await cur.fetchall()
-
-    if not top:
-        await send_text(chat_id, "Нет данных для Активность+")
-        return
-
-    lines = ["🔍 Активность+ (композит за ~24ч)\n"]
-
-    p = await get_pool()
-    async with p.connection() as conn:
-        async with conn.cursor() as cur:
-            for r in top:
-                sym = r["symbol"]
-                p24 = float(r["p24"] or 0)
-                turn = float(r["turn"] or 0)
-
-                await cur.execute(SQL_TRADES_SUM_24H, (sym,))
-                trow = await cur.fetchone()
-                trades_cnt = int(trow[0] or 0)
-                qty_sum = float(trow[1] or 0)
-
-                await cur.execute(SQL_ORDERBOOK_AGGR_24H, (sym,))
-                orow = await cur.fetchone()
-                avg_spread = orow[0]
-                avg_depth = orow[1]
-
-                await cur.execute(SQL_OI_DELTA_24H, (sym,))
-                oirow = await cur.fetchone()
-                first_oi = oirow[0]; last_oi = oirow[1]
-                oi_delta_pct = None
-                if first_oi and last_oi and first_oi != 0:
-                    oi_delta_pct = (last_oi - first_oi) / first_oi * 100.0
-
-                score = 0.0
-                score += (p24 / 5.0)
-                if trades_cnt > 0:
-                    score += min(trades_cnt / 400000.0, 1.0)
-                if avg_depth:
-                    score += min(avg_depth / 1_000_000.0, 1.0) * 0.5
-                if avg_spread is not None:
-                    score += max(0.0, (0.5 - min(avg_spread, 0.5)))
-                if oi_delta_pct is not None:
-                    score += (oi_delta_pct / 10.0)
-
-                lines.append(
-                    f"{sym}  score {score:+.2f}  | "
-                    f"turnover ~ {fmt_money(turn)} | trades ~ {fmt_money(trades_cnt)} | "
-                    f"depth≈${fmt_money(avg_depth or 0)} | spread≈{fmt_bps(avg_spread)} | "
-                    f"OIΔ {fmt_pct(oi_delta_pct)}"
-                )
-
-    await send_text(chat_id, "\n".join(lines))
 
 # =========================
 # LIFECYCLE
