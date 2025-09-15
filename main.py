@@ -394,7 +394,7 @@ def realized_vol(prices: List[Tuple[str,float]], window_min: int) -> Optional[fl
     rets = []
     for i in range(1,len(vals)):
         try:
-            rets.append(math.log(vals[i]/vals[i-1])))
+            rets.append(math.log(vals[i]/vals[i-1]))
         except Exception:
             pass
     if len(rets) < 2: return None
