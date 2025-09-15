@@ -1,101 +1,140 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sys, time, csv, json, math, signal, sqlite3, threading, argparse, logging
+
+import os, sys, time, csv, json, math, signal, sqlite3, threading, argparse, logging, traceback
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple, Any
+
 import requests
 from urllib3.util import Retry
 from requests.adapters import HTTPAdapter
 
-# -------- Config --------
+# =======================
+# Config
+# =======================
+
 @dataclass
 class Config:
     ByBitRestBase: str = "bytick.com"
     ByBitRestFallback: str = "bybit.com"
     PriceFallbackBinance: str = "binance.com"
+
     UniverseMax: int = 50
-    UniverseMode: str = "TOP"       # TOP | ALL
+    UniverseMode: str = "TOP"         # TOP | ALL
     UniverseRefreshMin: int = 15
     UniverseList: Optional[List[str]] = None
+
     RequestTimeout: int = 10
     MaxRetries: int = 3
     BackoffFactor: float = 0.6
-    Category: str = "linear"        # Bybit v5: linear|inverse|option
-    Concurrency: int = 10
+    Category: str = "linear"          # linear | inverse | option
+    Concurrency: int = 12
     RatePerSecond: float = 20.0
+
     CacheTTL: int = 15
+
     LogFile: str = "bot.log"
     CsvFile: str = "prices.csv"
     DbFile: str = "prices.sqlite3"
     LogLevel: str = "INFO"
     PrintOnly: bool = False
+
     HttpPort: int = 8080
     Once: bool = False
     Loop: bool = True
+
     VolWindowMin: int = 120
     TrendWindowMin: int = 120
 
+
 def env(name, default, cast=None):
     v = os.getenv(name)
-    if v is None: return default
+    if v is None:
+        return default
     if cast:
-        try: return cast(v)
-        except: return default
+        try:
+            return cast(v)
+        except Exception:
+            return default
     return v
 
+
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Screener with /activity /volatility /trend")
+    p = argparse.ArgumentParser(description="Screener bot with /activity /volatility /trend")
+
+    # Universe
     p.add_argument("--mode", default=env("UNIVERSE_MODE","TOP"), choices=["TOP","ALL"])
     p.add_argument("--max", type=int, default=env("UNIVERSE_MAX",50,int))
     p.add_argument("--refresh", type=int, default=env("UNIVERSE_REFRESH_MIN",15,int))
     p.add_argument("--list", type=str, default=env("UNIVERSE_LIST",None))
+
+    # Network
     p.add_argument("--timeout", type=int, default=env("REQUEST_TIMEOUT",10,int))
     p.add_argument("--retries", type=int, default=env("MAX_RETRIES",3,int))
     p.add_argument("--backoff", type=float, default=env("BACKOFF_FACTOR",0.6,float))
     p.add_argument("--category", default=env("BYBIT_CATEGORY","linear"), choices=["linear","inverse","option"])
-    p.add_argument("--concurrency", type=int, default=env("CONCURRENCY",10,int))
+    p.add_argument("--concurrency", type=int, default=env("CONCURRENCY",12,int))
     p.add_argument("--rps", type=float, default=env("RATE_PER_SECOND",20.0,float))
+
+    # Files/logging
     p.add_argument("--log", default=env("LOG_FILE","bot.log"))
     p.add_argument("--csv", default=env("CSV_FILE","prices.csv"))
     p.add_argument("--db", default=env("DB_FILE","prices.sqlite3"))
     p.add_argument("--level", default=env("LOG_LEVEL","INFO"), choices=["DEBUG","INFO","WARNING","ERROR"])
     p.add_argument("--print-only", action="store_true", default=env("PRINT_ONLY","false").lower()=="true")
-    p.add_argument("--http", type=int, default=env("HTTP_PORT",8080,int))
+
+    # Domains
     p.add_argument("--bybit-base", default=env("BYBIT_REST_BASE","bytick.com"))
     p.add_argument("--bybit-fallback", default=env("BYBIT_REST_FALLBACK","bybit.com"))
     p.add_argument("--binance", default=env("PRICE_FALLBACK_BINANCE","binance.com"))
+
+    # HTTP (PORT autoload)
+    p.add_argument("--http", type=int, default=int(os.getenv("PORT", os.getenv("HTTP_PORT", "8080"))))
+
+    # Modes
     p.add_argument("--once", action="store_true")
     p.add_argument("--loop", action="store_true")
+
+    # Analytics windows
     p.add_argument("--vol-window", type=int, default=env("VOL_WINDOW_MIN",120,int))
     p.add_argument("--trend-window", type=int, default=env("TREND_WINDOW_MIN",120,int))
+
     a = p.parse_args()
+
     return Config(
         ByBitRestBase=a.bybit_base, ByBitRestFallback=a.bybit_fallback, PriceFallbackBinance=a.binance,
         UniverseMax=a.max, UniverseMode=a.mode, UniverseRefreshMin=a.refresh,
         UniverseList=[s.strip() for s in a.list.split(",")] if a.list else None,
         RequestTimeout=a.timeout, MaxRetries=a.retries, BackoffFactor=a.backoff, Category=a.category,
-        Concurrency=a.concurrency, RatePerSecond=a.rps, CacheTTL=15, LogFile=a.log, CsvFile=a.csv, DbFile=a.db,
-        LogLevel=a.level, PrintOnly=a.print_only, HttpPort=a.http, Once=a.once, Loop=a.loop or (not a.once),
+        Concurrency=a.concurrency, RatePerSecond=a.rps, CacheTTL=15,
+        LogFile=a.log, CsvFile=a.csv, DbFile=a.db, LogLevel=a.level, PrintOnly=a.print_only,
+        HttpPort=a.http, Once=a.once, Loop=a.loop or (not a.once),
         VolWindowMin=a.vol_window, TrendWindowMin=a.trend_window
     )
+# =======================
+# Logger
+# =======================
 
-# -------- Logger --------
 def setup_logger(cfg: Config) -> logging.Logger:
     lg = logging.getLogger("bot")
     lg.setLevel(getattr(logging, cfg.LogLevel.upper(), logging.INFO))
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
-    h = logging.StreamHandler(sys.stdout); h.setFormatter(fmt)
-    lg.handlers.clear(); lg.addHandler(h)
+    sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt)
+    lg.handlers.clear(); lg.addHandler(sh)
     if not cfg.PrintOnly:
         from logging.handlers import RotatingFileHandler
-        fh = RotatingFileHandler(cfg.LogFile, maxBytes=3_000_000, backupCount=3, encoding="utf-8")
+        fh = RotatingFileHandler(cfg.LogFile, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
         fh.setFormatter(fmt); lg.addHandler(fh)
     return lg
 
-# -------- Universe --------
+
+# =======================
+# Universe
+# =======================
+
 DEFAULT_TOP = [
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT",
     "DOGEUSDT","ADAUSDT","TONUSDT","TRXUSDT","LINKUSDT",
@@ -107,60 +146,68 @@ DEFAULT_ALL = DEFAULT_TOP + [
     "PEPEUSDT","SHIBUSDT","FTMUSDT","KASUSDT","RUNEUSDT",
     "SEIUSDT","PYTHUSDT","TIAUSDT","ORDIUSDT","JUPUSDT",
 ]
+
 def get_universe(cfg: Config) -> List[str]:
-    if cfg.UniverseList: return [s.upper() for s in cfg.UniverseList][:cfg.UniverseMax]
+    if cfg.UniverseList:
+        return [s.strip().upper() for s in cfg.UniverseList][:cfg.UniverseMax]
     base = DEFAULT_TOP if cfg.UniverseMode.upper()=="TOP" else DEFAULT_ALL
     return base[:cfg.UniverseMax]
 
-# -------- HTTP / Retry session --------
-def build_session(cfg: Config) -> requests.Session:
-    s = requests.Session()
-    retry = Retry(total=cfg.MaxRetries, backoff_factor=cfg.BackoffFactor,
-                  status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
-    ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
-    s.mount("https://", ad); s.mount("http://", ad)
-    s.headers.update({"User-Agent":"ScreenerBot/mini"})
-    return s
 
-def n_bybit(sym:str)->str: return sym.replace("-","").upper()
-def n_binance(sym:str)->str: return sym.replace("-","").upper()
+# =======================
+# Rate limit (token bucket)
+# =======================
 
-# returns (price, quoteVol24h, baseVol24h)
-def fetch_bybit(s:requests.Session, cfg:Config, sym:str)->Tuple[float,Optional[float],Optional[float]]:
-    url=f"https://api.{cfg.ByBitRestBase}/v5/market/tickers"
-    r=s.get(url, params={"category":cfg.Category,"symbol":n_bybit(sym)}, timeout=cfg.RequestTimeout)
-    r.raise_for_status(); d=r.json()["result"]["list"][0]
-    price=float(d["lastPrice"])
-    vq=float(d["turnover24h"]) if d.get("turnover24h") is not None else None
-    vb=float(d["volume24h"]) if d.get("volume24h") is not None else None
-    return price,vq,vb
-def fetch_bybit_fb(s:requests.Session, cfg:Config, sym:str)->Tuple[float,Optional[float],Optional[float]]:
-    url=f"https://api.{cfg.ByBitRestFallback}/v5/market/tickers"
-    r=s.get(url, params={"category":cfg.Category,"symbol":n_bybit(sym)}, timeout=cfg.RequestTimeout)
-    r.raise_for_status(); d=r.json()["result"]["list"][0]
-    price=float(d["lastPrice"])
-    vq=float(d.get("turnover24h")) if d.get("turnover24h") is not None else None
-    vb=float(d.get("volume24h")) if d.get("volume24h") is not None else None
-    return price,vq,vb
-def fetch_binance(s:requests.Session, cfg:Config, sym:str)->Tuple[float,Optional[float],Optional[float]]:
-    url=f"https://api.{cfg.PriceFallbackBinance}/api/v3/ticker/24hr"
-    r=s.get(url, params={"symbol":n_binance(sym)}, timeout=cfg.RequestTimeout)
-    r.raise_for_status(); d=r.json()
-    price=float(d["lastPrice"])
-    vq=float(d.get("quoteVolume")) if d.get("quoteVolume") is not None else None
-    vb=float(d.get("volume")) if d.get("volume") is not None else None
-    return price,vq,vb
+class TokenBucket:
+    def __init__(self, rate_per_sec: float, capacity: Optional[float] = None):
+        self.rate = float(rate_per_sec)
+        self.capacity = capacity if capacity is not None else self.rate
+        self.tokens = self.capacity
+        self.last = time.perf_counter()
+        self.lock = threading.Lock()
+    def consume(self, amount: float = 1.0):
+        while True:
+            with self.lock:
+                self._refill()
+                if self.tokens >= amount:
+                    self.tokens -= amount
+                    return
+            time.sleep(0.001)
+    def _refill(self):
+        now = time.perf_counter()
+        delta = now - self.last
+        self.last = now
+        self.tokens = min(self.capacity, self.tokens + delta * self.rate)
 
-def snapshot(s, cfg, sym, logger):
-    try: p,vq,vb=fetch_bybit(s,cfg,sym); return "bytick",p,vq,vb
-    except Exception as e: logger.debug(f"bytick {sym} fail: {e}")
-    try: p,vq,vb=fetch_bybit_fb(s,cfg,sym); return "bybit",p,vq,vb
-    except Exception as e: logger.debug(f"bybitFB {sym} fail: {e}")
-    try: p,vq,vb=fetch_binance(s,cfg,sym); return "binance",p,vq,vb
-    except Exception as e: logger.debug(f"binance {sym} fail: {e}")
-    return None
 
-# -------- DB --------
+# =======================
+# Cache
+# =======================
+
+class TTLCache:
+    def __init__(self, ttl_sec: int):
+        self.ttl = ttl_sec
+        # sym -> (price, source, ts, vol_quote_24h, vol_base_24h)
+        self.data: Dict[str, Tuple[float,str,float,Optional[float],Optional[float]]] = {}
+        self.lock = threading.Lock()
+    def get(self, sym: str):
+        with self.lock:
+            row = self.data.get(sym)
+            if not row:
+                return None
+            price, source, ts, vq, vb = row
+            if time.time() - ts <= self.ttl:
+                return row
+            self.data.pop(sym, None); return None
+    def put(self, sym: str, price: float, source: str, vq: Optional[float], vb: Optional[float]):
+        with self.lock:
+            self.data[sym] = (price, source, time.time(), vq, vb)
+
+
+# =======================
+# DB
+# =======================
+
 class DB:
     def __init__(self, path:str, logger:logging.Logger):
         self.path=path; self.log=logger; self._init()
@@ -207,55 +254,152 @@ class DB:
             c.execute("""SELECT ts, price, vol_quote_24h, vol_base_24h
                          FROM prices WHERE symbol=? ORDER BY ts DESC LIMIT 1""", (sym.upper(),))
             r=c.fetchone()
-            return (r[0], float(r[1]),
-                    (float(r[2]) if r[2] is not None else None),
+            return (r[0], float(r[1]), (float(r[2]) if r[2] is not None else None),
                     (float(r[3]) if r[3] is not None else None)) if r else None
         except Exception as e:
             self.log.error(f"DB last error {sym}: {e}"); return None
         finally:
             try: con.close()
             except: pass
+# =======================
+# CSV
+# =======================
 
-# -------- CSV --------
 def ensure_csv(path:str, print_only:bool):
     if print_only: return
     if not os.path.isfile(path):
         with open(path,"w",newline="",encoding="utf-8") as f:
             csv.writer(f).writerow(["timestamp","symbol","source","price","vol_quote_24h","vol_base_24h"])
+
 def append_csv(path:str, row:List[Any], print_only:bool):
     if print_only: return
     with open(path,"a",newline="",encoding="utf-8") as f:
         csv.writer(f).writerow(row)
 
-# -------- Vol & Trend --------
-def realized_vol(prices:List[Tuple[str,float]], window_min:int)->Optional[float]:
-    if len(prices)<3: return None
-    vals=[p for _,p in prices if p>0]
-    if len(vals)<3: return None
-    rets=[]
+
+# =======================
+# HTTP session
+# =======================
+
+def build_session(cfg: Config) -> requests.Session:
+    s = requests.Session()
+    retry = Retry(total=cfg.MaxRetries, backoff_factor=cfg.BackoffFactor,
+                  status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
+    ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+    s.mount("https://", ad); s.mount("http://", ad)
+    s.headers.update({"User-Agent":"ScreenerBot/3.1"})
+    return s
+
+def n_bybit(sym:str)->str: return sym.replace("-","").upper()
+def n_binance(sym:str)->str: return sym.replace("-","").upper()
+
+
+# =======================
+# Fetchers
+# =======================
+
+def fetch_bybit(session, cfg, symbol):
+    sym = n_bybit(symbol)
+    url = f"https://api.{cfg.ByBitRestBase}/v5/market/tickers"
+    r = session.get(url, params={"category": cfg.Category, "symbol": sym}, timeout=cfg.RequestTimeout)
+    r.raise_for_status()
+    data = r.json()
+    lst = (((data or {}).get("result") or {}).get("list") or [])
+    if not lst:
+        raise RuntimeError(f"empty result: {data}")
+    item = lst[0]
+    price = float(item["lastPrice"])
+    vq = float(item["turnover24h"]) if item.get("turnover24h") else None
+    vb = float(item["volume24h"]) if item.get("volume24h") else None
+    return price, vq, vb
+
+def fetch_bybit_fb(session, cfg, symbol):
+    sym = n_bybit(symbol)
+    url = f"https://api.{cfg.ByBitRestFallback}/v5/market/tickers"
+    r = session.get(url, params={"category": cfg.Category, "symbol": sym}, timeout=cfg.RequestTimeout)
+    r.raise_for_status()
+    data = r.json()
+    lst = (((data or {}).get("result") or {}).get("list") or [])
+    if not lst:
+        raise RuntimeError(f"empty result: {data}")
+    item = lst[0]
+    price = float(item["lastPrice"])
+    vq = float(item.get("turnover24h")) if item.get("turnover24h") else None
+    vb = float(item.get("volume24h")) if item.get("volume24h") else None
+    return price, vq, vb
+
+def fetch_binance(session, cfg, symbol):
+    sym = n_binance(symbol)
+    url = f"https://api.{cfg.PriceFallbackBinance}/api/v3/ticker/24hr"
+    r = session.get(url, params={"symbol": sym}, timeout=cfg.RequestTimeout)
+    r.raise_for_status()
+    d = r.json()
+    if "lastPrice" not in d:
+        raise RuntimeError(f"unexpected binance payload: {d}")
+    price = float(d["lastPrice"])
+    vq = float(d.get("quoteVolume")) if d.get("quoteVolume") else None
+    vb = float(d.get("volume")) if d.get("volume") else None
+    return price, vq, vb
+
+
+def get_snapshot(session, cfg, symbol, logger):
+    try:
+        price, vq, vb = fetch_bybit(session, cfg, symbol)
+        return "bytick", price, vq, vb
+    except Exception as e:
+        logger.warning(f"[bytick] {symbol} fail: {e}")
+    try:
+        price, vq, vb = fetch_bybit_fb(session, cfg, symbol)
+        return "bybit", price, vq, vb
+    except Exception as e:
+        logger.warning(f"[bybit-fallback] {symbol} fail: {e}")
+    try:
+        price, vq, vb = fetch_binance(session, cfg, symbol)
+        return "binance", price, vq, vb
+    except Exception as e:
+        logger.warning(f"[binance] {symbol} fail: {e}")
+    return None
+
+
+# =======================
+# Analytics
+# =======================
+
+def realized_vol(prices: List[Tuple[str,float]], window_min: int) -> Optional[float]:
+    if len(prices) < 3: return None
+    vals = [p for _,p in prices if p>0]
+    if len(vals) < 3: return None
+    rets = []
     for i in range(1,len(vals)):
-        try: rets.append(math.log(vals[i]/vals[i-1]))
-        except: pass
-    if len(rets)<2: return None
-    m=sum(rets)/len(rets)
-    var=sum((x-m)**2 for x in rets)/(len(rets)-1)
-    std=math.sqrt(var)
-    scale=math.sqrt(1440.0/max(1.0,float(window_min)))
+        try:
+            rets.append(math.log(vals[i]/vals[i-1]))
+        except Exception:
+            pass
+    if len(rets) < 2: return None
+    mean = sum(rets)/len(rets)
+    var = sum((x-mean)**2 for x in rets)/(len(rets)-1)
+    std = math.sqrt(var)
+    scale = math.sqrt(1440.0/max(1.0, float(window_min)))
     return std*scale*100.0
-def linear_trend_pct_day(prices:List[Tuple[str,float]], window_min:int)->Optional[float]:
-    if len(prices)<3: return None
-    ys=[p for _,p in prices]; xs=list(range(len(ys)))
-    n=len(xs); sx=sum(xs); sy=sum(ys)
+
+def linear_trend_pct_day(prices: List[Tuple[str,float]], window_min: int) -> Optional[float]:
+    if len(prices) < 3: return None
+    ys = [p for _,p in prices]; xs = list(range(len(ys)))
+    n = len(xs); sx=sum(xs); sy=sum(ys)
     sxx=sum(x*x for x in xs); sxy=sum(xs[i]*ys[i] for i in range(n))
-    denom=n*sxx - sx*sx
-    if denom==0: return None
-    slope=(n*sxy - sx*sy)/denom
-    last=ys[-1]
-    if last<=0: return None
-    steps_per_day=1440.0/max(1.0,float(window_min))/n
+    denom = n*sxx - sx*sx
+    if denom == 0: return None
+    slope = (n*sxy - sx*sy)/denom
+    last = ys[-1]
+    if last <= 0: return None
+    steps_per_day = 1440.0/max(1.0, float(window_min))/n
     return (slope/last)*steps_per_day*100.0
 
-# -------- State & HTTP --------
+
+# =======================
+# State + HTTP handler
+# =======================
+
 STATE={"ok":0,"fail":0,"last_cycle_start":"","last_cycle_end":""}
 _GLOBALS={"cfg":None,"db":None}
 _SHUTDOWN=False
@@ -274,7 +418,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._raw(404, "not found")
     def _activity(self, qs):
-        cfg:_cfg=_GLOBALS["cfg"]; db:_db=_GLOBALS["db"]
+        cfg=_GLOBALS["cfg"]; db=_GLOBALS["db"]
         syms=get_universe(cfg); limit=int(qs.get("limit",[min(20,len(syms))])[0])
         rows=[]
         for s in syms:
@@ -314,25 +458,43 @@ class Handler(BaseHTTPRequestHandler):
         body=text.encode("utf-8")
         self.send_response(code); self.send_header("Content-Type","text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+# =======================
+# HTTP server
+# =======================
 
 def run_http(port:int, stop_evt:threading.Event, logger:logging.Logger):
-    httpd=HTTPServer(("0.0.0.0",port), Handler); httpd.timeout=1.0
+    httpd=HTTPServer(("0.0.0.0",port), Handler)
+    httpd.timeout=1.0
     logger.info(f"HTTP on :{port} (/health /activity /volatility /trend)")
-    while not stop_evt.is_set(): httpd.handle_request()
+    while not stop_evt.is_set():
+        httpd.handle_request()
     logger.info("HTTP stopped")
 
-# -------- Loop --------
-def now(): return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+# =======================
+# Core loop
+# =======================
+
+def now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def ensure_csv_header(path:str, print_only:bool):
+    # отдельная обёртка — исторически вызывалась из разных мест
+    ensure_csv(path, print_only)
 
 def run_once(cfg:Config, logger:logging.Logger, sess:requests.Session, db:DB):
     ts=now(); STATE["last_cycle_start"]=ts
-    ensure_csv(cfg.CsvFile, cfg.PrintOnly)
+    ensure_csv_header(cfg.CsvFile, cfg.PrintOnly)
     syms=get_universe(cfg)
-    results:Dict[str,Tuple[str,float,Optional[float],Optional[float]]]={}; errs={}
+
+    results:Dict[str,Tuple[str,float,Optional[float],Optional[float]]]={}
+    errs:Dict[str,str]={}
+
     def worker(sym:str):
-        snap=snapshot(sess,cfg,sym,logger)
+        snap=get_snapshot(sess,cfg,sym,logger)
         if not snap: return (sym,None,"all sources failed")
         src,price,vq,vb=snap; return (sym,(src,price,vq,vb),None)
+
     with ThreadPoolExecutor(max_workers=max(1,cfg.Concurrency)) as ex:
         futs={ex.submit(worker,s):s for s in syms}
         for f in as_completed(futs):
@@ -341,47 +503,77 @@ def run_once(cfg:Config, logger:logging.Logger, sess:requests.Session, db:DB):
                 sym,res,err=f.result()
                 if err: errs[sym]=err
                 else: results[sym]=res
-            except Exception as e: errs[s]=str(e)
+            except Exception as e:
+                errs[s]=str(e)
+
     ok=0; fail=0
     for s in syms:
         if s in results:
             src,price,vq,vb=results[s]
             print(f"{s}: {price} [{src}]")
             logger.info(f"{s}: {price} [{src}] volQ24h={vq} volB24h={vb}")
-            append_csv(cfg.CsvFile, [ts,s,src,f"{price:.10g}",vq if vq is not None else "", vb if vb is not None else ""], cfg.PrintOnly)
-            db.insert(ts,s,src,price,vq,vb); ok+=1
+            append_csv(cfg.CsvFile, [ts,s,src,f"{price:.10g}", vq if vq is not None else "", vb if vb is not None else ""], cfg.PrintOnly)
+            db.insert(ts,s,src,price,vq,vb)
+            ok+=1
         else:
-            logger.warning(f"{s}: нет данных ({errs.get(s,'unknown error')})"); fail+=1
+            logger.warning(f"{s}: нет данных ({errs.get(s,'unknown error')})")
+            fail+=1
+
     STATE["ok"]+=ok; STATE["fail"]+=fail; STATE["last_cycle_end"]=now()
 
 def install_signals(logger):
     def _h(signum, frame):
-        global _SHUTDOWN; _SHUTDOWN=True; logger.info(f"Signal {signum} -> stop")
-    signal.signal(signal.SIGINT,_h); signal.signal(signal.SIGTERM,_h)
+        global _SHUTDOWN
+        _SHUTDOWN=True
+        logger.info(f"Signal {signum} -> stop")
+    signal.signal(signal.SIGINT,_h)
+    signal.signal(signal.SIGTERM,_h)
 
 def run_loop(cfg:Config, logger:logging.Logger):
-    sess=build_session(cfg); db=DB(cfg.DbFile, logger)
-    http_stop=threading.Event(); http_thr=threading.Thread(target=run_http, args=(cfg.HttpPort,http_stop,logger), daemon=True)
-    http_thr.start()
+    sess=build_session(cfg)
+    db=DB(cfg.DbFile, logger)
+
+    # HTTP server (можно выключить, если HttpPort <= 0)
+    http_stop=None
+    http_thr=None
+    if isinstance(cfg.HttpPort,int) and cfg.HttpPort>0:
+        http_stop=threading.Event()
+        http_thr=threading.Thread(target=run_http, args=(cfg.HttpPort, http_stop, logger), daemon=True)
+        http_thr.start()
+
     try:
         while not _SHUTDOWN:
             run_once(cfg, logger, sess, db)
             if cfg.Once: break
-            for _ in range(max(1,int(cfg.UniverseRefreshMin*60))):
+            sleep_total=max(1, int(cfg.UniverseRefreshMin*60))
+            for _ in range(sleep_total):
                 if _SHUTDOWN: break
                 time.sleep(1)
     finally:
-        http_stop.set()
-        for _ in range(50):
-            if not http_thr.is_alive(): break
-            time.sleep(0.1)
+        if http_stop is not None:
+            http_stop.set()
+            # подождём аккуратно завершения сервера
+            for _ in range(50):
+                if http_thr and not http_thr.is_alive(): break
+                time.sleep(0.1)
         logger.info("Stopped")
 
-# -------- Main --------
+
+# =======================
+# Main
+# =======================
+
 def main():
-    cfg=parse_args(); logger=setup_logger(cfg); install_signals(logger)
-    if cfg.Loop: run_loop(cfg, logger)
+    cfg=parse_args()
+    logger=setup_logger(cfg)
+    install_signals(logger)
+
+    if cfg.Loop:
+        run_loop(cfg, logger)
     else:
-        sess=build_session(cfg); db=DB(cfg.DbFile, logger); run_once(cfg, logger, sess, db)
+        sess=build_session(cfg)
+        db=DB(cfg.DbFile, logger)
+        run_once(cfg, logger, sess, db)
+
 if __name__=="__main__":
     main()
