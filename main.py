@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, time, csv, json, math, signal, sqlite3, threading, argparse, logging, traceback
+import os, sys, re, time, csv, json, math, signal, sqlite3, threading, argparse, logging, traceback
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, urlparse as _urlparse, parse_qs
 
 import requests
 from urllib3.util import Retry
@@ -18,9 +18,9 @@ from requests.adapters import HTTPAdapter
 
 @dataclass
 class Config:
-    ByBitRestBase: str = "bytick.com"
-    ByBitRestFallback: str = "bybit.com"
-    PriceFallbackBinance: str = "binance.com"
+    ByBitRestBase: str = "api.bytick.com"
+    ByBitRestFallback: str = "api.bybit.com"
+    PriceFallbackBinance: str = "api.binance.com"
 
     UniverseMax: int = 50
     UniverseMode: str = "TOP"         # TOP | ALL
@@ -61,6 +61,26 @@ def env(name, default, cast=None):
             return default
     return v
 
+def auto_port(default: int = 8080) -> int:
+    raw = os.getenv("PORT") or os.getenv("HTTP_PORT") or str(default)
+    try:
+        m = re.search(r"\d+", str(raw))
+        return int(m.group()) if m else default
+    except Exception:
+        return default
+
+def clean_host(v: str) -> str:
+    """Возвращает чистый хост (без схемы и пути) из значения ENV."""
+    if not v:
+        return v
+    v = v.strip()
+    if "://" in v:
+        parsed = _urlparse(v)
+        host = (parsed.netloc or parsed.path or "").strip("/")
+    else:
+        host = v.strip("/")
+    return host.split("/")[0].strip()
+
 
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Screener bot with /activity /volatility /trend")
@@ -86,13 +106,13 @@ def parse_args() -> Config:
     p.add_argument("--level", default=env("LOG_LEVEL","INFO"), choices=["DEBUG","INFO","WARNING","ERROR"])
     p.add_argument("--print-only", action="store_true", default=env("PRINT_ONLY","false").lower()=="true")
 
-    # Domains
-    p.add_argument("--bybit-base", default=env("BYBIT_REST_BASE","bytick.com"))
-    p.add_argument("--bybit-fallback", default=env("BYBIT_REST_FALLBACK","bybit.com"))
-    p.add_argument("--binance", default=env("PRICE_FALLBACK_BINANCE","binance.com"))
+    # Domains (дефолты уже api.*)
+    p.add_argument("--bybit-base", default=env("BYBIT_REST_BASE","api.bytick.com"))
+    p.add_argument("--bybit-fallback", default=env("BYBIT_REST_FALLBACK","api.bybit.com"))
+    p.add_argument("--binance", default=env("PRICE_FALLBACK_BINANCE","api.binance.com"))
 
-    # HTTP (PORT autoload)
-    p.add_argument("--http", type=int, default=int(os.getenv("PORT", os.getenv("HTTP_PORT", "8080"))))
+    # HTTP (PORT autoload + sanitization)
+    p.add_argument("--http", type=int, default=auto_port(8080))
 
     # Modes
     p.add_argument("--once", action="store_true")
@@ -105,7 +125,9 @@ def parse_args() -> Config:
     a = p.parse_args()
 
     return Config(
-        ByBitRestBase=a.bybit_base, ByBitRestFallback=a.bybit_fallback, PriceFallbackBinance=a.binance,
+        ByBitRestBase=clean_host(a.bybit_base),
+        ByBitRestFallback=clean_host(a.bybit_fallback),
+        PriceFallbackBinance=clean_host(a.binance),
         UniverseMax=a.max, UniverseMode=a.mode, UniverseRefreshMin=a.refresh,
         UniverseList=[s.strip() for s in a.list.split(",")] if a.list else None,
         RequestTimeout=a.timeout, MaxRetries=a.retries, BackoffFactor=a.backoff, Category=a.category,
@@ -300,7 +322,7 @@ def n_binance(sym:str)->str: return sym.replace("-","").upper()
 
 def fetch_bybit(session, cfg, symbol):
     sym = n_bybit(symbol)
-    url = f"https://api.{cfg.ByBitRestBase}/v5/market/tickers"
+    url = f"https://{cfg.ByBitRestBase}/v5/market/tickers"
     r = session.get(url, params={"category": cfg.Category, "symbol": sym}, timeout=cfg.RequestTimeout)
     r.raise_for_status()
     data = r.json()
@@ -315,7 +337,7 @@ def fetch_bybit(session, cfg, symbol):
 
 def fetch_bybit_fb(session, cfg, symbol):
     sym = n_bybit(symbol)
-    url = f"https://api.{cfg.ByBitRestFallback}/v5/market/tickers"
+    url = f"https://{cfg.ByBitRestFallback}/v5/market/tickers"
     r = session.get(url, params={"category": cfg.Category, "symbol": sym}, timeout=cfg.RequestTimeout)
     r.raise_for_status()
     data = r.json()
@@ -330,7 +352,7 @@ def fetch_bybit_fb(session, cfg, symbol):
 
 def fetch_binance(session, cfg, symbol):
     sym = n_binance(symbol)
-    url = f"https://api.{cfg.PriceFallbackBinance}/api/v3/ticker/24hr"
+    url = f"https://{cfg.PriceFallbackBinance}/api/v3/ticker/24hr"
     r = session.get(url, params={"symbol": sym}, timeout=cfg.RequestTimeout)
     r.raise_for_status()
     d = r.json()
@@ -372,7 +394,7 @@ def realized_vol(prices: List[Tuple[str,float]], window_min: int) -> Optional[fl
     rets = []
     for i in range(1,len(vals)):
         try:
-            rets.append(math.log(vals[i]/vals[i-1]))
+            rets.append(math.log(vals[i]/vals[i-1])))
         except Exception:
             pass
     if len(rets) < 2: return None
@@ -479,7 +501,6 @@ def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 def ensure_csv_header(path:str, print_only:bool):
-    # отдельная обёртка — исторически вызывалась из разных мест
     ensure_csv(path, print_only)
 
 def run_once(cfg:Config, logger:logging.Logger, sess:requests.Session, db:DB):
@@ -533,7 +554,6 @@ def run_loop(cfg:Config, logger:logging.Logger):
     sess=build_session(cfg)
     db=DB(cfg.DbFile, logger)
 
-    # HTTP server (можно выключить, если HttpPort <= 0)
     http_stop=None
     http_thr=None
     if isinstance(cfg.HttpPort,int) and cfg.HttpPort>0:
@@ -552,7 +572,6 @@ def run_loop(cfg:Config, logger:logging.Logger):
     finally:
         if http_stop is not None:
             http_stop.set()
-            # подождём аккуратно завершения сервера
             for _ in range(50):
                 if http_thr and not http_thr.is_alive(): break
                 time.sleep(0.1)
