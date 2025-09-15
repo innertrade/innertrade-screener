@@ -9,3 +9,6 @@ openpyxl==3.1.5
 # postgres (совместимо с Python 3.13)
 psycopg[binary]==3.2.9
 psycopg-pool==3.2.6
+
+# для main.py (API-запросы, алерты, вебхуки)
+requests==2.32.3
