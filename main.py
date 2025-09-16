@@ -12,6 +12,8 @@ import requests
 from urllib3.util import Retry
 from requests.adapters import HTTPAdapter
 
+BUILD_TAG = "screener-main-coingecko-eu-2025-09-16"
+
 # =======================
 # Config
 # =======================
@@ -32,7 +34,6 @@ class Config:
     BackoffFactor: float = 0.6
     Category: str = "linear"          # linear | inverse | option
     Concurrency: int = 12
-    RatePerSecond: float = 20.0
 
     CacheTTL: int = 15
 
@@ -83,7 +84,7 @@ def clean_host(v: str) -> str:
 
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Screener bot with /activity /volatility /trend")
+    p = argparse.ArgumentParser(description="Screener bot: /health /activity /volatility /trend /ip")
 
     # Universe
     p.add_argument("--mode", default=env("UNIVERSE_MODE","TOP"), choices=["TOP","ALL"])
@@ -97,7 +98,6 @@ def parse_args() -> Config:
     p.add_argument("--backoff", type=float, default=env("BACKOFF_FACTOR",0.6,float))
     p.add_argument("--category", default=env("BYBIT_CATEGORY","linear"), choices=["linear","inverse","option"])
     p.add_argument("--concurrency", type=int, default=env("CONCURRENCY",12,int))
-    p.add_argument("--rps", type=float, default=env("RATE_PER_SECOND",20.0,float))
 
     # Files/logging
     p.add_argument("--log", default=env("LOG_FILE","bot.log"))
@@ -131,12 +131,12 @@ def parse_args() -> Config:
         UniverseMax=a.max, UniverseMode=a.mode, UniverseRefreshMin=a.refresh,
         UniverseList=[s.strip() for s in a.list.split(",")] if a.list else None,
         RequestTimeout=a.timeout, MaxRetries=a.retries, BackoffFactor=a.backoff, Category=a.category,
-        Concurrency=a.concurrency, RatePerSecond=a.rps, CacheTTL=15,
+        Concurrency=a.concurrency, CacheTTL=15,
         LogFile=a.log, CsvFile=a.csv, DbFile=a.db, LogLevel=a.level, PrintOnly=a.print_only,
         HttpPort=a.http, Once=a.once, Loop=a.loop or (not a.once),
         VolWindowMin=a.vol_window, TrendWindowMin=a.trend_window
     )
-    # =======================
+# =======================
 # Logger
 # =======================
 
@@ -146,10 +146,12 @@ def setup_logger(cfg: Config) -> logging.Logger:
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
     sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt)
     lg.handlers.clear(); lg.addHandler(sh)
-    if not cfg.PrintOnly:
+    try:
         from logging.handlers import RotatingFileHandler
         fh = RotatingFileHandler(cfg.LogFile, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
         fh.setFormatter(fmt); lg.addHandler(fh)
+    except Exception:
+        pass
     return lg
 
 
@@ -177,33 +179,7 @@ def get_universe(cfg: Config) -> List[str]:
 
 
 # =======================
-# Rate limit (token bucket)
-# =======================
-
-class TokenBucket:
-    def __init__(self, rate_per_sec: float, capacity: Optional[float] = None):
-        self.rate = float(rate_per_sec)
-        self.capacity = capacity if capacity is not None else self.rate
-        self.tokens = self.capacity
-        self.last = time.perf_counter()
-        self.lock = threading.Lock()
-    def consume(self, amount: float = 1.0):
-        while True:
-            with self.lock:
-                self._refill()
-                if self.tokens >= amount:
-                    self.tokens -= amount
-                    return
-            time.sleep(0.001)
-    def _refill(self):
-        now = time.perf_counter()
-        delta = now - self.last
-        self.last = now
-        self.tokens = min(self.capacity, self.tokens + delta * self.rate)
-
-
-# =======================
-# Cache
+# Cache (in-memory, optional)
 # =======================
 
 class TTLCache:
@@ -283,7 +259,9 @@ class DB:
         finally:
             try: con.close()
             except: pass
-                # =======================
+
+
+# =======================
 # CSV
 # =======================
 
@@ -297,8 +275,6 @@ def append_csv(path:str, row:List[Any], print_only:bool):
     if print_only: return
     with open(path,"a",newline="",encoding="utf-8") as f:
         csv.writer(f).writerow(row)
-
-
 # =======================
 # HTTP session
 # =======================
@@ -309,7 +285,7 @@ def build_session(cfg: Config) -> requests.Session:
                   status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
     ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
     s.mount("https://", ad); s.mount("http://", ad)
-    # маскируем User-Agent под браузер
+    # Маскируем под браузер и разрешаем прокси из ENV (HTTPS_PROXY / HTTP_PROXY)
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
@@ -317,6 +293,7 @@ def build_session(cfg: Config) -> requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
     })
+    s.trust_env = True
     return s
 
 def n_bybit(sym:str)->str: return sym.replace("-","").upper()
@@ -348,6 +325,7 @@ COINGECKO_ID = {
     "ETCUSDT": "ethereum-classic",
     "ATOMUSDT":"cosmos",
     "AAVEUSDT":"aave",
+    # extra
     "EOSUSDT": "eos",
     "XLMUSDT": "stellar",
     "FILUSDT": "filecoin",
@@ -459,6 +437,7 @@ def get_snapshot(session, cfg, symbol, logger):
         logger.warning(f"[binance] {symbol} fail: {e}")
 
     # 4) CoinGecko — максимально доступный публичный источник
+    logger.info(f"[coingecko] trying {symbol}")
     try:
         price, vq_usd, vb_est = fetch_coingecko(session, cfg, symbol)
         return "coingecko", price, vq_usd, vb_est
@@ -466,7 +445,7 @@ def get_snapshot(session, cfg, symbol, logger):
         logger.warning(f"[coingecko] {symbol} fail: {e}")
 
     return None
-    # =======================
+# =======================
 # Analytics
 # =======================
 
@@ -513,13 +492,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         p=urlparse(self.path); path=p.path; qs=parse_qs(p.query or "")
         if path=="/health":
-            self._json(200, {"status":"ok","stats":STATE})
+            self._json(200, {"status":"ok","stats":STATE,"build":BUILD_TAG})
         elif path=="/activity":
             self._json(200, self._activity(qs))
         elif path=="/volatility":
             self._json(200, self._vol(qs))
         elif path=="/trend":
             self._json(200, self._trend(qs))
+        elif path=="/ip":
+            self._json(200, self._ip())
         else:
             self._raw(404, "not found")
     def _activity(self, qs):
@@ -531,9 +512,10 @@ class Handler(BaseHTTPRequestHandler):
             if snap:
                 ts,price,vq,vb=snap
                 act=(vq if vq is not None else (vb*price if (vb is not None and price is not None) else 0.0))
-                rows.append({"symbol":s,"activity":float(act or 0.0),"price":price,"ts":ts,"source_hint":"24h USD" if vq and isinstance(vq,(int,float)) else ""})
+                rows.append({"symbol":s,"activity":float(act or 0.0),"price":price,"ts":ts,
+                             "note":"24h USD (global) if source=coingecko"})
             else:
-                rows.append({"symbol":s,"activity":0.0,"price":None,"ts":None,"source_hint":""})
+                rows.append({"symbol":s,"activity":0.0,"price":None,"ts":None})
         rows.sort(key=lambda r: r["activity"], reverse=True)
         return {"kind":"activity","data":rows[:limit]}
     def _vol(self, qs):
@@ -554,6 +536,12 @@ class Handler(BaseHTTPRequestHandler):
             out.append({"symbol":s,"trend_pct_day":tr,"last_price":(hist[-1][1] if hist else None)})
         out.sort(key=lambda r: (r["trend_pct_day"] if r["trend_pct_day"] is not None else -1), reverse=True)
         return {"kind":"trend","window_min":win,"data":out[:limit]}
+    def _ip(self):
+        try:
+            ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        except Exception as e:
+            ip = f"error: {e}"
+        return {"public_ip": ip, "build": BUILD_TAG}
     def log_message(self, *a, **k): return
     def _json(self, code:int, obj:Any):
         body=json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -572,7 +560,7 @@ class Handler(BaseHTTPRequestHandler):
 def run_http(port:int, stop_evt:threading.Event, logger:logging.Logger):
     httpd=HTTPServer(("0.0.0.0",port), Handler)
     httpd.timeout=1.0
-    logger.info(f"HTTP on :{port} (/health /activity /volatility /trend)")
+    logger.info(f"HTTP on :{port} (/health /activity /volatility /trend /ip)")
     while not stop_evt.is_set():
         httpd.handle_request()
     logger.info("HTTP stopped")
@@ -636,6 +624,7 @@ def install_signals(logger):
     signal.signal(signal.SIGTERM,_h)
 
 def run_loop(cfg:Config, logger:logging.Logger):
+    logger.info(f"BUILD {BUILD_TAG} | hosts: bytick={cfg.ByBitRestBase}, bybit={cfg.ByBitRestFallback}, binance={cfg.PriceFallbackBinance}")
     sess=build_session(cfg)
     db=DB(cfg.DbFile, logger)
 
