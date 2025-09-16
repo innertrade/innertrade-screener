@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, re, time, csv, json, math, signal, sqlite3, threading, argparse, logging, traceback
+import os, sys, re, time, csv, json, math, signal, sqlite3, threading, argparse, logging
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, urlparse as _urlparse, parse_qs
+from urllib.parse import urlparse as _urlparse, urlparse, parse_qs
 
 import requests
 from urllib3.util import Retry
@@ -70,7 +70,7 @@ def auto_port(default: int = 8080) -> int:
         return default
 
 def clean_host(v: str) -> str:
-    """Возвращает чистый хост (без схемы и пути) из значения ENV."""
+    """Вернёт чистый хост (без схемы/пути) из ENV."""
     if not v:
         return v
     v = v.strip()
@@ -136,7 +136,7 @@ def parse_args() -> Config:
         HttpPort=a.http, Once=a.once, Loop=a.loop or (not a.once),
         VolWindowMin=a.vol_window, TrendWindowMin=a.trend_window
     )
-# =======================
+    # =======================
 # Logger
 # =======================
 
@@ -283,7 +283,7 @@ class DB:
         finally:
             try: con.close()
             except: pass
-# =======================
+                # =======================
 # CSV
 # =======================
 
@@ -309,11 +309,61 @@ def build_session(cfg: Config) -> requests.Session:
                   status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
     ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
     s.mount("https://", ad); s.mount("http://", ad)
-    s.headers.update({"User-Agent":"ScreenerBot/3.1"})
+    # маскируем User-Agent под браузер
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    })
     return s
 
 def n_bybit(sym:str)->str: return sym.replace("-","").upper()
 def n_binance(sym:str)->str: return sym.replace("-","").upper()
+
+
+# =======================
+# CoinGecko symbol -> id
+# =======================
+
+COINGECKO_ID = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "SOLUSDT": "solana",
+    "XRPUSDT": "ripple",
+    "BNBUSDT": "binancecoin",
+    "DOGEUSDT": "dogecoin",
+    "ADAUSDT": "cardano",
+    "TONUSDT": "toncoin",
+    "TRXUSDT": "tron",
+    "LINKUSDT": "chainlink",
+    "APTUSDT": "aptos",
+    "ARBUSDT": "arbitrum",
+    "OPUSDT":  "optimism",
+    "NEARUSDT":"near",
+    "SUIUSDT": "sui",
+    "LTCUSDT": "litecoin",
+    "MATICUSDT":"matic-network",
+    "ETCUSDT": "ethereum-classic",
+    "ATOMUSDT":"cosmos",
+    "AAVEUSDT":"aave",
+    "EOSUSDT": "eos",
+    "XLMUSDT": "stellar",
+    "FILUSDT": "filecoin",
+    "INJUSDT": "injective-protocol",
+    "WLDUSDT": "worldcoin-wld",
+    "PEPEUSDT":"pepe",
+    "SHIBUSDT":"shiba-inu",
+    "FTMUSDT": "fantom",
+    "KASUSDT": "kaspa",
+    "RUNEUSDT":"thorchain",
+    "SEIUSDT": "sei-network",
+    "PYTHUSDT":"pyth-network",
+    "TIAUSDT": "celestia",
+    "ORDIUSDT":"ordinals",
+    "JUPUSDT": "jupiter-exchange-solana",
+}
 
 
 # =======================
@@ -363,27 +413,60 @@ def fetch_binance(session, cfg, symbol):
     vb = float(d.get("volume")) if d.get("volume") else None
     return price, vq, vb
 
+def fetch_coingecko(session, cfg, symbol):
+    """
+    Возвращает (price_usd, volume_quote_usd_24h, volume_base_24h_approx).
+    Для 'активности' используем 24h объём в USD.
+    """
+    coin_id = COINGECKO_ID.get(symbol.upper())
+    if not coin_id:
+        raise RuntimeError(f"coingecko id not mapped for {symbol}")
+
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {"vs_currency": "usd", "ids": coin_id, "precision": "full"}
+    r = session.get(url, params=params, timeout=cfg.RequestTimeout)
+    r.raise_for_status()
+    arr = r.json()
+    if not isinstance(arr, list) or not arr:
+        raise RuntimeError(f"coingecko empty for {symbol}: {arr}")
+    it = arr[0]
+    price = float(it["current_price"])
+    vol_usd = float(it.get("total_volume") or 0.0)
+    vol_base = (vol_usd / price) if price > 0 else None
+    return price, vol_usd, vol_base
+
 
 def get_snapshot(session, cfg, symbol, logger):
+    # 1) Bytick
     try:
         price, vq, vb = fetch_bybit(session, cfg, symbol)
         return "bytick", price, vq, vb
     except Exception as e:
         logger.warning(f"[bytick] {symbol} fail: {e}")
+
+    # 2) Bybit fallback
     try:
         price, vq, vb = fetch_bybit_fb(session, cfg, symbol)
         return "bybit", price, vq, vb
     except Exception as e:
         logger.warning(f"[bybit-fallback] {symbol} fail: {e}")
+
+    # 3) Binance (может давать 451 по региону)
     try:
         price, vq, vb = fetch_binance(session, cfg, symbol)
         return "binance", price, vq, vb
     except Exception as e:
         logger.warning(f"[binance] {symbol} fail: {e}")
+
+    # 4) CoinGecko — максимально доступный публичный источник
+    try:
+        price, vq_usd, vb_est = fetch_coingecko(session, cfg, symbol)
+        return "coingecko", price, vq_usd, vb_est
+    except Exception as e:
+        logger.warning(f"[coingecko] {symbol} fail: {e}")
+
     return None
-
-
-# =======================
+    # =======================
 # Analytics
 # =======================
 
@@ -448,9 +531,9 @@ class Handler(BaseHTTPRequestHandler):
             if snap:
                 ts,price,vq,vb=snap
                 act=(vq if vq is not None else (vb*price if (vb is not None and price is not None) else 0.0))
-                rows.append({"symbol":s,"activity":float(act or 0.0),"price":price,"ts":ts})
+                rows.append({"symbol":s,"activity":float(act or 0.0),"price":price,"ts":ts,"source_hint":"24h USD" if vq and isinstance(vq,(int,float)) else ""})
             else:
-                rows.append({"symbol":s,"activity":0.0,"price":None,"ts":None})
+                rows.append({"symbol":s,"activity":0.0,"price":None,"ts":None,"source_hint":""})
         rows.sort(key=lambda r: r["activity"], reverse=True)
         return {"kind":"activity","data":rows[:limit]}
     def _vol(self, qs):
@@ -480,6 +563,8 @@ class Handler(BaseHTTPRequestHandler):
         body=text.encode("utf-8")
         self.send_response(code); self.send_header("Content-Type","text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+
 # =======================
 # HTTP server
 # =======================
