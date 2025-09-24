@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, re, time, csv, json, math, signal, sqlite3, threading, argparse, logging, asyncio
+import os, sys, re, time, csv, json, math, signal, sqlite3, threading, argparse, logging, asyncio, contextlib
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,15 +12,7 @@ import requests
 from urllib3.util import Retry
 from requests.adapters import HTTPAdapter
 
-# --- Telegram (polling) ---
-try:
-    from aiogram import Bot, Dispatcher, F
-    from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
-    from aiogram.filters import CommandStart
-except Exception:
-    Bot = Dispatcher = None  # если aiogram не установлен, HTTP всё равно запустится
-
-BUILD_TAG = "screener-breakout-coingecko-2025-09-24"
+BUILD_TAG = "screener-main-coingecko-eu-2025-09-24"
 
 # =======================
 # Config
@@ -28,7 +20,6 @@ BUILD_TAG = "screener-breakout-coingecko-2025-09-24"
 
 @dataclass
 class Config:
-    # Sources
     ByBitRestBase: str = "api.bytick.com"
     ByBitRestFallback: str = "api.bybit.com"
     PriceFallbackBinance: str = "api.binance.com"
@@ -44,6 +35,8 @@ class Config:
     Category: str = "linear"          # linear | inverse | option
     Concurrency: int = 12
 
+    CacheTTL: int = 15
+
     LogFile: str = "bot.log"
     CsvFile: str = "prices.csv"
     DbFile: str = "prices.sqlite3"
@@ -57,27 +50,6 @@ class Config:
     VolWindowMin: int = 120
     TrendWindowMin: int = 120
 
-    # Telegram
-    TgToken: Optional[str] = None
-    TgAllowedChat: Optional[str] = None
-
-    # Breakout defaults (можно PATCH /config)
-    Mode: str = "breakout"            # breakout | activity | volatility | trend
-    BaselineHours: float = 2.0        # 1–4
-    LowVolThresholdPct: float = 1.2   # ATR-like %
-    Min24hVolumeUSD: float = 50_000_000.0
-    Min2hVolumeUSD: float = 10_000_000.0
-
-    Spike_VolRatioMin: float = 3.0
-    Spike_PricePctMin: float = 0.7    # альтернатива через ATR ratio — см. ниже
-    Spike_MinNotionalUSD: float = 100_000.0
-    Spike_ConfirmWithOI: bool = False # включи True, когда появится доступный OI
-    Spike_OIChange1mPctMin: float = 0.8
-    Spike_UseCVD: bool = False        # включим позже, когда подвезём trades WS
-    Spike_CvdRatioMin: float = 2.0
-    Spike_ImbalanceMin: float = 0.65
-    Spike_CooldownMin: int = 15
-    Spike_ClassifyLiquidations: bool = True
 
 def env(name, default, cast=None):
     v = os.getenv(name)
@@ -99,6 +71,7 @@ def auto_port(default: int = 8080) -> int:
         return default
 
 def clean_host(v: str) -> str:
+    """Вернёт чистый хост (без схемы/пути) из ENV."""
     if not v:
         return v
     v = v.strip()
@@ -109,8 +82,9 @@ def clean_host(v: str) -> str:
         host = v.strip("/")
     return host.split("/")[0].strip()
 
+
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Screener bot: HTTP + Telegram + BreakoutEngine")
+    p = argparse.ArgumentParser(description="Screener bot: /health /activity /volatility /trend /ip")
 
     # Universe
     p.add_argument("--mode", default=env("UNIVERSE_MODE","TOP"), choices=["TOP","ALL"])
@@ -132,12 +106,12 @@ def parse_args() -> Config:
     p.add_argument("--level", default=env("LOG_LEVEL","INFO"), choices=["DEBUG","INFO","WARNING","ERROR"])
     p.add_argument("--print-only", action="store_true", default=env("PRINT_ONLY","false").lower()=="true")
 
-    # Domains
+    # Domains (дефолты уже api.*)
     p.add_argument("--bybit-base", default=env("BYBIT_REST_BASE","api.bytick.com"))
     p.add_argument("--bybit-fallback", default=env("BYBIT_REST_FALLBACK","api.bybit.com"))
     p.add_argument("--binance", default=env("PRICE_FALLBACK_BINANCE","api.binance.com"))
 
-    # HTTP
+    # HTTP (PORT autoload + sanitization)
     p.add_argument("--http", type=int, default=auto_port(8080))
 
     # Modes
@@ -148,10 +122,6 @@ def parse_args() -> Config:
     p.add_argument("--vol-window", type=int, default=env("VOL_WINDOW_MIN",120,int))
     p.add_argument("--trend-window", type=int, default=env("TREND_WINDOW_MIN",120,int))
 
-    # Telegram
-    p.add_argument("--tg-token", default=env("TELEGRAM_BOT_TOKEN", None))
-    p.add_argument("--tg-allow", default=env("TELEGRAM_ALLOWED_CHAT_ID", None))
-
     a = p.parse_args()
 
     return Config(
@@ -161,11 +131,10 @@ def parse_args() -> Config:
         UniverseMax=a.max, UniverseMode=a.mode, UniverseRefreshMin=a.refresh,
         UniverseList=[s.strip() for s in a.list.split(",")] if a.list else None,
         RequestTimeout=a.timeout, MaxRetries=a.retries, BackoffFactor=a.backoff, Category=a.category,
-        Concurrency=a.concurrency,
+        Concurrency=a.concurrency, CacheTTL=15,
         LogFile=a.log, CsvFile=a.csv, DbFile=a.db, LogLevel=a.level, PrintOnly=a.print_only,
         HttpPort=a.http, Once=a.once, Loop=a.loop or (not a.once),
-        VolWindowMin=a.vol_window, TrendWindowMin=a.trend_window,
-        TgToken=a.tg_token, TgAllowedChat=a.tg_allow
+        VolWindowMin=a.vol_window, TrendWindowMin=a.trend_window
     )
 
 # =======================
@@ -185,6 +154,7 @@ def setup_logger(cfg: Config) -> logging.Logger:
     except Exception:
         pass
     return lg
+
 
 # =======================
 # Universe
@@ -208,142 +178,33 @@ def get_universe(cfg: Config) -> List[str]:
     base = DEFAULT_TOP if cfg.UniverseMode.upper()=="TOP" else DEFAULT_ALL
     return base[:cfg.UniverseMax]
 
-# =======================
-# HTTP session
-# =======================
-
-def build_session(cfg: Config) -> requests.Session:
-    s = requests.Session()
-    retry = Retry(total=cfg.MaxRetries, backoff_factor=cfg.BackoffFactor,
-                  status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
-    ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
-    s.mount("https://", ad); s.mount("http://", ad)
-    s.headers.update({
-        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-        "Accept": "application/json,text/plain,*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-    })
-    s.trust_env = True  # HTTPS_PROXY/HTTP_PROXY из ENV, если понадобится
-    return s
-
-def n_bybit(sym:str)->str: return sym.replace("-","").upper()
-def n_binance(sym:str)->str: return sym.replace("-","").upper()
 
 # =======================
-# CoinGecko maps
+# Cache (in-memory, optional)
 # =======================
 
-COINGECKO_ID = {
-    "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum", "SOLUSDT": "solana",
-    "XRPUSDT": "ripple", "BNBUSDT": "binancecoin", "DOGEUSDT": "dogecoin",
-    "ADAUSDT": "cardano", "TONUSDT": "toncoin", "TRXUSDT": "tron",
-    "LINKUSDT": "chainlink", "APTUSDT": "aptos", "ARBUSDT": "arbitrum",
-    "OPUSDT": "optimism", "NEARUSDT": "near", "SUIUSDT": "sui",
-    "LTCUSDT": "litecoin", "MATICUSDT": "matic-network",
-    "ETCUSDT": "ethereum-classic", "ATOMUSDT": "cosmos", "AAVEUSDT": "aave",
-    "EOSUSDT": "eos", "XLMUSDT":"stellar", "FILUSDT":"filecoin",
-    "INJUSDT":"injective-protocol", "WLDUSDT":"worldcoin-wld",
-    "PEPEUSDT":"pepe", "SHIBUSDT":"shiba-inu", "FTMUSDT":"fantom",
-    "KASUSDT":"kaspa", "RUNEUSDT":"thorchain", "SEIUSDT":"sei-network",
-    "PYTHUSDT":"pyth-network", "TIAUSDT":"celestia", "ORDIUSDT":"ordinals",
-    "JUPUSDT":"jupiter-exchange-solana",
-}
+class TTLCache:
+    def __init__(self, ttl_sec: int):
+        self.ttl = ttl_sec
+        # sym -> (price, source, ts, vol_quote_24h, vol_base_24h)
+        self.data: Dict[str, Tuple[float,str,float,Optional[float],Optional[float]]] = {}
+        self.lock = threading.Lock()
+    def get(self, sym: str):
+        with self.lock:
+            row = self.data.get(sym)
+            if not row:
+                return None
+            price, source, ts, vq, vb = row
+            if time.time() - ts <= self.ttl:
+                return row
+            self.data.pop(sym, None); return None
+    def put(self, sym: str, price: float, source: str, vq: Optional[float], vb: Optional[float]):
+        with self.lock:
+            self.data[sym] = (price, source, time.time(), vq, vb)
+
 
 # =======================
-# Fetchers (Bybit/Binance used only if доступно)
-# =======================
-
-def fetch_binance_24h(session, cfg, symbol):
-    sym = n_binance(symbol)
-    url = f"https://{cfg.PriceFallbackBinance}/api/v3/ticker/24hr"
-    r = session.get(url, params={"symbol": sym}, timeout=cfg.RequestTimeout)
-    r.raise_for_status()
-    d = r.json()
-    price = float(d["lastPrice"])
-    vq = float(d.get("quoteVolume")) if d.get("quoteVolume") else None
-    vb = float(d.get("volume")) if d.get("volume") else None
-    return price, vq, vb
-
-def fetch_coingecko_markets(session, cfg, symbol):
-    coin_id = COINGECKO_ID.get(symbol.upper())
-    if not coin_id:
-        raise RuntimeError(f"coingecko id not mapped for {symbol}")
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    r = session.get(url, params={"vs_currency":"usd","ids":coin_id,"precision":"full"},
-                    timeout=cfg.RequestTimeout)
-    r.raise_for_status()
-    arr = r.json()
-    if not isinstance(arr, list) or not arr:
-        raise RuntimeError(f"empty markets for {symbol}")
-    it = arr[0]
-    price = float(it["current_price"])
-    vol_usd_24h = float(it.get("total_volume") or 0.0)
-    vol_base = (vol_usd_24h/price) if price>0 else None
-    return price, vol_usd_24h, vol_base
-
-def fetch_coingecko_1m_series(session, coin_id:str, minutes:int, timeout:int)->Tuple[List[Tuple[int,float]], List[Tuple[int,float]]]:
-    """
-    Возвращает (prices, volumes) за ~последние 1 день, минутные значения.
-    prices: [(ts_ms, price)], volumes: [(ts_ms, vol_usd_for_interval)]
-    """
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    # days=1 + interval=minute — Coingecko вернёт минутные точки
-    r = session.get(url, params={"vs_currency":"usd","days":1,"interval":"minute"}, timeout=timeout)
-    r.raise_for_status()
-    d = r.json()
-    prices = d.get("prices") or []
-    vols = d.get("total_volumes") or []
-    return prices, vols
-
-# =======================
-# Analytics (ATR-like/trend/vol)
-# =======================
-
-def realized_vol(prices: List[Tuple[str,float]], window_min: int) -> Optional[float]:
-    if len(prices) < 3: return None
-    vals = [p for _,p in prices if p>0]
-    if len(vals) < 3: return None
-    rets = []
-    for i in range(1,len(vals)):
-        try: rets.append(math.log(vals[i]/vals[i-1]))
-        except Exception: pass
-    if len(rets) < 2: return None
-    mean = sum(rets)/len(rets)
-    var = sum((x-mean)**2 for x in rets)/(len(rets)-1)
-    std = math.sqrt(var)
-    scale = math.sqrt(1440.0/max(1.0, float(window_min)))
-    return std*scale*100.0
-
-def linear_trend_pct_day(prices: List[Tuple[str,float]], window_min: int) -> Optional[float]:
-    if len(prices) < 3: return None
-    ys = [p for _,p in prices]; xs = list(range(len(ys)))
-    n = len(xs); sx=sum(xs); sy=sum(ys)
-    sxx=sum(x*x for x in xs); sxy=sum(xs[i]*ys[i] for i in range(n))
-    denom = n*sxx - sx*sx
-    if denom == 0: return None
-    slope = (n*sxy - sx*sy)/denom
-    last = ys[-1]
-    if last <= 0: return None
-    steps_per_day = 1440.0/max(1.0, float(window_min))/n
-    return (slope/last)*steps_per_day*100.0
-
-def atr_like_pct_from_series(prices: List[float]) -> float:
-    """
-    Приближение ATR-like % без H/L: средний |ΔP|/P (по минутам), в %.
-    """
-    if len(prices) < 3: return 0.0
-    s=0.0; c=0
-    for i in range(1,len(prices)):
-        p0=prices[i-1]; p1=prices[i]
-        if p0>0 and p1>0:
-            s += abs(p1-p0)/p0
-            c += 1
-    return (s/c)*100.0 if c>0 else 0.0
-
-# =======================
-# DB (цены/активность для меню)
+# DB
 # =======================
 
 class DB:
@@ -357,14 +218,10 @@ class DB:
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               ts TEXT NOT NULL, symbol TEXT NOT NULL, source TEXT NOT NULL,
               price REAL NOT NULL, vol_quote_24h REAL, vol_base_24h REAL)""")
-            c.execute("""CREATE TABLE IF NOT EXISTS signals(
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              ts TEXT NOT NULL, symbol TEXT NOT NULL, kind TEXT NOT NULL,
-              payload TEXT NOT NULL)""")
             con.commit()
         finally:
             con.close()
-    def insert_price(self, ts:str, sym:str, src:str, price:float, vq:Optional[float], vb:Optional[float]):
+    def insert(self, ts:str, sym:str, src:str, price:float, vq:Optional[float], vb:Optional[float]):
         try:
             con=sqlite3.connect(self.path); c=con.cursor()
             c.execute("INSERT INTO prices(ts,symbol,source,price,vol_quote_24h,vol_base_24h) VALUES(?,?,?,?,?,?)",
@@ -403,350 +260,250 @@ class DB:
         finally:
             try: con.close()
             except: pass
-    def insert_signal(self, ts:str, sym:str, kind:str, payload:Dict[str,Any]):
-        try:
-            con=sqlite3.connect(self.path); c=con.cursor()
-            c.execute("INSERT INTO signals(ts,symbol,kind,payload) VALUES(?,?,?,?)",
-                      (ts, sym.upper(), kind, json.dumps(payload, ensure_ascii=False)))
-            con.commit()
-        except Exception as e:
-            self.log.error(f"DB signal insert error {sym}: {e}")
-        finally:
-            try: con.close()
-            except: pass
-    def last_signals(self, limit:int=50)->List[Dict[str,Any]]:
-        try:
-            con=sqlite3.connect(self.path); c=con.cursor()
-            c.execute("""SELECT ts,symbol,kind,payload FROM signals ORDER BY id DESC LIMIT ?""",(limit,))
-            out=[]
-            for ts,s,k,p in c.fetchall():
-                try: payload=json.loads(p)
-                except: payload={"raw":p}
-                out.append({"ts":ts,"symbol":s,"kind":k,"payload":payload})
-            return out
-        except Exception as e:
-            self.log.error(f"DB last_signals error: {e}"); return []
-        finally:
-            try: con.close()
-            except: pass
+
 
 # =======================
-# Utils
+# CSV
 # =======================
 
-def now_str() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-
-def ensure_csv_header(path:str, print_only:bool):
+def ensure_csv(path:str, print_only:bool):
     if print_only: return
     if not os.path.isfile(path):
         with open(path,"w",newline="",encoding="utf-8") as f:
             csv.writer(f).writerow(["timestamp","symbol","source","price","vol_quote_24h","vol_base_24h"])
 
+def append_csv(path:str, row:List[Any], print_only:bool):
+    if print_only: return
+    with open(path,"a",newline="",encoding="utf-8") as f:
+        csv.writer(f).writerow(row)
+
 # =======================
-# Breakout Engine
+# HTTP session
 # =======================
 
-class BreakoutEngine:
+def build_session(cfg: Config) -> requests.Session:
+    s = requests.Session()
+    retry = Retry(total=cfg.MaxRetries, backoff_factor=cfg.BackoffFactor,
+                  status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
+    ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+    s.mount("https://", ad); s.mount("http://", ad)
+    # Маскируем под браузер и разрешаем прокси из ENV (HTTPS_PROXY / HTTP_PROXY)
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    })
+    s.trust_env = True
+    return s
+
+def n_bybit(sym:str)->str: return sym.replace("-","").upper()
+def n_binance(sym:str)->str: return sym.replace("-","").upper()
+
+
+# =======================
+# CoinGecko symbol -> id
+# =======================
+
+COINGECKO_ID = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "SOLUSDT": "solana",
+    "XRPUSDT": "ripple",
+    "BNBUSDT": "binancecoin",
+    "DOGEUSDT": "dogecoin",
+    "ADAUSDT": "cardano",
+    "TONUSDT": "toncoin",
+    "TRXUSDT": "tron",
+    "LINKUSDT": "chainlink",
+    "APTUSDT": "aptos",
+    "ARBUSDT": "arbitrum",
+    "OPUSDT":  "optimism",
+    "NEARUSDT":"near",
+    "SUIUSDT": "sui",
+    "LTCUSDT": "litecoin",
+    "MATICUSDT":"matic-network",
+    "ETCUSDT": "ethereum-classic",
+    "ATOMUSDT":"cosmos",
+    "AAVEUSDT":"aave",
+    # extra
+    "EOSUSDT": "eos",
+    "XLMUSDT": "stellar",
+    "FILUSDT": "filecoin",
+    "INJUSDT": "injective-protocol",
+    "WLDUSDT": "worldcoin-wld",
+    "PEPEUSDT":"pepe",
+    "SHIBUSDT":"shiba-inu",
+    "FTMUSDT": "fantom",
+    "KASUSDT": "kaspa",
+    "RUNEUSDT":"thorchain",
+    "SEIUSDT": "sei-network",
+    "PYTHUSDT":"pyth-network",
+    "TIAUSDT": "celestia",
+    "ORDIUSDT":"ordinals",
+    "JUPUSDT": "jupiter-exchange-solana",
+}
+
+
+# =======================
+# Fetchers
+# =======================
+
+def fetch_bybit(session, cfg, symbol):
+    sym = n_bybit(symbol)
+    url = f"https://{cfg.ByBitRestBase}/v5/market/tickers"
+    r = session.get(url, params={"category": cfg.Category, "symbol": sym}, timeout=cfg.RequestTimeout)
+    r.raise_for_status()
+    data = r.json()
+    lst = (((data or {}).get("result") or {}).get("list") or [])
+    if not lst:
+        raise RuntimeError(f"empty result: {data}")
+    item = lst[0]
+    price = float(item["lastPrice"])
+    vq = float(item["turnover24h"]) if item.get("turnover24h") else None
+    vb = float(item["volume24h"]) if item.get("volume24h") else None
+    return price, vq, vb
+
+def fetch_bybit_fb(session, cfg, symbol):
+    sym = n_bybit(symbol)
+    url = f"https://{cfg.ByBitRestFallback}/v5/market/tickers"
+    r = session.get(url, params={"category": cfg.Category, "symbol": sym}, timeout=cfg.RequestTimeout)
+    r.raise_for_status()
+    data = r.json()
+    lst = (((data or {}).get("result") or {}).get("list") or [])
+    if not lst:
+        raise RuntimeError(f"empty result: {data}")
+    item = lst[0]
+    price = float(item["lastPrice"])
+    vq = float(item.get("turnover24h")) if item.get("turnover24h") else None
+    vb = float(item.get("volume24h")) if item.get("volume24h") else None
+    return price, vq, vb
+
+def fetch_binance(session, cfg, symbol):
+    sym = n_binance(symbol)
+    url = f"https://{cfg.PriceFallbackBinance}/api/v3/ticker/24hr"
+    r = session.get(url, params={"symbol": sym}, timeout=cfg.RequestTimeout)
+    r.raise_for_status()
+    d = r.json()
+    if "lastPrice" not in d:
+        raise RuntimeError(f"unexpected binance payload: {d}")
+    price = float(d["lastPrice"])
+    vq = float(d.get("quoteVolume")) if d.get("quoteVolume") else None
+    vb = float(d.get("volume")) if d.get("volume") else None
+    return price, vq, vb
+
+def fetch_coingecko(session, cfg, symbol):
     """
-    Детект «Выход из консолидации» на базе минутной серии CoinGecko.
-    База: последние ~2ч (настраивается), Триггер: 1m (объём/цена).
-    OI/CVD — опционально (по умолчанию отключены).
+    Возвращает (price_usd, volume_quote_usd_24h, volume_base_24h_approx).
+    Для 'активности' используем 24h объём в USD.
     """
-    def __init__(self, cfg:Config, session:requests.Session, db:DB, logger:logging.Logger):
-        self.cfg=cfg; self.sess=session; self.db=db; self.log=logger
-        self.cooldowns: Dict[str, float] = {}  # symbol -> next_allowed_ts
+    coin_id = COINGECKO_ID.get(symbol.upper())
+    if not coin_id:
+        raise RuntimeError(f"coingecko id not mapped for {symbol}")
 
-    def _cooldown_ok(self, sym:str)->bool:
-        t = self.cooldowns.get(sym, 0.0)
-        return time.time() >= t
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {"vs_currency": "usd", "ids": coin_id, "precision": "full"}
+    r = session.get(url, params=params, timeout=cfg.RequestTimeout)
+    r.raise_for_status()
+    arr = r.json()
+    if not isinstance(arr, list) or not arr:
+        raise RuntimeError(f"coingecko empty for {symbol}: {arr}")
+    it = arr[0]
+    price = float(it["current_price"])
+    vol_usd = float(it.get("total_volume") or 0.0)
+    vol_base = (vol_usd / price) if price > 0 else None
+    return price, vol_usd, vol_base
 
-    def _arm_cooldown(self, sym:str):
-        self.cooldowns[sym] = time.time() + max(1, self.cfg.Spike_CooldownMin)*60
 
-    def _fetch_series(self, symbol:str)->Tuple[List[float], List[float]]:
-        coin_id = COINGECKO_ID.get(symbol.upper())
-        prices_raw, vols_raw = fetch_coingecko_1m_series(self.sess, coin_id, minutes=180, timeout=self.cfg.RequestTimeout)
-        # Нормализуем: берём последние N минут
-        # prices_raw: [[ts_ms, price], ...], vols_raw: [[ts_ms, vol_usd], ...]
-        # Приведём длины к общему минимуму
-        n = min(len(prices_raw), len(vols_raw))
-        prices = [float(p[1]) for p in prices_raw[-n:]]
-        vols   = [float(v[1]) for v in vols_raw[-n:]]
-        return prices, vols
+def get_snapshot(session, cfg, symbol, logger):
+    # 1) Bytick
+    try:
+        price, vq, vb = fetch_bybit(session, cfg, symbol)
+        return "bytick", price, vq, vb
+    except Exception as e:
+        logger.warning(f"[bytick] {symbol} fail: {e}")
 
-    def _baseline_stats(self, prices:List[float], vols:List[float], baseline_min:int)->Dict[str,Any]:
-        if len(prices) < baseline_min+2 or len(vols) < baseline_min+2:
-            return {"ok":False, "reason":"series too short"}
-        base_p = prices[-(baseline_min+1):-1]  # последние baseline_min минут, без текущей
-        base_v = vols  [-(baseline_min+1):-1]
-        # ATR-like %
-        atr_like = atr_like_pct_from_series(base_p)
-        # средний 1m оборот в USD
-        avg_turnover_1m = sum(base_v)/max(1,len(base_v))
-        # кумулятив за 2h
-        cum_turnover_2h = sum(base_v)
-        return {
-            "ok": True,
-            "atr_like_pct": atr_like,
-            "avg_turnover_1m": avg_turnover_1m,
-            "cum_turnover_2h": cum_turnover_2h,
-        }
+    # 2) Bybit fallback
+    try:
+        price, vq, vb = fetch_bybit_fb(session, cfg, symbol)
+        return "bybit", price, vq, vb
+    except Exception as e:
+        logger.warning(f"[bybit-fallback] {symbol} fail: {e}")
 
-    def _last_1m(self, prices:List[float], vols:List[float])->Tuple[float,float,float]:
-        if len(prices)<2 or len(vols)<1: return 0.0,0.0,0.0
-        p0=prices[-2]; p1=prices[-1]
-        dp_pct = ((p1-p0)/p0*100.0) if p0>0 else 0.0
-        vol_1m = vols[-1]
-        notional_1m = vol_1m  # у Coingecko в USD
-        return dp_pct, vol_1m, notional_1m
+    # 3) Binance (может давать 451 по региону)
+    try:
+        price, vq, vb = fetch_binance(session, cfg, symbol)
+        return "binance", price, vq, vb
+    except Exception as e:
+        logger.warning(f"[binance] {symbol} fail: {e}")
 
-    def _liquidity_gate(self, vol24h_usd:float, cum2h_usd:float)->bool:
-        return (vol24h_usd >= self.cfg.Min24hVolumeUSD) and (cum2h_usd >= self.cfg.Min2hVolumeUSD)
+    # 4) CoinGecko — максимально доступный публичный источник
+    logger.info(f"[coingecko] trying {symbol}")
+    try:
+        price, vq_usd, vb_est = fetch_coingecko(session, cfg, symbol)
+        return "coingecko", price, vq_usd, vb_est
+    except Exception as e:
+        logger.warning(f"[coingecko] {symbol} fail: {e}")
 
-    def _detect_one(self, symbol:str)->Optional[Dict[str,Any]]:
+    return None
+
+# =======================
+# Analytics
+# =======================
+
+def realized_vol(prices: List[Tuple[str,float]], window_min: int) -> Optional[float]:
+    if len(prices) < 3: return None
+    vals = [p for _,p in prices if p>0]
+    if len(vals) < 3: return None
+    rets = []
+    for i in range(1,len(vals)):
         try:
-            # 1) 24h маркеты (быстрые фильтры)
-            price, vol24h_usd, _vb = fetch_coingecko_markets(self.sess, self.cfg, symbol)
+            rets.append(math.log(vals[i]/vals[i-1]))
+        except Exception:
+            pass
+    if len(rets) < 2: return None
+    mean = sum(rets)/len(rets)
+    var = sum((x-mean)**2 for x in rets)/(len(rets)-1)
+    std = math.sqrt(var)
+    scale = math.sqrt(1440.0/max(1.0, float(window_min)))
+    return std*scale*100.0
 
-            # 2) минутная серия для baseline и 1m-спайка
-            prices, vols = self._fetch_series(symbol)
-            baseline_min = int(self.cfg.BaselineHours*60)
+def linear_trend_pct_day(prices: List[Tuple[str,float]], window_min: int) -> Optional[float]:
+    if len(prices) < 3: return None
+    ys = [p for _,p in prices]; xs = list(range(len(ys)))
+    n = len(xs); sx=sum(xs); sy=sum(ys)
+    sxx=sum(x*x for x in xs); sxy=sum(xs[i]*ys[i] for i in range(n))
+    denom = n*sxx - sx*sx
+    if denom == 0: return None
+    slope = (n*sxy - sx*sy)/denom
+    last = ys[-1]
+    if last <= 0: return None
+    steps_per_day = 1440.0/max(1.0, float(window_min))/n
+    return (slope/last)*steps_per_day*100.0
 
-            b = self._baseline_stats(prices, vols, baseline_min)
-            if not b["ok"]:
-                return None
-
-            # База: low-vol и ликвидность
-            if b["atr_like_pct"] > self.cfg.LowVolThresholdPct:
-                return None
-            if not self._liquidity_gate(vol24h_usd, b["cum_turnover_2h"]):
-                return None
-
-            # Триггер: всплеск
-            dp_pct, vol_1m, notional_1m = self._last_1m(prices, vols)
-            vol_ratio = (vol_1m / b["avg_turnover_1m"]) if b["avg_turnover_1m"]>0 else 0.0
-
-            cond_price = abs(dp_pct) >= self.cfg.Spike_PricePctMin
-            cond_vol   = vol_ratio >= self.cfg.Spike_VolRatioMin
-            cond_not   = notional_1m >= self.cfg.Spike_MinNotionalUSD
-
-            if not (cond_price and cond_vol and cond_not):
-                return None
-
-            # OI / CVD — заглушки (можно подключить позже; сейчас просто метки)
-            oi_1m_pct = None
-            cvd_ratio = None
-            imbalance = None
-            oi_confirmed = False
-
-            if self.cfg.Spike_ConfirmWithOI and (oi_1m_pct is not None):
-                oi_confirmed = (oi_1m_pct >= self.cfg.Spike_OIChange1mPctMin)
-                if not oi_confirmed:
-                    return None
-
-            # Сигнал
-            score = 0.0
-            score += min(3.0, vol_ratio)         # вес объёма
-            score += min(2.0, abs(dp_pct)/ self.cfg.Spike_PricePctMin)  # вес цены
-            if oi_confirmed: score += 0.7
-
-            payload = {
-                "symbol": symbol,
-                "price": price,
-                "dp_pct_1m": round(dp_pct,3),
-                "vol_ratio": round(vol_ratio,2),
-                "notional_1m": int(notional_1m),
-                "baseline": {
-                    "hours": self.cfg.BaselineHours,
-                    "atr_like_pct": round(b["atr_like_pct"],3),
-                    "avg_turnover_1m": int(b["avg_turnover_1m"]),
-                    "cum_turnover_2h": int(b["cum_turnover_2h"]),
-                    "vol24h_usd": int(vol24h_usd),
-                },
-                "flags": {
-                    "early": True,
-                    "oi_confirmed": oi_confirmed,
-                    "uses_coingecko": True
-                },
-                "score": round(score,2),
-            }
-            return payload
-        except Exception as e:
-            self.log.debug(f"breakout detect error {symbol}: {e}")
-            return None
-
-    def scan(self, symbols:List[str])->List[Dict[str,Any]]:
-        out=[]
-        for s in symbols:
-            if not self._cooldown_ok(s):
-                continue
-            sig = self._detect_one(s)
-            if sig:
-                out.append(sig)
-                self._arm_cooldown(s)
-        return out
-
-# =======================
-# Telegram bot (polling)
-# =======================
-
-class TGBotRunner:
-    def __init__(self, cfg:Config, db:DB, logger:logging.Logger):
-        self.cfg=cfg; self.db=db; self.log=logger
-        self._thread=None
-
-    def start(self):
-        if not (self.cfg.TgToken and Bot and Dispatcher):
-            self.log.info("TG: token not set or aiogram not available — bot disabled")
-            return
-        self._thread=threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        self.log.info("TG: polling thread started")
-
-    def _run_loop(self):
-        asyncio.run(self._main())
-
-    async def _main(self):
-        bot=Bot(self.cfg.TgToken)
-        dp=Dispatcher()
-
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="Активность"), KeyboardButton(text="Волатильность")],
-                [KeyboardButton(text="Тренд"), KeyboardButton(text="Режим: Breakout")],
-            ],
-            resize_keyboard=True
-        )
-
-        def allowed(msg: Message) -> bool:
-            if not self.cfg.TgAllowedChat: return True
-            try:
-                return str(msg.chat.id) == str(self.cfg.TgAllowedChat)
-            except Exception:
-                return False
-
-        @dp.message(CommandStart())
-        async def on_start(msg: Message):
-            if not allowed(msg):
-                await msg.answer("Доступ ограничён.")
-                return
-            await msg.answer("Привет! Выбирай:", reply_markup=kb)
-
-        @dp.message(F.text.lower().in_(["активность","волатильность","тренд","режим: breakout"]))
-        async def on_buttons(msg: Message):
-            if not allowed(msg):
-                await msg.answer("Доступ ограничён."); return
-            txt = msg.text.lower()
-            try:
-                if txt == "активность":
-                    text = tg_format_activity_top(self.db, self.cfg)
-                elif txt == "волатильность":
-                    text = tg_format_vol_top(self.db, self.cfg)
-                elif txt == "тренд":
-                    text = tg_format_trend_top(self.db, self.cfg)
-                else:
-                    text = f"Режим уже: {self.cfg.Mode}"
-                await msg.answer(text or "Пока нет данных.")
-            except Exception as e:
-                self.log.error(f"TG handler error: {e}")
-                await msg.answer("Ошибка внутри бота.")
-
-        await dp.start_polling(bot, allowed_updates=["message"])
-
-def tg_format_activity_top(db:DB, cfg:Config, limit:int=10)->str:
-    syms=get_universe(cfg)
-    rows=[]
-    for s in syms:
-        snap=db.last(s)
-        if not snap: continue
-        ts,price,vq,vb=snap
-        act=(vq if vq is not None else (vb*price if (vb is not None and price is not None) else 0.0))
-        rows.append((s, float(act or 0.0), price))
-    rows.sort(key=lambda x: x[1], reverse=True)
-    rows=rows[:limit]
-    lines=[f"🏁 Топ по активности (24h USD):"]
-    for i,(s,a,p) in enumerate(rows,1):
-        lines.append(f"{i:>2}. {s:<9} act≈${int(a):,}  px={p:g}".replace(",", " "))
-    return "\n".join(lines)
-
-def tg_format_vol_top(db:DB, cfg:Config, limit:int=10)->str:
-    syms=get_universe(cfg); win=cfg.VolWindowMin
-    rows=[]
-    for s in syms:
-        hist=db.history(s,win)
-        vol=realized_vol(hist,win)
-        if vol is None: continue
-        rows.append((s, vol, hist[-1][1] if hist else None))
-    rows.sort(key=lambda x: x[1], reverse=True)
-    rows=rows[:limit]
-    lines=[f"📈 Топ по реализ. волатильности (~%/день, окно {win}м):"]
-    for i,(s,v,p) in enumerate(rows,1):
-        vtxt = f"{v:.2f}%" if v is not None else "—"
-        lines.append(f"{i:>2}. {s:<9} vol={vtxt}  px={p if p is not None else '—'}")
-    return "\n".join(lines)
-
-def tg_format_trend_top(db:DB, cfg:Config, limit:int=10)->str:
-    syms=get_universe(cfg); win=cfg.TrendWindowMin
-    rows=[]
-    for s in syms:
-        hist=db.history(s,win)
-        tr=linear_trend_pct_day(hist,win)
-        if tr is None: continue
-        rows.append((s, tr, hist[-1][1] if hist else None))
-    rows.sort(key=lambda x: x[1], reverse=True)
-    rows=rows[:limit]
-    lines=[f"📊 Топ по тренду (~%/день, окно {win}м):"]
-    for i,(s,t,p) in enumerate(rows,1):
-        ttxt = f"{t:.2f}%" if t is not None else "—"
-        lines.append(f"{i:>2}. {s:<9} trend={ttxt}  px={p if p is not None else '—'}")
-    return "\n".join(lines)
 
 # =======================
 # State + HTTP handler
 # =======================
 
 STATE={"ok":0,"fail":0,"last_cycle_start":"","last_cycle_end":""}
-_GLOBALS={"cfg":None,"db":None,"sess":None,"bo":None,"tg":None}
+_GLOBALS={"cfg":None,"db":None}
 _SHUTDOWN=False
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         p=urlparse(self.path); path=p.path; qs=parse_qs(p.query or "")
         if path=="/health":
-            self._json(200, {"status":"ok","stats":STATE,"build":BUILD_TAG,"mode":_GLOBALS["cfg"].Mode})
+            self._json(200, {"status":"ok","stats":STATE,"build":BUILD_TAG})
         elif path=="/activity":
             self._json(200, self._activity(qs))
         elif path=="/volatility":
             self._json(200, self._vol(qs))
         elif path=="/trend":
             self._json(200, self._trend(qs))
-        elif path=="/signals":
-            self._json(200, {"data":_GLOBALS["db"].last_signals(50)})
         elif path=="/ip":
             self._json(200, self._ip())
-        else:
-            self._raw(404, "not found")
-    def do_PATCH(self):
-        p=urlparse(self.path); path=p.path
-        if path=="/config":
-            ln=int(self.headers.get("Content-Length","0"))
-            body=self.rfile.read(ln).decode("utf-8") if ln>0 else "{}"
-            try:
-                cfg=_GLOBALS["cfg"]; data=json.loads(body or "{}")
-                # обновляем только известные ключи
-                for k,v in data.items():
-                    if hasattr(cfg, k):
-                        setattr(cfg, k, v)
-                self._json(200, {"ok":True, "cfg": {k:getattr(cfg,k) for k in ["Mode","BaselineHours","LowVolThresholdPct",
-                                                                              "Min24hVolumeUSD","Min2hVolumeUSD",
-                                                                              "Spike_VolRatioMin","Spike_PricePctMin",
-                                                                              "Spike_MinNotionalUSD","Spike_ConfirmWithOI",
-                                                                              "Spike_OIChange1mPctMin","Spike_UseCVD",
-                                                                              "Spike_CvdRatioMin","Spike_ImbalanceMin",
-                                                                              "Spike_CooldownMin","Spike_ClassifyLiquidations"]}})
-            except Exception as e:
-                self._json(400, {"ok":False, "error":str(e)})
         else:
             self._raw(404, "not found")
     def _activity(self, qs):
@@ -759,7 +516,7 @@ class Handler(BaseHTTPRequestHandler):
                 ts,price,vq,vb=snap
                 act=(vq if vq is not None else (vb*price if (vb is not None and price is not None) else 0.0))
                 rows.append({"symbol":s,"activity":float(act or 0.0),"price":price,"ts":ts,
-                             "note":"24h USD (global, CoinGecko) может отличаться от биржевого"})
+                             "note":"24h USD (global) if source=coingecko"})
             else:
                 rows.append({"symbol":s,"activity":0.0,"price":None,"ts":None})
         rows.sort(key=lambda r: r["activity"], reverse=True)
@@ -798,37 +555,43 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type","text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
+
+# =======================
+# HTTP server
+# =======================
+
 def run_http(port:int, stop_evt:threading.Event, logger:logging.Logger):
     httpd=HTTPServer(("0.0.0.0",port), Handler)
     httpd.timeout=1.0
-    logger.info(f"HTTP on :{port} (/health /activity /volatility /trend /signals /ip /config[PATCH])")
+    logger.info(f"HTTP on :{port} (/health /activity /volatility /trend /ip)")
     while not stop_evt.is_set():
         httpd.handle_request()
     logger.info("HTTP stopped")
 
+
 # =======================
-# Collection loop (prices for menu + breakout scan)
+# Core loop
 # =======================
 
-def collect_once(cfg:Config, logger:logging.Logger, sess:requests.Session, db:DB, bo:BreakoutEngine, tg:Optional[Bot]):
-    ts=now_str(); ensure_csv_header(cfg.CsvFile, cfg.PrintOnly)
+def now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def ensure_csv_header(path:str, print_only:bool):
+    ensure_csv(path, print_only)
+
+def run_once(cfg:Config, logger:logging.Logger, sess:requests.Session, db:DB):
+    ts=now(); STATE["last_cycle_start"]=ts
+    ensure_csv_header(cfg.CsvFile, cfg.PrintOnly)
     syms=get_universe(cfg)
-
-    # 1) Быстрый снэпшот для меню: (price, vol24h) через CoinGecko (приоритет)
-    def worker(sym:str):
-        try:
-            price, vq, vb = fetch_coingecko_markets(sess, cfg, sym)
-            return (sym, ("coingecko", price, vq, vb), None)
-        except Exception as e:
-            # fallback Binance (может дать 451)
-            try:
-                price, vq, vb = fetch_binance_24h(sess, cfg, sym)
-                return (sym, ("binance", price, vq, vb), None)
-            except Exception as e2:
-                return (sym, None, f"{e} | {e2}")
 
     results:Dict[str,Tuple[str,float,Optional[float],Optional[float]]]={}
     errs:Dict[str,str]={}
+
+    def worker(sym:str):
+        snap=get_snapshot(sess,cfg,sym,logger)
+        if not snap: return (sym,None,"all sources failed")
+        src,price,vq,vb=snap; return (sym,(src,price,vq,vb),None)
+
     with ThreadPoolExecutor(max_workers=max(1,cfg.Concurrency)) as ex:
         futs={ex.submit(worker,s):s for s in syms}
         for f in as_completed(futs):
@@ -844,54 +607,16 @@ def collect_once(cfg:Config, logger:logging.Logger, sess:requests.Session, db:DB
     for s in syms:
         if s in results:
             src,price,vq,vb=results[s]
+            print(f"{s}: {price} [{src}]")
             logger.info(f"{s}: {price} [{src}] volQ24h={vq} volB24h={vb}")
-            if not cfg.PrintOnly:
-                with open(cfg.CsvFile,"a",newline="",encoding="utf-8") as f:
-                    csv.writer(f).writerow([ts,s,src,f"{price:.10g}", vq if vq is not None else "", vb if vb is not None else ""])
-            db.insert_price(ts,s,src,price,vq,vb)
+            append_csv(cfg.CsvFile, [ts,s,src,f"{price:.10g}", vq if vq is not None else "", vb if vb is not None else ""], cfg.PrintOnly)
+            db.insert(ts,s,src,price,vq,vb)
             ok+=1
         else:
             logger.warning(f"{s}: нет данных ({errs.get(s,'unknown error')})")
             fail+=1
 
-    # 2) Breakout scan (только если режим breakout)
-    if cfg.Mode.lower()=="breakout":
-        sigs = bo.scan(syms)
-        for payload in sigs:
-            db.insert_signal(now_str(), payload["symbol"], "BREAKOUT", payload)
-            # Телеграм-алёрт
-            if tg is not None:
-                try:
-                    text = format_breakout_msg(payload)
-                    chat_id = cfg.TgAllowedChat
-                    if chat_id:
-                        asyncio.run(send_tg(tg, chat_id, text))
-                except Exception as e:
-                    logger.error(f"TG send error: {e}")
-
-    STATE["ok"]+=ok; STATE["fail"]+=fail; STATE["last_cycle_start"]=ts; STATE["last_cycle_end"]=now_str()
-
-def format_breakout_msg(p:Dict[str,Any])->str:
-    base=p["baseline"]
-    lines=[
-        f"🚀 [BREAKOUT] {p['symbol']} — score={p['score']}",
-        f"Price {p['dp_pct_1m']}% / 1m, Vol {p['vol_ratio']}× avg(2h), Notional1m ≈ ${p['notional_1m']:,}".replace(","," "),
-        f"Base {base['hours']}h: ATR~{base['atr_like_pct']}%, cum≈${base['cum_turnover_2h']:,}, avg1m≈${base['avg_turnover_1m']:,}, 24h≈${base['vol24h_usd']:,}".replace(","," "),
-        f"Flags: early={p['flags']['early']} oi_confirmed={p['flags']['oi_confirmed']} (src=CoinGecko)"
-    ]
-    return "\n".join(lines)
-
-async def send_tg(bot:Bot, chat_id:str, text:str):
-    try:
-        await bot.send_message(chat_id, text)
-    except Exception:
-        # если polling идёт в другом loop — создадим временный
-        async with Bot(token=bot.token) as t:
-            await t.send_message(chat_id, text)
-
-# =======================
-# Runner
-# =======================
+    STATE["ok"]+=ok; STATE["fail"]+=fail; STATE["last_cycle_end"]=now()
 
 def install_signals(logger):
     def _h(signum, frame):
@@ -901,54 +626,183 @@ def install_signals(logger):
     signal.signal(signal.SIGINT,_h)
     signal.signal(signal.SIGTERM,_h)
 
+
+# =======================
+# Telegram bot (polling, aiogram v3)
+# =======================
+
+try:
+    from aiogram import Bot, Dispatcher, F
+    from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+    from aiogram.filters import CommandStart
+    _TG_AVAILABLE = True
+except Exception:
+    _TG_AVAILABLE = False
+
+def _tg_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Активность"), KeyboardButton(text="Волатильность")],
+            [KeyboardButton(text="Тренд")],
+        ],
+        resize_keyboard=True
+    )
+
+async def _tg_runner(cfg: Config, logger: logging.Logger):
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_whitelist = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # CSV разрешённых chat_id, пусто = всем
+    allow_any = (chat_whitelist == "")
+
+    if not token:
+        logger.info("Telegram: токен не задан, бот отключён.")
+        return
+
+    bot = Bot(token=token)
+    dp = Dispatcher()
+
+    def _allowed(chat_id: int) -> bool:
+        if allow_any:
+            return True
+        allowed_ids = {x.strip() for x in chat_whitelist.split(",") if x.strip()}
+        return str(chat_id) in allowed_ids
+
+    @dp.message(CommandStart())
+    async def _start(m: Message):
+        if not _allowed(m.chat.id):
+            return
+        await m.answer(
+            "Привет! Я скринер. Кнопки ниже:\n— Активность\n— Волатильность\n— Тренд",
+            reply_markup=_tg_kb()
+        )
+
+    @dp.message(F.text.in_({"Активность","Волатильность","Тренд"}))
+    async def _menu(m: Message):
+        if not _allowed(m.chat.id):
+            return
+        text = (m.text or "").strip()
+        try:
+            base = f"http://127.0.0.1:{_GLOBALS['cfg'].HttpPort}"
+            if text == "Активность":
+                r = requests.get(f"{base}/activity?limit=10", timeout=10).json()
+                rows = r.get("data", [])[:10]
+                lines = []
+                for it in rows:
+                    price = it.get("price")
+                    act = it.get("activity") or 0
+                    lines.append(f"◆ {it['symbol']}: ${price if price is not None else '-'} | act≈{round(float(act)):,}")
+                msg = "ТОП по активности (24h):\n" + ("\n".join(lines) if lines else "нет данных")
+            elif text == "Волатильность":
+                r = requests.get(f"{base}/volatility?window_min={_GLOBALS['cfg'].VolWindowMin}&limit=10", timeout=10).json()
+                rows = r.get("data", [])[:10]
+                lines = []
+                for it in rows:
+                    vol = it.get("volatility_pct_day")
+                    lines.append(f"◆ {it['symbol']}: {round(vol,2) if vol is not None else '-'}%/day")
+                msg = f"Волатильность (окно { _GLOBALS['cfg'].VolWindowMin }м):\n" + ("\n".join(lines) if lines else "нет данных")
+            else:  # "Тренд"
+                r = requests.get(f"{base}/trend?window_min={_GLOBALS['cfg'].TrendWindowMin}&limit=10", timeout=10).json()
+                rows = r.get("data", [])[:10]
+                lines = []
+                for it in rows:
+                    tr = it.get("trend_pct_day")
+                    lines.append(f"◆ {it['symbol']}: {round(tr,2) if tr is not None else '-'}%/day")
+                msg = f"Тренд (окно { _GLOBALS['cfg'].TrendWindowMin }м):\n" + ("\n".join(lines) if lines else "нет данных")
+            await m.answer(msg)
+        except Exception as e:
+            await m.answer(f"Ошибка: {e}")
+
+    @dp.message(F.text == "ping")
+    async def _ping(m: Message):
+        if not _allowed(m.chat.id):
+            return
+        await m.answer("pong ✅")
+
+    logger.info("Telegram: polling start")
+    try:
+        # если висел webhook — aiogram сам переключится на polling; дополнительно можно удалить:
+        # await bot.delete_webhook(drop_pending_updates=False)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        with contextlib.suppress(Exception):
+            await bot.session.close()
+
+def start_telegram_in_thread(cfg: Config, logger: logging.Logger):
+    if not _TG_AVAILABLE:
+        logger.info("Telegram: aiogram не установлен — бот отключён.")
+        return None
+
+    def _target():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(_tg_runner(cfg, logger))
+        except Exception as e:
+            logger.error(f"Telegram thread error: {e}")
+
+    thr = threading.Thread(target=_target, daemon=True)
+    thr.start()
+    return thr
+
+
+# =======================
+# Run loop
+# =======================
+
 def run_loop(cfg:Config, logger:logging.Logger):
-    logger.info(f"BUILD {BUILD_TAG} | mode={cfg.Mode}")
+    logger.info(f"BUILD {BUILD_TAG} | hosts: bytick={cfg.ByBitRestBase}, bybit={cfg.ByBitRestFallback}, binance={cfg.PriceFallbackBinance}")
     sess=build_session(cfg)
     db=DB(cfg.DbFile, logger)
-    bo=BreakoutEngine(cfg, sess, db, logger)
 
-    _GLOBALS.update({"cfg":cfg,"db":db,"sess":sess,"bo":bo})
+    http_stop=None
+    http_thr=None
+    tg_thr=None
 
     # HTTP
-    http_stop=threading.Event()
-    http_thr=threading.Thread(target=run_http, args=(cfg.HttpPort, http_stop, logger), daemon=True)
-    http_thr.start()
+    if isinstance(cfg.HttpPort,int) and cfg.HttpPort>0:
+        http_stop=threading.Event()
+        http_thr=threading.Thread(target=run_http, args=(cfg.HttpPort, http_stop, logger), daemon=True)
+        http_thr.start()
 
-    # Telegram polling (если токен задан)
-    tg_bot=None
-    if cfg.TgToken and Bot and Dispatcher:
-        # отдельный раннер, но для отправки алёртов держим Bot здесь
-        tg_runner = TGBotRunner(cfg, db, logger)
-        tg_runner.start()
-        tg_bot = Bot(cfg.TgToken)
+    # Telegram
+    try:
+        tg_thr = start_telegram_in_thread(cfg, logger)
+    except Exception as e:
+        logger.error(f"Telegram start error: {e}")
 
     try:
         while not _SHUTDOWN:
-            collect_once(cfg, logger, sess, db, bo, tg_bot)
+            run_once(cfg, logger, sess, db)
             if cfg.Once: break
-            sleep_total=max(5, int(cfg.UniverseRefreshMin*60))
+            sleep_total=max(1, int(cfg.UniverseRefreshMin*60))
             for _ in range(sleep_total):
                 if _SHUTDOWN: break
                 time.sleep(1)
     finally:
-        http_stop.set()
-        for _ in range(50):
-            if not http_thr.is_alive(): break
-            time.sleep(0.1)
+        if http_stop is not None:
+            http_stop.set()
+            for _ in range(50):
+                if http_thr and not http_thr.is_alive(): break
+                time.sleep(0.1)
         logger.info("Stopped")
+
+
+# =======================
+# Main
+# =======================
 
 def main():
     cfg=parse_args()
+    _GLOBALS["cfg"]=cfg  # чтобы Телега знала порт/окна
     logger=setup_logger(cfg)
     install_signals(logger)
+
     if cfg.Loop:
         run_loop(cfg, logger)
     else:
         sess=build_session(cfg)
         db=DB(cfg.DbFile, logger)
-        bo=BreakoutEngine(cfg, sess, db, logger)
-        _GLOBALS.update({"cfg":cfg,"db":db,"sess":sess,"bo":bo})
-        collect_once(cfg, logger, sess, db, bo, None)
+        _GLOBALS["db"]=db
+        run_once(cfg, logger, sess, db)
 
 if __name__=="__main__":
     main()
