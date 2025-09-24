@@ -12,7 +12,7 @@ import requests
 from urllib3.util import Retry
 from requests.adapters import HTTPAdapter
 
-BUILD_TAG = "screener-main-coingecko-eu-2025-09-24"
+BUILD_TAG = "screener-main-coingecko-eu-2025-09-24b"
 
 # =======================
 # Config
@@ -26,14 +26,14 @@ class Config:
 
     UniverseMax: int = 50
     UniverseMode: str = "TOP"         # TOP | ALL
-    UniverseRefreshMin: int = 15
+    UniverseRefreshMin: int = 30
     UniverseList: Optional[List[str]] = None
 
     RequestTimeout: int = 10
     MaxRetries: int = 3
     BackoffFactor: float = 0.6
     Category: str = "linear"          # linear | inverse | option
-    Concurrency: int = 12
+    Concurrency: int = 4              # <=4 чтобы не ловить 429 у CG
 
     CacheTTL: int = 15
 
@@ -50,6 +50,8 @@ class Config:
     VolWindowMin: int = 120
     TrendWindowMin: int = 120
 
+    # CoinGecko throttle: минимальный интервал между запросами (сек)
+    CG_MinIntervalSec: float = 0.25   # ~4 rps безопасно
 
 def env(name, default, cast=None):
     v = os.getenv(name)
@@ -71,9 +73,7 @@ def auto_port(default: int = 8080) -> int:
         return default
 
 def clean_host(v: str) -> str:
-    """Вернёт чистый хост (без схемы/пути) из ENV."""
-    if not v:
-        return v
+    if not v: return v
     v = v.strip()
     if "://" in v:
         parsed = _urlparse(v)
@@ -82,14 +82,13 @@ def clean_host(v: str) -> str:
         host = v.strip("/")
     return host.split("/")[0].strip()
 
-
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Screener bot: /health /activity /volatility /trend /ip")
 
     # Universe
     p.add_argument("--mode", default=env("UNIVERSE_MODE","TOP"), choices=["TOP","ALL"])
     p.add_argument("--max", type=int, default=env("UNIVERSE_MAX",50,int))
-    p.add_argument("--refresh", type=int, default=env("UNIVERSE_REFRESH_MIN",15,int))
+    p.add_argument("--refresh", type=int, default=env("UNIVERSE_REFRESH_MIN",30,int))
     p.add_argument("--list", type=str, default=env("UNIVERSE_LIST",None))
 
     # Network
@@ -97,7 +96,7 @@ def parse_args() -> Config:
     p.add_argument("--retries", type=int, default=env("MAX_RETRIES",3,int))
     p.add_argument("--backoff", type=float, default=env("BACKOFF_FACTOR",0.6,float))
     p.add_argument("--category", default=env("BYBIT_CATEGORY","linear"), choices=["linear","inverse","option"])
-    p.add_argument("--concurrency", type=int, default=env("CONCURRENCY",12,int))
+    p.add_argument("--concurrency", type=int, default=env("CONCURRENCY",4,int))
 
     # Files/logging
     p.add_argument("--log", default=env("LOG_FILE","bot.log"))
@@ -106,12 +105,12 @@ def parse_args() -> Config:
     p.add_argument("--level", default=env("LOG_LEVEL","INFO"), choices=["DEBUG","INFO","WARNING","ERROR"])
     p.add_argument("--print-only", action="store_true", default=env("PRINT_ONLY","false").lower()=="true")
 
-    # Domains (дефолты уже api.*)
+    # Domains
     p.add_argument("--bybit-base", default=env("BYBIT_REST_BASE","api.bytick.com"))
     p.add_argument("--bybit-fallback", default=env("BYBIT_REST_FALLBACK","api.bybit.com"))
     p.add_argument("--binance", default=env("PRICE_FALLBACK_BINANCE","api.binance.com"))
 
-    # HTTP (PORT autoload + sanitization)
+    # HTTP
     p.add_argument("--http", type=int, default=auto_port(8080))
 
     # Modes
@@ -121,6 +120,9 @@ def parse_args() -> Config:
     # Analytics windows
     p.add_argument("--vol-window", type=int, default=env("VOL_WINDOW_MIN",120,int))
     p.add_argument("--trend-window", type=int, default=env("TREND_WINDOW_MIN",120,int))
+
+    # CoinGecko throttle
+    p.add_argument("--cg-interval", type=float, default=env("COINGECKO_MIN_INTERVAL","0.25",float))
 
     a = p.parse_args()
 
@@ -134,7 +136,8 @@ def parse_args() -> Config:
         Concurrency=a.concurrency, CacheTTL=15,
         LogFile=a.log, CsvFile=a.csv, DbFile=a.db, LogLevel=a.level, PrintOnly=a.print_only,
         HttpPort=a.http, Once=a.once, Loop=a.loop or (not a.once),
-        VolWindowMin=a.vol_window, TrendWindowMin=a.trend_window
+        VolWindowMin=a.vol_window, TrendWindowMin=a.trend_window,
+        CG_MinIntervalSec=a.cg_interval
     )
 
 # =======================
@@ -154,7 +157,6 @@ def setup_logger(cfg: Config) -> logging.Logger:
     except Exception:
         pass
     return lg
-
 
 # =======================
 # Universe
@@ -178,15 +180,13 @@ def get_universe(cfg: Config) -> List[str]:
     base = DEFAULT_TOP if cfg.UniverseMode.upper()=="TOP" else DEFAULT_ALL
     return base[:cfg.UniverseMax]
 
-
 # =======================
-# Cache (in-memory, optional)
+# Cache
 # =======================
 
 class TTLCache:
     def __init__(self, ttl_sec: int):
         self.ttl = ttl_sec
-        # sym -> (price, source, ts, vol_quote_24h, vol_base_24h)
         self.data: Dict[str, Tuple[float,str,float,Optional[float],Optional[float]]] = {}
         self.lock = threading.Lock()
     def get(self, sym: str):
@@ -201,7 +201,6 @@ class TTLCache:
     def put(self, sym: str, price: float, source: str, vq: Optional[float], vb: Optional[float]):
         with self.lock:
             self.data[sym] = (price, source, time.time(), vq, vb)
-
 
 # =======================
 # DB
@@ -261,9 +260,8 @@ class DB:
             try: con.close()
             except: pass
 
-
 # =======================
-# CSV
+# CSV helpers
 # =======================
 
 def ensure_csv(path:str, print_only:bool):
@@ -287,7 +285,6 @@ def build_session(cfg: Config) -> requests.Session:
                   status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
     ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
     s.mount("https://", ad); s.mount("http://", ad)
-    # Маскируем под браузер и разрешаем прокси из ENV (HTTPS_PROXY / HTTP_PROXY)
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
@@ -300,7 +297,6 @@ def build_session(cfg: Config) -> requests.Session:
 
 def n_bybit(sym:str)->str: return sym.replace("-","").upper()
 def n_binance(sym:str)->str: return sym.replace("-","").upper()
-
 
 # =======================
 # CoinGecko symbol -> id
@@ -327,7 +323,6 @@ COINGECKO_ID = {
     "ETCUSDT": "ethereum-classic",
     "ATOMUSDT":"cosmos",
     "AAVEUSDT":"aave",
-    # extra
     "EOSUSDT": "eos",
     "XLMUSDT": "stellar",
     "FILUSDT": "filecoin",
@@ -345,10 +340,22 @@ COINGECKO_ID = {
     "JUPUSDT": "jupiter-exchange-solana",
 }
 
+# =======================
+# Fetchers + throttle
+# =======================
 
-# =======================
-# Fetchers
-# =======================
+_cg_lock = threading.Lock()
+_cg_last_ts = 0.0
+
+def _coingecko_throttle(min_interval_sec: float):
+    global _cg_last_ts
+    with _cg_lock:
+        now = time.time()
+        wait = _cg_last_ts + min_interval_sec - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.time()
+        _cg_last_ts = now
 
 def fetch_bybit(session, cfg, symbol):
     sym = n_bybit(symbol)
@@ -394,14 +401,10 @@ def fetch_binance(session, cfg, symbol):
     return price, vq, vb
 
 def fetch_coingecko(session, cfg, symbol):
-    """
-    Возвращает (price_usd, volume_quote_usd_24h, volume_base_24h_approx).
-    Для 'активности' используем 24h объём в USD.
-    """
     coin_id = COINGECKO_ID.get(symbol.upper())
     if not coin_id:
         raise RuntimeError(f"coingecko id not mapped for {symbol}")
-
+    _coingecko_throttle(cfg.CG_MinIntervalSec)
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {"vs_currency": "usd", "ids": coin_id, "precision": "full"}
     r = session.get(url, params=params, timeout=cfg.RequestTimeout)
@@ -415,37 +418,28 @@ def fetch_coingecko(session, cfg, symbol):
     vol_base = (vol_usd / price) if price > 0 else None
     return price, vol_usd, vol_base
 
-
 def get_snapshot(session, cfg, symbol, logger):
-    # 1) Bytick
     try:
         price, vq, vb = fetch_bybit(session, cfg, symbol)
         return "bytick", price, vq, vb
     except Exception as e:
         logger.warning(f"[bytick] {symbol} fail: {e}")
-
-    # 2) Bybit fallback
     try:
         price, vq, vb = fetch_bybit_fb(session, cfg, symbol)
         return "bybit", price, vq, vb
     except Exception as e:
         logger.warning(f"[bybit-fallback] {symbol} fail: {e}")
-
-    # 3) Binance (может давать 451 по региону)
     try:
         price, vq, vb = fetch_binance(session, cfg, symbol)
         return "binance", price, vq, vb
     except Exception as e:
         logger.warning(f"[binance] {symbol} fail: {e}")
-
-    # 4) CoinGecko — максимально доступный публичный источник
     logger.info(f"[coingecko] trying {symbol}")
     try:
         price, vq_usd, vb_est = fetch_coingecko(session, cfg, symbol)
         return "coingecko", price, vq_usd, vb_est
     except Exception as e:
         logger.warning(f"[coingecko] {symbol} fail: {e}")
-
     return None
 
 # =======================
@@ -481,7 +475,6 @@ def linear_trend_pct_day(prices: List[Tuple[str,float]], window_min: int) -> Opt
     if last <= 0: return None
     steps_per_day = 1440.0/max(1.0, float(window_min))/n
     return (slope/last)*steps_per_day*100.0
-
 
 # =======================
 # State + HTTP handler
@@ -555,7 +548,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type","text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
-
 # =======================
 # HTTP server
 # =======================
@@ -567,7 +559,6 @@ def run_http(port:int, stop_evt:threading.Event, logger:logging.Logger):
     while not stop_evt.is_set():
         httpd.handle_request()
     logger.info("HTTP stopped")
-
 
 # =======================
 # Core loop
@@ -626,9 +617,8 @@ def install_signals(logger):
     signal.signal(signal.SIGINT,_h)
     signal.signal(signal.SIGTERM,_h)
 
-
 # =======================
-# Telegram bot (polling, aiogram v3)
+# Telegram bot (aiogram v3) — в отдельном потоке, БЕЗ сигналов
 # =======================
 
 try:
@@ -650,7 +640,7 @@ def _tg_kb():
 
 async def _tg_runner(cfg: Config, logger: logging.Logger):
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_whitelist = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # CSV разрешённых chat_id, пусто = всем
+    chat_whitelist = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     allow_any = (chat_whitelist == "")
 
     if not token:
@@ -670,10 +660,7 @@ async def _tg_runner(cfg: Config, logger: logging.Logger):
     async def _start(m: Message):
         if not _allowed(m.chat.id):
             return
-        await m.answer(
-            "Привет! Я скринер. Кнопки ниже:\n— Активность\n— Волатильность\n— Тренд",
-            reply_markup=_tg_kb()
-        )
+        await m.answer("Привет! Я скринер. Кнопки ниже:", reply_markup=_tg_kb())
 
     @dp.message(F.text.in_({"Активность","Волатильность","Тренд"}))
     async def _menu(m: Message):
@@ -699,7 +686,7 @@ async def _tg_runner(cfg: Config, logger: logging.Logger):
                     vol = it.get("volatility_pct_day")
                     lines.append(f"◆ {it['symbol']}: {round(vol,2) if vol is not None else '-'}%/day")
                 msg = f"Волатильность (окно { _GLOBALS['cfg'].VolWindowMin }м):\n" + ("\n".join(lines) if lines else "нет данных")
-            else:  # "Тренд"
+            else:
                 r = requests.get(f"{base}/trend?window_min={_GLOBALS['cfg'].TrendWindowMin}&limit=10", timeout=10).json()
                 rows = r.get("data", [])[:10]
                 lines = []
@@ -719,9 +706,10 @@ async def _tg_runner(cfg: Config, logger: logging.Logger):
 
     logger.info("Telegram: polling start")
     try:
-        # если висел webhook — aiogram сам переключится на polling; дополнительно можно удалить:
-        # await bot.delete_webhook(drop_pending_updates=False)
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        with contextlib.suppress(Exception):
+            await bot.delete_webhook(drop_pending_updates=False)
+        # ВАЖНО: handle_signals=False — чтобы не трогать set_wakeup_fd в потоке
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), handle_signals=False)
     finally:
         with contextlib.suppress(Exception):
             await bot.session.close()
@@ -737,12 +725,11 @@ def start_telegram_in_thread(cfg: Config, logger: logging.Logger):
             asyncio.set_event_loop(loop)
             loop.run_until_complete(_tg_runner(cfg, logger))
         except Exception as e:
-            logger.error(f"Telegram thread error: {e}")
+            logging.getLogger("bot").error(f"Telegram thread error: {e}")
 
     thr = threading.Thread(target=_target, daemon=True)
     thr.start()
     return thr
-
 
 # =======================
 # Run loop
@@ -752,10 +739,10 @@ def run_loop(cfg:Config, logger:logging.Logger):
     logger.info(f"BUILD {BUILD_TAG} | hosts: bytick={cfg.ByBitRestBase}, bybit={cfg.ByBitRestFallback}, binance={cfg.PriceFallbackBinance}")
     sess=build_session(cfg)
     db=DB(cfg.DbFile, logger)
+    _GLOBALS["db"]=db
 
     http_stop=None
     http_thr=None
-    tg_thr=None
 
     # HTTP
     if isinstance(cfg.HttpPort,int) and cfg.HttpPort>0:
@@ -765,7 +752,7 @@ def run_loop(cfg:Config, logger:logging.Logger):
 
     # Telegram
     try:
-        tg_thr = start_telegram_in_thread(cfg, logger)
+        start_telegram_in_thread(cfg, logger)
     except Exception as e:
         logger.error(f"Telegram start error: {e}")
 
@@ -785,14 +772,13 @@ def run_loop(cfg:Config, logger:logging.Logger):
                 time.sleep(0.1)
         logger.info("Stopped")
 
-
 # =======================
 # Main
 # =======================
 
 def main():
     cfg=parse_args()
-    _GLOBALS["cfg"]=cfg  # чтобы Телега знала порт/окна
+    _GLOBALS["cfg"]=cfg
     logger=setup_logger(cfg)
     install_signals(logger)
 
