@@ -1,14 +1,4 @@
-aiogram==3.13.1
-python-dotenv==1.0.1
-aiohttp==3.9.5
-pytz==2024.1
-matplotlib==3.9.2
-numpy==1.26.4
-openpyxl==3.1.5
-
-# postgres (совместимо с Python 3.13)
-psycopg[binary]==3.2.9
-psycopg-pool==3.2.6
-
-# для main.py (API-запросы, алерты, вебхуки)
 requests==2.32.3
+urllib3>=2.2,<3
+aiogram==3.13.1
+python-dotenv==1.0.1   # опционально: если читаешь переменные из .env локально
