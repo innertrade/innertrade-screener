@@ -1,2 +1,5 @@
-requests==2.32.3
-aiogram==3.13.1
+fastapi
+uvicorn[standard]
+httpx
+pydantic
+python-dotenv
