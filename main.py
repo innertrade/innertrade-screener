@@ -3,7 +3,7 @@
 
 import os, sys, re, time, csv, json, math, signal, sqlite3, threading, argparse, logging
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse as _urlparse, urlparse, parse_qs
@@ -16,8 +16,11 @@ from requests.adapters import HTTPAdapter
 AI_TELEGRAM = True
 try:
     from aiogram import Bot, Dispatcher, F
-    from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-    from aiogram.filters import CommandStart
+    if TYPE_CHECKING:
+        # только для type hints, чтобы не падало при отсутствии aiogram
+        from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+    AI_TELEGRAM = True
+    from aiogram.types import Message  # безопасно импортировать Message
 except Exception:
     AI_TELEGRAM = False
 
@@ -73,7 +76,7 @@ class Config:
     LowVolThresholdPct: float = float(os.getenv("LOW_VOL_THRESHOLD_PCT", "1.2"))  # ATR-like %
     Min24hVolumeUSD: float = float(os.getenv("MIN_24H_VOLUME_USD", "50000000"))   # 50M
 
-    SpikeVolRatioMin: float = float(os.getenv("SPIKE_VOL_RATIO_MIN", "3.0"))      # v0: не используем явно (сигнал по цене)
+    SpikeVolRatioMin: float = float(os.getenv("SPIKE_VOL_RATIO_MIN", "3.0"))
     SpikePricePctMin: float = float(os.getenv("SPIKE_PRICE_PCT_MIN", "0.7"))
     MinNotionalUSD: float = float(os.getenv("MIN_NOTIONAL_USD", "100000"))
     CooldownMinutes: int = int(os.getenv("COOLDOWN_MINUTES", "15"))
@@ -114,7 +117,6 @@ def clean_host(v: str) -> str:
     else:
         host = v.strip("/")
     return host.split("/")[0].strip()
-
 
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Screener bot: /health /activity /volatility /trend /signals /ip")
@@ -188,7 +190,6 @@ def setup_logger(cfg: Config) -> logging.Logger:
         pass
     return lg
 
-
 # =======================
 # Universe
 # =======================
@@ -210,7 +211,6 @@ def get_universe(cfg: Config) -> List[str]:
         return [s.strip().upper() for s in cfg.UniverseList][:cfg.UniverseMax]
     base = DEFAULT_TOP if cfg.UniverseMode.upper()=="TOP" else DEFAULT_ALL
     return base[:cfg.UniverseMax]
-
 
 # =======================
 # Cache (in-memory, optional)
@@ -234,7 +234,6 @@ class TTLCache:
     def put(self, sym: str, price: float, source: str, vq: Optional[float], vb: Optional[float]):
         with self.lock:
             self.data[sym] = (price, source, time.time(), vq, vb)
-
 
 # =======================
 # DB
@@ -294,7 +293,6 @@ class DB:
             try: con.close()
             except: pass
 
-
 # =======================
 # CSV
 # =======================
@@ -320,7 +318,6 @@ def build_session(cfg: Config) -> requests.Session:
                   status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
     ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
     s.mount("https://", ad); s.mount("http://", ad)
-    # Маскируем под браузер и разрешаем прокси из ENV (HTTPS_PROXY / HTTP_PROXY)
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
@@ -461,7 +458,6 @@ def fetch_coingecko(session, cfg, symbol):
     vol_usd = float(it.get("total_volume") or 0.0)
     vol_base = (vol_usd / price) if price > 0 else None
     return price, vol_usd, vol_base
-
 
 def get_snapshot(session, cfg, symbol, logger):
     # 1) Bytick
@@ -807,7 +803,11 @@ def install_signals(logger):
 # Telegram bot (aiogram, опционально)
 # =======================
 
-def build_keyboard() -> ReplyKeyboardMarkup:
+def build_keyboard() -> 'ReplyKeyboardMarkup':
+    if not AI_TELEGRAM:
+        # на случай прямого вызова без aiogram — возвратим None-подобный объект
+        return None  # type: ignore
+    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton  # локальный импорт
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Активность")],
@@ -885,14 +885,18 @@ async def telegram_polling_main(cfg: Config, logger: logging.Logger):
         logger.warning("TELEGRAM_BOT_TOKEN отсутствует — Telegram меню отключено")
         return
 
+    from aiogram import Bot, Dispatcher, F  # локальные импорты, если пакет есть
+    from aiogram.types import Message
+
     bot = Bot(cfg.TelegramBotToken)
     dp = Dispatcher()
 
-    @dp.message(CommandStart())
+    @dp.message(commands={"start"})
     async def start_cmd(msg: Message):
         if cfg.TelegramAllowedChatId and str(msg.chat.id) != str(cfg.TelegramAllowedChatId):
             return
-        await msg.answer("Привет! Выбери режим:", reply_markup=build_keyboard())
+        kb = build_keyboard()
+        await msg.answer("Привет! Выбери режим:", reply_markup=kb)
 
     @dp.message(F.text == "Активность")
     async def on_activity(msg: Message):
@@ -903,7 +907,7 @@ async def telegram_polling_main(cfg: Config, logger: logging.Logger):
 
     @dp.message(F.text == "Волатильность")
     async def on_vol(msg: Message):
-        if cfg.TelegramAllowedChatId and str(msg.chat.id) != str(cfg.TelegramAllowedChatId):
+        if cfg.TelegramAllowedChatId and str(msg.chat.id) != str(cfg.TeleagramAllowedChatId):
             return
         txt = tg_build_text_volatility(cfg, _GLOBALS["db"])
         await msg.answer(txt)
