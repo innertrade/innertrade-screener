@@ -711,7 +711,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"kind":"trend","window_min":win,"data":out[:limit]}
     def _signals(self, qs):
         limit = int(qs.get("limit", [50])[0])
-        with _GLOBALS["signals_lock"]:
+        with _GLOBALS["signals_lock"] as _:
             data = list(_GLOBALS["signals_buffer"][-limit:])
         return {"kind":"signals", "count": len(data), "data": data}
     def _ip(self):
@@ -891,6 +891,16 @@ async def telegram_polling_main(cfg: Config, logger: logging.Logger):
     bot = Bot(cfg.TelegramBotToken)
     dp = Dispatcher()
 
+    # Диагностика вебхука (в поллинге он должен быть пуст)
+    try:
+        info = await bot.get_webhook_info()
+        if getattr(info, "url", ""):
+            logger.warning(f"Telegram webhook is SET: {info.url} — при активном вебхуке polling не получит апдейты")
+        else:
+            logger.info("Telegram webhook: <empty> (ok for polling)")
+    except Exception as e:
+        logger.warning(f"GetWebhookInfo failed: {e}")
+
     @dp.message(commands={"start"})
     async def start_cmd(msg: Message):
         if cfg.TelegramAllowedChatId and str(msg.chat.id) != str(cfg.TelegramAllowedChatId):
@@ -907,7 +917,7 @@ async def telegram_polling_main(cfg: Config, logger: logging.Logger):
 
     @dp.message(F.text == "Волатильность")
     async def on_vol(msg: Message):
-        if cfg.TelegramAllowedChatId and str(msg.chat.id) != str(cfg.TeleagramAllowedChatId):
+        if cfg.TelegramAllowedChatId and str(msg.chat.id) != str(cfg.TelegramAllowedChatId):
             return
         txt = tg_build_text_volatility(cfg, _GLOBALS["db"])
         await msg.answer(txt)
@@ -990,6 +1000,10 @@ def start_workers(cfg: Config, logger: logging.Logger) -> Tuple[threading.Event,
 def main():
     cfg=parse_args()
     logger=setup_logger(cfg)
+
+    # Диагностика конфигурации при старте
+    logger.info(f"CFG: TelegramPolling={cfg.TelegramPolling} | Token={'set' if cfg.TelegramBotToken else 'missing'} | AllowedChatId={cfg.TelegramAllowedChatId} | Mode={cfg.Mode}")
+
     install_signals(logger)
 
     logger.info(f"BUILD {BUILD_TAG} | hosts: bytick={cfg.ByBitRestBase}, bybit={cfg.ByBitRestFallback}, binance={cfg.PriceFallbackBinance}")
@@ -1007,6 +1021,9 @@ def main():
                 asyncio.run(telegram_polling_main(cfg, logger))
             except Exception as e:
                 logger.error(f"Telegram polling error: {e}")
+    else:
+        # Явный лог, если поллинг пропускается
+        logger.info(f"Skip TG: polling={cfg.TelegramPolling} token={'set' if cfg.TelegramBotToken else 'missing'} AI_TELEGRAM={AI_TELEGRAM}")
 
     # Если поллинг не включён — просто держим процесс пока идут фоновые потоки
     try:
