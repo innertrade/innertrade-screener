@@ -3,7 +3,7 @@
 
 import os, sys, re, time, csv, json, math, signal, sqlite3, threading, argparse, logging
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse as _urlparse, urlparse, parse_qs
@@ -12,14 +12,18 @@ import requests
 from urllib3.util import Retry
 from requests.adapters import HTTPAdapter
 
+# --- aiogram (опционально, только для меню) ---
 AI_TELEGRAM = True
 try:
     from aiogram import Bot, Dispatcher, F
-    from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+    if TYPE_CHECKING:
+        from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+    AI_TELEGRAM = True
+    from aiogram.types import Message
 except Exception:
     AI_TELEGRAM = False
 
-BUILD_TAG = "screener-5m-signals-2025-09-30-all-usdt-bybit"
+BUILD_TAG = "screener-main-5m-signals-oi-2025-09-30"
 
 # =======================
 # Config
@@ -27,14 +31,14 @@ BUILD_TAG = "screener-5m-signals-2025-09-30-all-usdt-bybit"
 
 @dataclass
 class Config:
-    # Bybit/Binance hosts
+    # Bybit/Binance хосты
     ByBitRestBase: str = "api.bytick.com"
     ByBitRestFallback: str = "api.bybit.com"
     PriceFallbackBinance: str = "api.binance.com"
 
     # Universe
     UniverseMax: int = 50
-    UniverseMode: str = "TOP"          # TOP | ALL | LIST
+    UniverseMode: str = "TOP"         # TOP | ALL
     UniverseRefreshMin: int = 1
     UniverseList: Optional[List[str]] = None
 
@@ -42,8 +46,9 @@ class Config:
     RequestTimeout: int = 10
     MaxRetries: int = 3
     BackoffFactor: float = 0.6
-    Category: str = "linear"           # linear | inverse | option
+    Category: str = "linear"
     Concurrency: int = 12
+
     CacheTTL: int = 15
 
     # Files/logging
@@ -60,42 +65,45 @@ class Config:
     Once: bool = False
     Loop: bool = True
 
-    # Analytics windows (для /volatility /trend)
+    # Analytics windows
     VolWindowMin: int = 120
     TrendWindowMin: int = 120
 
-    # --- РЕЖИМЫ ---
-    Mode: str = os.getenv("MODE", "signals_5m")  # signals_5m | breakout | activity | volatility | trend
+    # ---- Breakout v0 (на 60s; оставляем, но режимом не пользуемся) ----
+    Mode: str = os.getenv("MODE", "breakout")
 
-    # --- Breakout v0 (1m на базе цен/объёма снапшота) ---
     BaselineHours: int = int(os.getenv("BASELINE_HOURS", "2"))
     LowVolThresholdPct: float = float(os.getenv("LOW_VOL_THRESHOLD_PCT", "1.2"))
-    Min24hVolumeUSD: float = float(os.getenv("MIN_24H_VOLUME_USD", "50000000"))
-    SpikeVolRatioMin: float = float(os.getenv("SPIKE_VOL_RATIO_MIN", "3.0"))
     SpikePricePctMin: float = float(os.getenv("SPIKE_PRICE_PCT_MIN", "0.7"))
+    Min24hVolumeUSD: float = float(os.getenv("MIN_24H_VOLUME_USD", "50000000"))
     MinNotionalUSD: float = float(os.getenv("MIN_NOTIONAL_USD", "100000"))
     CooldownMinutes: int = int(os.getenv("COOLDOWN_MINUTES", "15"))
 
-    # --- Signals 5m thresholds ---
+    # ---- SIGNALS_5M с OI ----
     Baseline5mHours: int = int(os.getenv("BASELINE_5M_HOURS", "1"))
     PriceSpikePct5m: float = float(os.getenv("PRICE_SPIKE_PCT_5M", "0.7"))
     VolumeSpikeX5m: float = float(os.getenv("VOLUME_SPIKE_X_5M", "3.0"))
     OIIncreasePct5m: float = float(os.getenv("OI_INCREASE_PCT_5M", "0.5"))
-    KlineSource: str = os.getenv("KLINE_SOURCE", "bybit")   # bybit
-    OISource: str = os.getenv("OI_SOURCE", "bybit")         # bybit
+
+    # Источники для 5м
+    KlineSource: str = os.getenv("KLINE_SOURCE", "bybit")
+    OISource: str = os.getenv("OI_SOURCE", "bybit")
 
     # Telegram
-    TelegramPolling: bool = (os.getenv("TELEGRAM_POLLING", "false").lower() == "true")
+    TelegramPolling: bool = (os.getenv("TELEGRAM_POLLING", "true").lower() == "true")
     TelegramBotToken: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
     TelegramAlertChatId: Optional[str] = os.getenv("TELEGRAM_ALERT_CHAT_ID")
     TelegramAllowedChatId: Optional[str] = os.getenv("TELEGRAM_ALLOWED_CHAT_ID")
 
 def env(name, default, cast=None):
     v = os.getenv(name)
-    if v is None: return default
+    if v is None:
+        return default
     if cast:
-        try: return cast(v)
-        except Exception: return default
+        try:
+            return cast(v)
+        except Exception:
+            return default
     return v
 
 def auto_port(default: int = 8080) -> int:
@@ -107,7 +115,8 @@ def auto_port(default: int = 8080) -> int:
         return default
 
 def clean_host(v: str) -> str:
-    if not v: return v
+    if not v:
+        return v
     v = v.strip()
     if "://" in v:
         parsed = _urlparse(v)
@@ -117,10 +126,10 @@ def clean_host(v: str) -> str:
     return host.split("/")[0].strip()
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Screener: /health /activity /volatility /trend /signals /ip")
+    p = argparse.ArgumentParser(description="Screener bot: /health /activity /volatility /trend /signals /ip")
 
     # Universe
-    p.add_argument("--mode", default=env("UNIVERSE_MODE","TOP"), choices=["TOP","ALL","LIST"])
+    p.add_argument("--mode", default=env("UNIVERSE_MODE","TOP"), choices=["TOP","ALL"])
     p.add_argument("--max", type=int, default=env("UNIVERSE_MAX",50,int))
     p.add_argument("--refresh", type=int, default=env("UNIVERSE_REFRESH_MIN",1,int))
     p.add_argument("--list", type=str, default=env("UNIVERSE_LIST",None))
@@ -195,70 +204,45 @@ def setup_logger(cfg: Config) -> logging.Logger:
 DEFAULT_TOP = [
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT",
     "DOGEUSDT","ADAUSDT","TONUSDT","TRXUSDT","LINKUSDT",
+    "APTUSDT","ARBUSDT","OPUSDT","NEARUSDT","SUIUSDT",
+    "LTCUSDT","MATICUSDT","ETCUSDT","ATOMUSDT","AAVEUSDT",
+]
+DEFAULT_ALL = DEFAULT_TOP + [
+    "EOSUSDT","XLMUSDT","FILUSDT","INJUSDT","WLDUSDT",
+    "PEPEUSDT","SHIBUSDT","FTMUSDT","KASUSDT","RUNEUSDT",
+    "SEIUSDT","PYTHUSDT","TIAUSDT","ORDIUSDT","JUPUSDT",
 ]
 
-DEFAULT_ALL = DEFAULT_TOP  # будет расширено авто-дискавером
-
-_universe_cache: Dict[str, float] = {}  # sym -> ts_seen
-_universe_lock = threading.Lock()
-
-def autodiscover_universe_bybit(session: requests.Session, cfg: Config, logger: logging.Logger) -> List[str]:
-    """
-    Берём ВСЕ линейные USDT фьючи с Bybit (если доступен).
-    """
-    try:
-        url = f"https://{cfg.ByBitRestBase}/v5/market/instruments-info"
-        params = {"category": cfg.Category}
-        r = session.get(url, params=params, timeout=cfg.RequestTimeout)
-        r.raise_for_status()
-        data = r.json()
-        lst = (((data or {}).get("result") or {}).get("list") or [])
-        syms = []
-        for it in lst:
-            s = (it.get("symbol") or "").upper()
-            if s.endswith("USDT"):
-                syms.append(s)
-        if not syms:
-            raise RuntimeError("empty list from bytick base")
-        return sorted(set(syms))
-    except Exception as e:
-        logger.warning(f"autodiscover(bytick) fail: {e}; try fallback")
-        try:
-            url = f"https://{cfg.ByBitRestFallback}/v5/market/instruments-info"
-            params = {"category": cfg.Category}
-            r = session.get(url, params=params, timeout=cfg.RequestTimeout)
-            r.raise_for_status()
-            data = r.json()
-            lst = (((data or {}).get("result") or {}).get("list") or [])
-            syms = []
-            for it in lst:
-                s = (it.get("symbol") or "").upper()
-                if s.endswith("USDT"):
-                    syms.append(s)
-            if syms:
-                return sorted(set(syms))
-        except Exception as e2:
-            logger.warning(f"autodiscover(bybit-fallback) fail: {e2}")
-    return []
-
-def get_universe(cfg: Config, session: Optional[requests.Session]=None, logger: Optional[logging.Logger]=None) -> List[str]:
+def get_universe(cfg: Config) -> List[str]:
     if cfg.UniverseList:
         return [s.strip().upper() for s in cfg.UniverseList][:cfg.UniverseMax]
-    if cfg.UniverseMode.upper() == "TOP":
-        return DEFAULT_TOP[:min(cfg.UniverseMax, len(DEFAULT_TOP))]
-    if cfg.UniverseMode.upper() == "ALL":
-        if session and logger:
-            syms = autodiscover_universe_bybit(session, cfg, logger)
-            if syms:
-                return syms[:cfg.UniverseMax]
-        # fallback
-        base = list(DEFAULT_ALL)
-        return base[:cfg.UniverseMax]
-    # LIST без списка -> TOP
-    return DEFAULT_TOP[:min(cfg.UniverseMax, len(DEFAULT_TOP))]
+    base = DEFAULT_TOP if cfg.UniverseMode.upper()=="TOP" else DEFAULT_ALL
+    return base[:cfg.UniverseMax]
 
 # =======================
-# DB & CSV
+# Cache
+# =======================
+
+class TTLCache:
+    def __init__(self, ttl_sec: int):
+        self.ttl = ttl_sec
+        self.data: Dict[str, Tuple[float,str,float,Optional[float],Optional[float]]] = {}
+        self.lock = threading.Lock()
+    def get(self, sym: str):
+        with self.lock:
+            row = self.data.get(sym)
+            if not row:
+                return None
+            price, source, ts, vq, vb = row
+            if time.time() - ts <= self.ttl:
+                return row
+            self.data.pop(sym, None); return None
+    def put(self, sym: str, price: float, source: str, vq: Optional[float], vb: Optional[float]):
+        with self.lock:
+            self.data[sym] = (price, source, time.time(), vq, vb)
+
+# =======================
+# DB
 # =======================
 
 class DB:
@@ -315,6 +299,10 @@ class DB:
             try: con.close()
             except: pass
 
+# =======================
+# CSV helpers
+# =======================
+
 def ensure_csv(path:str, print_only:bool):
     if print_only: return
     if not os.path.isfile(path):
@@ -334,7 +322,7 @@ def build_session(cfg: Config) -> requests.Session:
     s = requests.Session()
     retry = Retry(total=cfg.MaxRetries, backoff_factor=cfg.BackoffFactor,
                   status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
-    ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=100)
+    ad = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -350,7 +338,49 @@ def n_bybit(sym:str)->str: return sym.replace("-","").upper()
 def n_binance(sym:str)->str: return sym.replace("-","").upper()
 
 # =======================
-# Price/Volume snapshot fetchers
+# CoinGecko symbol -> id (для fallback + активности/меню)
+# =======================
+
+COINGECKO_ID = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "SOLUSDT": "solana",
+    "XRPUSDT": "ripple",
+    "BNBUSDT": "binancecoin",
+    "DOGEUSDT": "dogecoin",
+    "ADAUSDT": "cardano",
+    "TONUSDT": "toncoin",
+    "TRXUSDT": "tron",
+    "LINKUSDT": "chainlink",
+    "APTUSDT": "aptos",
+    "ARBUSDT": "arbitrum",
+    "OPUSDT":  "optimism",
+    "NEARUSDT":"near",
+    "SUIUSDT": "sui",
+    "LTCUSDT": "litecoin",
+    "MATICUSDT":"matic-network",
+    "ETCUSDT": "ethereum-classic",
+    "ATOMUSDT":"cosmos",
+    "AAVEUSDT":"aave",
+    "EOSUSDT": "eos",
+    "XLMUSDT": "stellar",
+    "FILUSDT": "filecoin",
+    "INJUSDT": "injective-protocol",
+    "WLDUSDT": "worldcoin-wld",
+    "PEPEUSDT":"pepe",
+    "SHIBUSDT":"shiba-inu",
+    "FTMUSDT": "fantom",
+    "KASUSDT": "kaspa",
+    "RUNEUSDT":"thorchain",
+    "SEIUSDT": "sei-network",
+    "PYTHUSDT":"pyth-network",
+    "TIAUSDT": "celestia",
+    "ORDIUSDT":"ordinals",
+    "JUPUSDT": "jupiter-exchange-solana",
+}
+
+# =======================
+# Fetchers (tickers + kline + OI)
 # =======================
 
 def fetch_bybit(session, cfg, symbol):
@@ -397,21 +427,39 @@ def fetch_binance(session, cfg, symbol):
     return price, vq, vb
 
 def fetch_coingecko(session, cfg, symbol):
-    # Простая страховка — не используем для сигналов, лишь как последний fallback по цене/24h.
-    time.sleep(0.5)
-    raise RuntimeError("coingecko disabled for brevity in this build")
+    coin_id = COINGECKO_ID.get(symbol.upper())
+    if not coin_id:
+        raise RuntimeError(f"coingecko id not mapped for {symbol}")
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {"vs_currency": "usd", "ids": coin_id, "precision": "full"}
+    r = session.get(url, params=params, timeout=cfg.RequestTimeout)
+    r.raise_for_status()
+    arr = r.json()
+    if not isinstance(arr, list) or not arr:
+        raise RuntimeError(f"coingecko empty for {symbol}: {arr}")
+    it = arr[0]
+    price = float(it["current_price"])
+    vol_usd = float(it.get("total_volume") or 0.0)
+    vol_base = (vol_usd / price) if price > 0 else None
+    return price, vol_usd, vol_base
 
 def get_snapshot(session, cfg, symbol, logger):
-    for fn, name in (
-        (fetch_bybit, "bytick"),
-        (fetch_bybit_fb, "bybit"),
-        (fetch_binance, "binance"),
-    ):
-        try:
-            price, vq, vb = fn(session, cfg, symbol)
-            return name, price, vq, vb
-        except Exception as e:
-            logger.warning(f"[{name}] {symbol} fail: {e}")
+    try:
+        price, vq, vb = fetch_bybit(session, cfg, symbol)
+        return "bytick", price, vq, vb
+    except Exception as e:
+        logger.warning(f"[bytick] {symbol} fail: {e}")
+    try:
+        price, vq, vb = fetch_bybit_fb(session, cfg, symbol)
+        return "bybit", price, vq, vb
+    except Exception as e:
+        logger.warning(f"[bybit-fallback] {symbol} fail: {e}")
+    try:
+        price, vq, vb = fetch_binance(session, cfg, symbol)
+        return "binance", price, vq, vb
+    except Exception as e:
+        logger.warning(f"[binance] {symbol} fail: {e}")
+    logger.info(f"[coingecko] trying {symbol}")
     try:
         price, vq_usd, vb_est = fetch_coingecko(session, cfg, symbol)
         return "coingecko", price, vq_usd, vb_est
@@ -419,82 +467,67 @@ def get_snapshot(session, cfg, symbol, logger):
         logger.warning(f"[coingecko] {symbol} fail: {e}")
     return None
 
-# =======================
-# 5m data (klines & OI) from Bybit
-# =======================
-
-def bybit_klines_5m(session: requests.Session, cfg: Config, symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
+# --- 5m Kline (Bybit v5) ---
+def fetch_bybit_kline_5m(session: requests.Session, cfg: Config, symbol: str, limit: int = 60):
     """
-    v5 /market/kline (interval='5')
-    Возвращает список свечей (последняя — текущая/самая свежая).
+    Возвращает список свечей (от старых к новым): [(open_time_ms, open, high, low, close, volume)]
+    interval=5 (минут), category=cfg.Category
     """
     sym = n_bybit(symbol)
-    params = {"category": cfg.Category, "symbol": sym, "interval": "5", "limit": str(limit)}
-    # primary
-    url = f"https://{cfg.ByBitRestBase}/v5/market/kline"
-    try:
-        r = session.get(url, params=params, timeout=cfg.RequestTimeout)
-        r.raise_for_status()
-        data = r.json()
-        lst = (((data or {}).get("result") or {}).get("list") or [])
-        # формат: [start, open, high, low, close, volume, turnover]
-        out = []
-        for row in lst:
-            out.append({
-                "start": int(row[0])//1000,
-                "open": float(row[1]), "high": float(row[2]),
-                "low": float(row[3]), "close": float(row[4]),
-                "volume": float(row[5]), "turnover": float(row[6]) if len(row)>6 and row[6] is not None else None
-            })
-        return out
-    except Exception:
-        # fallback
-        url = f"https://{cfg.ByBitRestFallback}/v5/market/kline"
-        r = session.get(url, params=params, timeout=cfg.RequestTimeout)
-        r.raise_for_status()
-        data = r.json()
-        lst = (((data or {}).get("result") or {}).get("list") or [])
-        out = []
-        for row in lst:
-            out.append({
-                "start": int(row[0])//1000,
-                "open": float(row[1]), "high": float(row[2]),
-                "low": float(row[3]), "close": float(row[4]),
-                "volume": float(row[5]), "turnover": float(row[6]) if len(row)>6 and row[6] is not None else None
-            })
-        return out
+    base_urls = [cfg.ByBitRestBase, cfg.ByBitRestFallback]
+    for host in base_urls:
+        try:
+            url = f"https://{host}/v5/market/kline"
+            params = {"category": cfg.Category, "symbol": sym, "interval": "5", "limit": str(limit)}
+            r = session.get(url, params=params, timeout=cfg.RequestTimeout)
+            r.raise_for_status()
+            js = r.json()
+            lst = (((js or {}).get("result") or {}).get("list") or [])
+            if not lst:
+                raise RuntimeError(f"kline empty: {js}")
+            # Bybit v5 возвращает newest->oldest, перевернём
+            rows = []
+            for it in reversed(lst):
+                # форма: [start, open, high, low, close, volume, turnover] (строки)
+                ts = int(it[0]); o=float(it[1]); h=float(it[2]); l=float(it[3]); c=float(it[4]); v=float(it[5])
+                rows.append((ts, o, h, l, c, v))
+            return rows
+        except Exception as e:
+            continue
+    raise RuntimeError("kline fetch failed")
 
-def bybit_oi_5m(session: requests.Session, cfg: Config, symbol: str, limit: int = 20) -> List[Dict[str, Any]]:
+# --- 5m Open Interest (Bybit v5) ---
+def fetch_bybit_oi_5m(session: requests.Session, cfg: Config, symbol: str, limit: int = 2) -> List[Tuple[int,float]]:
     """
-    v5 /market/open-interest (interval='5min' у Bybit)
-    Возвращает список точек OI (последняя — свежая).
+    Возвращает [(ts_ms, oi_value)], 5m.
+    endpoint: /v5/market/open-interest?category=linear&symbol=BTCUSDT&interval=5min&limit=...
     """
     sym = n_bybit(symbol)
-    params = {"category": cfg.Category, "symbol": sym, "interval": "5min", "limit": str(limit)}
-    url = f"https://{cfg.ByBitRestBase}/v5/market/open-interest"
-    try:
-        r = session.get(url, params=params, timeout=cfg.RequestTimeout)
-        r.raise_for_status()
-        data = r.json()
-        lst = (((data or {}).get("result") or {}).get("list") or [])
-        out = []
-        for row in lst:
-            # формат: [timestamp, value]
-            out.append({"ts": int(row[0])//1000, "oi": float(row[1])})
-        return out
-    except Exception:
-        url = f"https://{cfg.ByBitRestFallback}/v5/market/open-interest"
-        r = session.get(url, params=params, timeout=cfg.RequestTimeout)
-        r.raise_for_status()
-        data = r.json()
-        lst = (((data or {}).get("result") or {}).get("list") or [])
-        out = []
-        for row in lst:
-            out.append({"ts": int(row[0])//1000, "oi": float(row[1])})
-        return out
+    base_urls = [cfg.ByBitRestBase, cfg.ByBitRestFallback]
+    for host in base_urls:
+        try:
+            url = f"https://{host}/v5/market/open-interest"
+            params = {"category": cfg.Category, "symbol": sym, "interval": "5min", "limit": str(limit)}
+            r = session.get(url, params=params, timeout=cfg.RequestTimeout)
+            r.raise_for_status()
+            js = r.json()
+            lst = (((js or {}).get("result") or {}).get("list") or [])
+            if not lst:
+                raise RuntimeError(f"oi empty: {js}")
+            # newest->oldest -> перевернём
+            rows=[]
+            for it in reversed(lst):
+                # it: {"openInterest": "...", "timestamp": "..."}
+                ts=int(it.get("timestamp") or it.get("ts") or 0)
+                oi=float(it.get("openInterest") or 0.0)
+                rows.append((ts,oi))
+            return rows
+        except Exception:
+            continue
+    raise RuntimeError("oi fetch failed")
 
 # =======================
-# Analytics helpers
+# Analytics
 # =======================
 
 def realized_vol(prices: List[Tuple[str,float]], window_min: int) -> Optional[float]:
@@ -504,7 +537,7 @@ def realized_vol(prices: List[Tuple[str,float]], window_min: int) -> Optional[fl
     rets = []
     for i in range(1,len(vals)):
         try: rets.append(math.log(vals[i]/vals[i-1]))
-        except Exception: pass
+        except: pass
     if len(rets) < 2: return None
     mean = sum(rets)/len(rets)
     var = sum((x-mean)**2 for x in rets)/(len(rets)-1)
@@ -547,7 +580,7 @@ def approx_notional_1m_from_24h(vol24h_usd: Optional[float]) -> Optional[float]:
     return vol24h_usd / 1440.0
 
 # =======================
-# Engines
+# Breakout Engine v0 (оставлен как есть)
 # =======================
 
 class BreakoutEngineV0:
@@ -557,15 +590,12 @@ class BreakoutEngineV0:
         self.log = logger
         self.send_alert = send_alert_fn
         self.last_signal_ts: Dict[str, float] = {}
-
     def _cooldown_ok(self, symbol: str) -> bool:
         cd = max(1, self.cfg.CooldownMinutes) * 60
         t0 = self.last_signal_ts.get(symbol, 0)
         return (time.time() - t0) >= cd
-
     def _mark_signalled(self, symbol: str):
         self.last_signal_ts[symbol] = time.time()
-
     def check_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
         win_min = self.cfg.BaselineHours * 60
         hist = self.db.history(symbol, win_min)
@@ -588,7 +618,6 @@ class BreakoutEngineV0:
             return None
         if not self._cooldown_ok(symbol):
             return None
-
         sig = {
             "symbol": symbol,
             "price": last_price,
@@ -603,75 +632,40 @@ class BreakoutEngineV0:
         self._mark_signalled(symbol)
         return sig
 
+# =======================
+# SIGNALS_5M Engine (5m + OI)
+# =======================
+
 class Signals5mEngine:
-    """
-    Сигнал, если одновременно выполняются:
-      - |Δцены за 5м| >= PRICE_SPIKE_PCT_5M
-      - объём 5м >= VOLUME_SPIKE_X_5M * средний 5м объём за Baseline5mHours
-      - рост OI за 5м >= OI_INCREASE_PCT_5M
-      - 24h оборот (USD) >= MIN_24H_VOLUME_USD и мин. «минутный» notional >= MIN_NOTIONAL_USD
-    """
-    def __init__(self, cfg: Config, db: DB, logger: logging.Logger, session: requests.Session, send_alert_fn):
+    def __init__(self, cfg: Config, logger: logging.Logger, session: requests.Session, db: DB, send_alert_fn):
         self.cfg = cfg
-        self.db = db
         self.log = logger
-        self.session = session
+        self.sess = session
+        self.db = db
         self.send_alert = send_alert_fn
         self.last_signal_ts: Dict[str, float] = {}
 
     def _cooldown_ok(self, symbol: str) -> bool:
         cd = max(1, self.cfg.CooldownMinutes) * 60
-        t0 = self.last_signal_ts.get(symbol, 0)
-        return (time.time() - t0) >= cd
+        return (time.time() - self.last_signal_ts.get(symbol, 0)) >= cd
 
     def _mark_signalled(self, symbol: str):
         self.last_signal_ts[symbol] = time.time()
 
+    def _kline_baseline_vol(self, klines: List[Tuple[int,float,float,float,float,float]]) -> Optional[float]:
+        # берём всё, кроме последней свечи, как базу
+        vols = [v for (_,_,_,_,_,v) in klines[:-1] if v is not None]
+        if len(vols) < 3: return None
+        return sum(vols)/len(vols)
+
+    def _oi_increase_pct_last5m(self, oi_rows: List[Tuple[int,float]]) -> Optional[float]:
+        if len(oi_rows) < 2: return None
+        a = oi_rows[-2][1]; b = oi_rows[-1][1]
+        if a <= 0: return None
+        return (b/a - 1.0)*100.0
+
     def check_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
-        # 1) Получаем 5м свечи (последние N)
-        try:
-            kl = bybit_klines_5m(self.session, self.cfg, symbol, limit= max(20, self.cfg.Baseline5mHours*12 + 3))
-        except Exception as e:
-            self.log.warning(f"klines5m fail {symbol}: {e}")
-            return None
-        if len(kl) < 6:  # нужно минимум 2 последних + база
-            return None
-
-        last = kl[-1]
-        prev = kl[-2]
-        px_last = float(last["close"])
-        px_prev = float(prev["close"])
-        dprice_pct = pct_change(px_last, px_prev)
-        if dprice_pct is None or abs(dprice_pct) < self.cfg.PriceSpikePct5m:
-            return None
-
-        # 2) Объём: last 5m turnover против среднего за baseline
-        baseline_candles = max(6, self.cfg.Baseline5mHours * 12)  # 12 пятиминуток в час
-        base_slice = kl[-(baseline_candles+1):-1]  # без последней
-        vols = [c.get("turnover") if c.get("turnover") is not None else c.get("volume")*c.get("close", px_last) for c in base_slice]
-        vols = [float(v) for v in vols if v is not None]
-        if len(vols) < max(6, baseline_candles//2):
-            return None
-        avg5m = sum(vols)/len(vols) if vols else 0.0
-        last_vol = float(last.get("turnover") or (last["volume"]*px_last))
-        if avg5m <= 0 or last_vol < self.cfg.VolumeSpikeX5m * avg5m:
-            return None
-
-        # 3) OI рост за 5м
-        try:
-            ois = bybit_oi_5m(self.session, self.cfg, symbol, limit=10)
-            if len(ois) < 2: 
-                return None
-            oi_last = float(ois[-1]["oi"])
-            oi_prev = float(ois[-2]["oi"])
-            oi_chg_pct = pct_change(oi_last, oi_prev) or 0.0
-            if oi_chg_pct < self.cfg.OIIncreasePct5m:
-                return None
-        except Exception as e:
-            self.log.warning(f"oi5m fail {symbol}: {e}")
-            return None
-
-        # 4) Ликвидность 24h
+        # ликвидность 24h
         snap = self.db.last(symbol)
         vol24h_usd = snap[2] if snap else None
         if (vol24h_usd is None) or (vol24h_usd < self.cfg.Min24hVolumeUSD):
@@ -680,27 +674,60 @@ class Signals5mEngine:
         if (approx_1m is None) or (approx_1m < self.cfg.MinNotionalUSD):
             return None
 
-        # 5) Cooldown
+        # kline 5m
+        limit = max(12, self.cfg.Baseline5mHours*12 + 2)  # база + 2 свечи
+        try:
+            kl = fetch_bybit_kline_5m(self.sess, self.cfg, symbol, limit=limit)
+        except Exception as e:
+            self.log.debug(f"kline5m fail {symbol}: {e}")
+            return None
+        if len(kl) < 3:
+            return None
+
+        # Δ5m цены и объём-спайк
+        _,_,_,_, prev_close, _ = kl[-2]
+        _,_,_,_, last_close,  last_vol  = kl[-1]
+        if prev_close <= 0 or last_close <= 0:
+            return None
+
+        d5m = (last_close/prev_close - 1.0)*100.0
+        base_vol = self._kline_baseline_vol(kl)
+        if base_vol is None or base_vol <= 0:
+            return None
+        vol_ratio = (last_vol / base_vol) if base_vol>0 else 0.0
+
+        if abs(d5m) < self.cfg.PriceSpikePct5m:
+            return None
+        if vol_ratio < self.cfg.VolumeSpikeX5m:
+            return None
+
+        # OI 5m
+        try:
+            oi_rows = fetch_bybit_oi_5m(self.sess, self.cfg, symbol, limit=2)
+            oi_pct = self._oi_increase_pct_last5m(oi_rows)
+        except Exception as e:
+            self.log.debug(f"oi5m fail {symbol}: {e}")
+            oi_pct = None
+
+        if (oi_pct is None) or (oi_pct < self.cfg.OIIncreasePct5m):
+            return None
+
+        # cooldown
         if not self._cooldown_ok(symbol):
             return None
 
-        # OK — формируем сигнал
         sig = {
+            "mode": "signals_5m",
             "symbol": symbol,
-            "price": px_last,
-            "price_change_5m_pct": dprice_pct,
-            "vol5m_usd": last_vol,
-            "vol5m_avg_usd": avg5m,
-            "vol5m_x": (last_vol/avg5m if avg5m>0 else None),
-            "oi_change_5m_pct": oi_chg_pct,
+            "price": last_close,
+            "delta_5m_pct": d5m,
+            "volume_ratio_5m": vol_ratio,
+            "oi_5m_pct": oi_pct,
             "vol24h_usd": vol24h_usd,
             "notional1m_est_usd": approx_1m,
+            "atr2h_pct": atr_like_pct(self.db.history(symbol, max(10, self.cfg.VolWindowMin))),  # контекст
             "ts": now(),
-            "strength": round(min(5.0,
-                                  (abs(dprice_pct)/max(0.1,self.cfg.PriceSpikePct5m)) * 0.7 +
-                                  (last_vol/max(1.0,avg5m))/self.cfg.VolumeSpikeX5m * 0.6 +
-                                  (oi_chg_pct/max(0.1,self.cfg.OIIncreasePct5m)) * 0.5), 2),
-            "mode": "signals_5m"
+            "strength": round(min(5.0, (abs(d5m)/max(0.1,self.cfg.PriceSpikePct5m))*1.0 + (vol_ratio/self.cfg.VolumeSpikeX5m)*0.5 + (oi_pct/self.cfg.OIIncreasePct5m)*0.5, 2), 2),
         }
         self._mark_signalled(symbol)
         return sig
@@ -712,20 +739,21 @@ class Signals5mEngine:
 def format_signal_text(sig: Dict[str, Any]) -> str:
     mode = sig.get("mode","signal").upper()
     if mode == "SIGNALS_5M":
+        atr_txt = f"{sig['atr2h_pct']:.2f}%" if isinstance(sig.get("atr2h_pct"), (float,int)) else "NA"
         return (
             f"🚀 [{mode}] {sig['symbol']}\n"
             f"Price: {sig['price']:.8g}\n"
-            f"Δ5m: {sig['price_change_5m_pct']:+.2f}% | OI5m:+{sig['oi_change_5m_pct']:.2f}%\n"
-            f"Vol5m: ${sig['vol5m_usd']:.0f} (avg ${sig['vol5m_avg_usd']:.0f}, x{sig['vol5m_x']:.2f})\n"
+            f"Δ5m: {sig['delta_5m_pct']:+.2f}% | ATR2h≈{atr_txt}\n"
+            f"OI 5m: {sig['oi_5m_pct']:+.2f}% | Vol(5m)/Avg: ×{sig['volume_ratio_5m']:.2f}\n"
             f"24h Notional≈${sig['vol24h_usd']:.0f} | 1m≈${sig['notional1m_est_usd']:.0f}\n"
             f"Strength: {sig['strength']:.2f}\n"
             f"Time: {sig['ts']}"
         )
-    # fallback для breakout_v0
+    # fallback / старые сигналы
     return (
         f"🚀 [{mode}] {sig['symbol']}\n"
         f"Price: {sig.get('price',0):.8g}\n"
-        f"Δ60s: {sig.get('price_change_60s_pct',0):+.2f}% | ATR2h≈{sig.get('atr2h_pct',0):.2f}%\n"
+        f"Δ60s: {sig.get('price_change_60s_pct',0):+.2f}% | ATR2h≈{sig.get('atr2h_pct','NA')}\n"
         f"24h Notional≈${sig.get('vol24h_usd',0):.0f} | 1m≈${sig.get('notional1m_est_usd',0):.0f}\n"
         f"Strength: {sig.get('strength',0):.2f}\n"
         f"Time: {sig.get('ts','')}"
@@ -771,8 +799,7 @@ class Handler(BaseHTTPRequestHandler):
             self._raw(404, "not found")
     def _activity(self, qs):
         cfg=_GLOBALS["cfg"]; db=_GLOBALS["db"]
-        syms=get_universe(cfg)  # без сессии здесь, чтобы не блокировать
-        limit=int(qs.get("limit",[min(20,len(syms))])[0])
+        syms=get_universe(cfg); limit=int(qs.get("limit",[min(10,len(syms))])[0])
         rows=[]
         for s in syms:
             snap=db.last(s)
@@ -780,14 +807,14 @@ class Handler(BaseHTTPRequestHandler):
                 ts,price,vq,vb=snap
                 act=(vq if vq is not None else (vb*price if (vb is not None and price is not None) else 0.0))
                 rows.append({"symbol":s,"activity":float(act or 0.0),"price":price,"ts":ts,
-                             "note":"24h USD (exchange source)"})
+                             "note":"24h USD (global) if source=coingecko"})
             else:
                 rows.append({"symbol":s,"activity":0.0,"price":None,"ts":None})
         rows.sort(key=lambda r: r["activity"], reverse=True)
         return {"kind":"activity","data":rows[:limit]}
     def _vol(self, qs):
         cfg=_GLOBALS["cfg"]; db=_GLOBALS["db"]
-        syms=get_universe(cfg); limit=int(qs.get("limit",[min(20,len(syms))])[0])
+        syms=get_universe(cfg); limit=int(qs.get("limit",[min(10,len(syms))])[0])
         win=int(qs.get("window_min",[cfg.VolWindowMin])[0]); out=[]
         for s in syms:
             hist=db.history(s,win); vol=realized_vol(hist,win)
@@ -796,7 +823,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"kind":"volatility","window_min":win,"data":out[:limit]}
     def _trend(self, qs):
         cfg=_GLOBALS["cfg"]; db=_GLOBALS["db"]
-        syms=get_universe(cfg); limit=int(qs.get("limit",[min(20,len(syms))])[0])
+        syms=get_universe(cfg); limit=int(qs.get("limit",[min(10,len(syms))])[0])
         win=int(qs.get("window_min",[cfg.TrendWindowMin])[0]); out=[]
         for s in syms:
             hist=db.history(s,win); tr=linear_trend_pct_day(hist,win)
@@ -849,8 +876,8 @@ def ensure_csv_header(path:str, print_only:bool):
 def run_once(cfg:Config, logger:logging.Logger, sess:requests.Session, db:DB):
     ts=now(); STATE["last_cycle_start"]=ts
     ensure_csv_header(cfg.CsvFile, cfg.PrintOnly)
+    syms=get_universe(cfg)
 
-    syms=get_universe(cfg, sess, logger)
     results:Dict[str,Tuple[str,float,Optional[float],Optional[float]]]={}
     errs:Dict[str,str]={}
 
@@ -875,8 +902,7 @@ def run_once(cfg:Config, logger:logging.Logger, sess:requests.Session, db:DB):
         if s in results:
             src,price,vq,vb=results[s]
             logger.info(f"{s}: {price} [{src}] volQ24h={vq} volB24h={vb}")
-            if not cfg.PrintOnly:
-                append_csv(cfg.CsvFile, [ts,s,src,f"{price:.10g}", vq if vq is not None else "", vb if vb is not None else ""], cfg.PrintOnly)
+            append_csv(cfg.CsvFile, [ts,s,src,f"{price:.10g}", vq if vq is not None else "", vb if vb is not None else ""], cfg.PrintOnly)
             db.insert(ts,s,src,price,vq,vb)
             ok+=1
         else:
@@ -894,10 +920,13 @@ def install_signals(logger):
     signal.signal(signal.SIGTERM,_h)
 
 # =======================
-# Telegram bot (optional polling)
+# Telegram menu (optional)
 # =======================
 
-def build_keyboard() -> ReplyKeyboardMarkup:
+def build_keyboard() -> 'ReplyKeyboardMarkup':
+    if not AI_TELEGRAM:
+        return None  # type: ignore
+    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Активность")],
@@ -964,19 +993,23 @@ def tg_build_text_signals() -> str:
         return "Пока сигналов нет."
     lines=["🚀 Последние сигналы:"]
     for sig in data[::-1]:
-        if sig.get("mode") == "signals_5m":
-            lines.append(f"{sig['ts']} | {sig['symbol']} | Δ5m={sig['price_change_5m_pct']:+.2f}% | OI5m=+{sig['oi_change_5m_pct']:.2f}% | xVol={sig.get('vol5m_x',0):.2f}")
+        mode = sig.get("mode","signal").upper()
+        if mode == "SIGNALS_5M":
+            lines.append(f"{sig['ts']} | {sig['symbol']} | Δ5m={sig['delta_5m_pct']:+.2f}% | OI5m={sig['oi_5m_pct']:+.2f}% | str={sig['strength']:.2f}")
         else:
-            lines.append(f"{sig['ts']} | {sig['symbol']} | Δ60s={sig.get('price_change_60s_pct',0):+.2f}%")
+            lines.append(f"{sig['ts']} | {sig['symbol']} | Δ60s={sig.get('price_change_60s_pct',0):+.2f}% | str={sig.get('strength',0):.2f}")
     return "\n".join(lines)
 
 async def telegram_polling_main(cfg: Config, logger: logging.Logger):
     if not AI_TELEGRAM:
-        logger.warning("aiogram не установлен — Telegram меню отключено")
+        logger.warning("aiogram не установлен — Telegram меню отключено (alerts работают через sendMessage)")
         return
     if not cfg.TelegramBotToken:
         logger.warning("TELEGRAM_BOT_TOKEN отсутствует — Telegram меню отключено")
         return
+
+    from aiogram import Bot, Dispatcher, F
+    from aiogram.types import Message
 
     bot = Bot(cfg.TelegramBotToken)
     dp = Dispatcher()
@@ -984,7 +1017,7 @@ async def telegram_polling_main(cfg: Config, logger: logging.Logger):
     try:
         info = await bot.get_webhook_info()
         if getattr(info, "url", ""):
-            logger.warning(f"Telegram webhook is SET: {info.url} — polling не получит апдейты")
+            logger.warning(f"Telegram webhook is SET: {info.url} — при активном вебхуке polling не получит апдейты")
         else:
             logger.info("Telegram webhook: <empty> (ok for polling)")
     except Exception as e:
@@ -994,7 +1027,8 @@ async def telegram_polling_main(cfg: Config, logger: logging.Logger):
     async def start_cmd(msg: Message):
         if cfg.TelegramAllowedChatId and str(msg.chat.id) != str(cfg.TelegramAllowedChatId):
             return
-        await msg.answer("Привет! Выбери режим:", reply_markup=build_keyboard())
+        kb = build_keyboard()
+        await msg.answer("Привет! Выбери режим:", reply_markup=kb)
 
     @dp.message(F.text == "Активность")
     async def on_activity(msg: Message):
@@ -1042,38 +1076,35 @@ def start_workers(cfg: Config, logger: logging.Logger) -> Tuple[threading.Event,
     http_thr = threading.Thread(target=run_http, args=(cfg.HttpPort, http_stop, logger), daemon=True)
     http_thr.start()
 
-    # engines
-    breakout_engine = BreakoutEngineV0(cfg, db, logger, send_alert_fn=lambda s: send_signal_alert(s, logger))
-    signals5m_engine = Signals5mEngine(cfg, db, logger, sess, send_alert_fn=lambda s: send_signal_alert(s, logger))
+    # движки
+    engine_breakout = BreakoutEngineV0(cfg, db, logger, send_alert_fn=lambda s: send_signal_alert(s, logger))
+    engine_5m = Signals5mEngine(cfg, logger, sess, db, send_alert_fn=lambda s: send_signal_alert(s, logger))
 
     def data_loop():
         try:
             while not http_stop.is_set() and not _SHUTDOWN:
-                # 1) Снапшоты цен/24h (минутный цикл)
                 run_once(cfg, logger, sess, db)
 
-                # 2) Сигнальный проход:
+                # включаем сигнал-движок в нужных режимах
                 mode = cfg.Mode.lower()
+                syms = get_universe(cfg)
                 if mode in ("signals_5m", "breakout"):
-                    syms = get_universe(cfg, sess, logger)
-                    if mode == "signals_5m":
-                        eng = signals5m_engine
-                    else:
-                        eng = breakout_engine
                     for s in syms:
                         try:
-                            sig = eng.check_symbol(s)
+                            if mode == "signals_5m":
+                                sig = engine_5m.check_symbol(s)
+                            else:
+                                sig = engine_breakout.check_symbol(s)
                             if sig:
                                 logger.info(f"[signal] {sig}")
                                 with _GLOBALS["signals_lock"]:
                                     _GLOBALS["signals_buffer"].append(sig)
                                     if len(_GLOBALS["signals_buffer"]) > 300:
                                         _GLOBALS["signals_buffer"] = _GLOBALS["signals_buffer"][-300:]
-                                eng.send_alert(sig)
+                                (engine_5m.send_alert if mode=="signals_5m" else engine_breakout.send_alert)(sig)
                         except Exception as e:
                             logger.warning(f"signal error {s}: {e}")
 
-                # sleep до следующего круга
                 sleep_total=max(1, int(cfg.UniverseRefreshMin*60))
                 for _ in range(sleep_total):
                     if http_stop.is_set() or _SHUTDOWN:
@@ -1085,7 +1116,7 @@ def start_workers(cfg: Config, logger: logging.Logger) -> Tuple[threading.Event,
     data_thr = threading.Thread(target=data_loop, daemon=True)
     data_thr.start()
 
-    return http_stop, http_thr, data_thr, sess, db, signals5m_engine
+    return http_stop, http_thr, data_thr, sess, db, engine_5m
 
 # =======================
 # Main
@@ -1094,12 +1125,12 @@ def start_workers(cfg: Config, logger: logging.Logger) -> Tuple[threading.Event,
 def main():
     cfg=parse_args()
     logger=setup_logger(cfg)
-    install_signals(logger)
 
     logger.info(f"CFG: TelegramPolling={cfg.TelegramPolling} | Token={'set' if cfg.TelegramBotToken else 'missing'} | AllowedChatId={cfg.TelegramAllowedChatId} | Mode={cfg.Mode}")
+    install_signals(logger)
     logger.info(f"BUILD {BUILD_TAG} | hosts: bytick={cfg.ByBitRestBase}, bybit={cfg.ByBitRestFallback}, binance={cfg.PriceFallbackBinance}")
 
-    http_stop, http_thr, data_thr, sess, db, engine = start_workers(cfg, logger)
+    http_stop, http_thr, data_thr, sess, db, engine_5m = start_workers(cfg, logger)
 
     if cfg.TelegramPolling and cfg.TelegramBotToken:
         if not AI_TELEGRAM:
@@ -1110,6 +1141,8 @@ def main():
                 asyncio.run(telegram_polling_main(cfg, logger))
             except Exception as e:
                 logger.error(f"Telegram polling error: {e}")
+    else:
+        logger.info(f"Skip TG: polling={cfg.TelegramPolling} token={'set' if cfg.TelegramBotToken else 'missing'} AI_TELEGRAM={AI_TELEGRAM}")
 
     try:
         while not _SHUTDOWN:
