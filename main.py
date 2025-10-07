@@ -1,338 +1,346 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Screener Engine (stable 5m)
+- HTTP: /health, /signals
+- Mode: signals_5m
+- Source: Bybit v5
+- All thresholds/интервалы берём из .env, но движок сам НИЧЕГО не фильтрует
+  (фильтрация/классификация — в push_signals.py). Движок лишь считает метрики.
+
+Зависимости: Flask, requests
+"""
 
 import os
 import time
-import json
 import math
+import json
+import logging
 import threading
-from typing import List, Dict, Any, Optional
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Dict, Any, List, Optional
 
 import requests
+from flask import Flask, jsonify
+
+# -------------------- ENV --------------------
+
+HTTP_PORT           = int(os.getenv("HTTP_PORT", "8080"))
+KLINE_SOURCE        = os.getenv("KLINE_SOURCE", "bybit").lower()  # bybit
+OI_SOURCE           = os.getenv("OI_SOURCE", "bybit").lower()     # bybit
+INTERVAL_MIN        = int(os.getenv("INTERVAL_MIN", "5"))         # 5-мин режим
+WINDOW              = int(os.getenv("WINDOW", "48"))              # глубина окна (48 * 5м ≈ 4ч)
+UNIVERSE_ENV        = os.getenv("UNIVERSE", "").strip()           # пусто => авто по Bybit linear USDT
+POLL_SEC            = int(os.getenv("POLL_SEC", "8"))             # как часто обновлять кеш
+HTTP_TIMEOUT        = float(os.getenv("HTTP_TIMEOUT", "8.0"))     # таймаут HTTP
+ADAPTIVE            = os.getenv("ADAPTIVE", "1") == "1"           # просто флаг для /health
+
+# -------------------- LOG --------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+# -------------------- HTTP -------------------
+
+app = Flask(__name__)
+
+_STATE = {
+    "signals": [],          # кеш последнего расчёта
+    "last_update": 0,       # epoch sec
+    "universe": [],         # список символов
+    "mode": "signals_5m",
+}
+
+# ------------------ Helpers ------------------
+
+BYBIT_BASE = "https://api.bybit.com"
 
 
-# =========================
-# Конфиг из окружения (.env)
-# =========================
-
-def _get_float(key: str, default: float) -> float:
+def _get(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
-        return float(os.getenv(key, str(default)))
-    except Exception:
-        return default
-
-
-def _get_int(key: str, default: int) -> int:
-    try:
-        return int(float(os.getenv(key, str(default))))
-    except Exception:
-        return default
-
-
-MODE                 = os.getenv("MODE", "signals_5m")
-
-# Вселенная
-UNIVERSE_MODE        = os.getenv("UNIVERSE_MODE", "LIST").upper()   # LIST | ALL
-UNIVERSE_LIST        = os.getenv("UNIVERSE_LIST", "")               # CSV тикеров
-UNIVERSE_MAX         = _get_int("UNIVERSE_MAX", 500)
-
-# Адаптивные сигналы (5m)
-ADAPTIVE_SIGNALS     = os.getenv("ADAPTIVE_SIGNALS", "true").lower() == "true"
-BASELINE_5M_WINDOW   = _get_int("BASELINE_5M_WINDOW", 96)     # ~8 часов (96 баров)
-PRICE_Z_5M           = _get_float("PRICE_Z_5M", 1.0)          # z-score порог по цене
-VOL_MULT_MEDIAN_5M   = _get_float("VOL_MULT_MEDIAN_5M", 1.3)  # кратность объёма к медиане
-DEBOUNCE_BARS_5M     = _get_int("DEBOUNCE_BARS_5M", 1)        # антидублирование (минимум баров)
-
-# HTTP/цикл
-HTTP_PORT            = _get_int("HTTP_PORT", 8080)
-SLEEP_SEC            = _get_int("SLEEP_SEC", 60)               # пауза между сканами в секундах
-REQUEST_TIMEOUT      = _get_int("REQUEST_TIMEOUT", 10)
-
-
-# =========================
-# Глобали (память)
-# =========================
-
-_SIGNALS: List[Dict[str, Any]] = []
-_SIGNALS_LOCK = threading.Lock()
-_LAST_SIGNAL_BAR: Dict[str, int] = {}     # symbol -> last 5m bar open time (ms) где мы уже сигналили
-_STOP = threading.Event()
-
-
-def _now_iso() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _median(xs: List[float]) -> float:
-    n = len(xs)
-    if n == 0:
-        return 0.0
-    s = sorted(xs)
-    m = n // 2
-    if n % 2 == 1:
-        return s[m]
-    return 0.5 * (s[m-1] + s[m])
-
-
-def _mean(xs: List[float]) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
-
-
-def _stdev(xs: List[float]) -> float:
-    n = len(xs)
-    if n < 2:
-        return 0.0
-    mu = _mean(xs)
-    var = sum((x - mu) ** 2 for x in xs) / (n - 1)
-    return math.sqrt(max(var, 0.0))
-
-
-# =========================
-# Bybit public API (v5)
-# =========================
-
-BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api.bybit.com")
-
-_session = requests.Session()
-_session.headers.update({"User-Agent": "screener-bybit-clean/1.0"})
-
-
-def bybit_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{BYBIT_BASE}{path}"
-    r = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-
-def fetch_bybit_universe_usdt(maxn: int = 2000) -> List[str]:
-    """
-    Получаем все USDT линейные контракты (perp) из instruments-info.
-    category=linear
-    """
-    try:
-        data = bybit_get("/v5/market/instruments-info", {"category": "linear"})
-        out: List[str] = []
-        for it in data.get("result", {}).get("list", []) or []:
-            # Поля по v5: symbol, quoteCoin, status (Trading/...)
-            sym = (it.get("symbol") or "").upper()
-            q = (it.get("quoteCoin") or "").upper()
-            st = (it.get("status") or "").lower()
-            if not sym or q != "USDT":
-                continue
-            if st != "trading":
-                continue
-            if not sym.endswith("USDT"):
-                continue
-            out.append(sym)
-        out = sorted(set(out))
-        return out[:maxn]
+        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+        if r.ok:
+            return r.json()
     except Exception as e:
-        print(f"{_now_iso()} | WARNING | [bybit] instruments-info fail: {e}")
-        return []
+        logging.warning(f"HTTP GET fail {url}: {e}")
+    return None
 
 
-def bybit_klines_5m(symbol: str, limit: int) -> List[Dict[str, Any]]:
+def _universe_bybit_linear_usdt() -> List[str]:
     """
-    v5 kline:
-      GET /v5/market/kline?category=linear&symbol=BTCUSDT&interval=5&limit=200
-    Ответ: result.list = [[start, open, high, low, close, volume, turnover], ...]
+    Берём все торгуемые линейные (USDT) контракты с Bybit.
     """
-    params = {"category": "linear", "symbol": symbol, "interval": "5", "limit": str(limit)}
-    data = bybit_get("/v5/market/kline", params)
-    arr = data.get("result", {}).get("list", []) or []
-    # Bybit возвращает newest first — убедимся в порядке по времени возрастания
-    # Формат строки: [start, open, high, low, close, volume, turnover]
-    rows = []
-    for row in arr:
+    url = f"{BYBIT_BASE}/v5/market/instruments-info"
+    params = {"category": "linear", "status": "Trading"}
+    j = _get(url, params)
+    out: List[str] = []
+    if j and j.get("retCode") == 0:
+        for it in j["result"]["list"]:
+            # Отфильтруем только USDT линейные
+            if str(it.get("quoteCoin", "")).upper() == "USDT":
+                sym = str(it.get("symbol", "")).upper()
+                if sym:
+                    out.append(sym)
+    logging.info(f"universe(bybit linear USDT): {len(out)} symbols")
+    return sorted(list(set(out)))
+
+
+def _load_universe() -> List[str]:
+    if UNIVERSE_ENV:
+        arr = [s.strip().upper() for s in UNIVERSE_ENV.split(",") if s.strip()]
+        logging.info(f"universe(from .env UNIVERSE): {len(arr)} symbols")
+        return arr
+    return _universe_bybit_linear_usdt()
+
+
+def _kline_bybit(symbol: str, interval_min: int, limit: int) -> Optional[List[Dict[str, Any]]]:
+    """
+    Bybit kline (linear): /v5/market/kline
+    Возвращаем список свечей по времени (возрастающе).
+    """
+    url = f"{BYBIT_BASE}/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": str(interval_min),  # '5'
+        "limit": str(limit),
+    }
+    j = _get(url, params)
+    if not (j and j.get("retCode") == 0 and j.get("result", {}).get("list")):
+        return None
+    # Bybit отдаёт в обратном порядке (последняя вперёд); перевернём:
+    rows = j["result"]["list"][::-1]
+
+    out = []
+    # row: [startMs, open, high, low, close, volume(base), turnover(quote)]
+    for row in rows:
         try:
-            rows.append({
-                "ts": int(row[0]),          # ms
+            out.append({
+                "start_ms": int(row[0]),
                 "open": float(row[1]),
                 "high": float(row[2]),
                 "low": float(row[3]),
                 "close": float(row[4]),
-                "volume": float(row[5]),    # базовый объём (контракты/монеты)
-                "turnover": float(row[6]) if len(row) > 6 and row[6] is not None else None,
+                "volume_base": float(row[5]),
+                "turnover_quote": float(row[6]),  # в USDT
             })
         except Exception:
-            continue
-    rows.sort(key=lambda x: x["ts"])
-    return rows
-
-
-def bybit_ticker_24h(symbol: str) -> Dict[str, Any]:
-    """
-    v5 tickers:
-      GET /v5/market/tickers?category=linear&symbol=BTCUSDT
-    Важно: quoteVolume в v5 может называться turnover24h (в USDT).
-    """
-    params = {"category": "linear", "symbol": symbol}
-    data = bybit_get("/v5/market/tickers", params)
-    lst = data.get("result", {}).get("list", []) or []
-    return lst[0] if lst else {}
-
-
-# =========================
-# Вселенная
-# =========================
-
-def get_universe() -> List[str]:
-    if UNIVERSE_MODE == "LIST" and UNIVERSE_LIST.strip():
-        raw = [x.strip().upper() for x in UNIVERSE_LIST.replace(";", ",").split(",") if x.strip()]
-        uniq: List[str] = []
-        for s in raw:
-            s2 = s if s.endswith("USDT") else (s + "USDT")
-            if s2 not in uniq:
-                uniq.append(s2)
-        return uniq
-    # иначе — притягиваем все USDT с Bybit и режем по UNIVERSE_MAX
-    return fetch_bybit_universe_usdt(maxn=UNIVERSE_MAX)
-
-
-# =========================
-# Логика сигналов (адаптивная)
-# =========================
-
-def check_symbol(symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Сигнал, если И цена (zprice) >= PRICE_Z_5M, И объём (vol_mult) >= VOL_MULT_MEDIAN_5M.
-    """
-    try:
-        win = max(30, BASELINE_5M_WINDOW)  # чуть больше запаса
-        kl = bybit_klines_5m(symbol, limit=win)
-        if len(kl) < BASELINE_5M_WINDOW:
-            print(f"{_now_iso()} | INFO | [sigskip] {symbol}: klines<window")
             return None
+    return out
 
-        sample = kl[-BASELINE_5M_WINDOW:]
-        closes = [x["close"] for x in sample]
-        vols = [x["volume"] for x in sample]
 
-        mu = _mean(closes)
-        sd = _stdev(closes)
-        vmed = _median(vols)
+def _tickers24h_bybit(symbols: List[str]) -> Dict[str, float]:
+    """
+    Вернём словарь symbol -> vol24h_usd (turnover24h).
+    /v5/market/tickers?category=linear
+    """
+    url = f"{BYBIT_BASE}/v5/market/tickers"
+    params = {"category": "linear"}
+    j = _get(url, params)
+    out: Dict[str, float] = {}
+    if j and j.get("retCode") == 0 and j.get("result", {}).get("list"):
+        for it in j["result"]["list"]:
+            sym = str(it.get("symbol", "")).upper()
+            if sym in symbols:
+                try:
+                    out[sym] = float(it.get("turnover24h") or 0.0)
+                except Exception:
+                    out[sym] = 0.0
+    return out
 
-        last = sample[-1]
-        last_ts = last["ts"]
-        # антидублирование: не сигналим дважды на один и тот же бар
-        if DEBOUNCE_BARS_5M > 0:
-            last_seen = _LAST_SIGNAL_BAR.get(symbol)
-            if last_seen is not None and last_seen >= last_ts:
-                return None
 
-        zprice = (last["close"] - mu) / sd if sd > 0 else 0.0
-        vol_mult = (last["volume"] / vmed) if vmed > 0 else 0.0
-
-        if zprice < PRICE_Z_5M:
-            print(f"{_now_iso()} | INFO | [sigskip] {symbol}: price_spike<threshold")
-            return None
-        if vol_mult < VOL_MULT_MEDIAN_5M:
-            print(f"{_now_iso()} | INFO | [sigskip] {symbol}: volume_spike<threshold")
-            return None
-
-        # справка 24h (по возможности)
+def _oi_series_bybit(symbol: str, interval_min: int, limit: int) -> Optional[List[float]]:
+    """
+    Вернём ряд Open Interest (значения, возрастающая временная ось).
+    /v5/market/open-interest?category=linear&symbol=BTCUSDT&interval=5&limit=xx
+    """
+    url = f"{BYBIT_BASE}/v5/market/open-interest"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": str(interval_min),
+        "limit": str(limit),
+    }
+    j = _get(url, params)
+    if not (j and j.get("retCode") == 0 and j.get("result", {}).get("list")):
+        return None
+    rows = j["result"]["list"][::-1]  # в возрастающий порядок
+    out = []
+    for row in rows:
         try:
-            t24 = bybit_ticker_24h(symbol)
-            # в v5 linear turnover24h — суммарный оборот в quote (USDT)
-            vol24h_quote = float(t24.get("turnover24h") or 0.0)
+            # row: {'openInterest': 'xxxx', 'timestamp': 'ms'}
+            out.append(float(row.get("openInterest") or 0.0))
         except Exception:
-            vol24h_quote = 0.0
+            return None
+    return out
 
-        sig = {
-            "ts": _now_iso(),
-            "symbol": symbol,
-            "close": last["close"],
-            "zprice": round(zprice, 3),
-            "vol_mult": round(vol_mult, 2),
-            "vol24h_usd": round(vol24h_quote, 0),
-            "bar_ts": last_ts
-        }
-        _LAST_SIGNAL_BAR[symbol] = last_ts
-        return sig
 
-    except Exception as e:
-        print(f"{_now_iso()} | WARNING | [sigerr] {symbol}: {e}")
+def _mean_std(vals: List[float]) -> (float, float):
+    n = len(vals)
+    if n == 0:
+        return 0.0, 0.0
+    m = sum(vals) / n
+    var = sum((x - m) ** 2 for x in vals) / max(1, (n - 1))
+    return m, math.sqrt(var)
+
+
+def _zscore(curr: float, hist: List[float]) -> Optional[float]:
+    """
+    Z = (curr - mean(hist)) / std(hist), если std>0 и гист длиной >= 5.
+    """
+    if len(hist) < 5:
+        return None
+    m, s = _mean_std(hist)
+    if s <= 0:
+        return None
+    return (curr - m) / s
+
+
+def _calc_metrics_for_symbol(sym: str, interval_min: int, window: int,
+                             vol24h_map: Dict[str, float]) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает одну запись для /signals:
+    {
+      "ts": "YYYY-mm-dd HH:MM:SS",
+      "symbol": "BTCUSDT",
+      "close": 61234.5,
+      "zprice": 2.31,
+      "vol_mult": 1.87,
+      "vol24h_usd": 123456789.0,
+      "bar_ts": 1759812000000,
+      "oi_z": 0.91 | None
+    }
+    """
+    kl = _kline_bybit(sym, interval_min, limit=window + 1)
+    if not kl or len(kl) < (window + 1):
         return None
 
+    # Берём последнюю свечу как "текущую"
+    curr = kl[-1]
+    hist = kl[:-1]  # окно истории без текущей
 
-# =========================
-# HTTP
-# =========================
+    # Цена и Z по цене
+    close = float(curr["close"])
+    close_hist = [float(x["close"]) for x in hist]
+    zprice = _zscore(close, close_hist)
 
-class Handler(BaseHTTPRequestHandler):
-    def _json(self, obj, code=200):
-        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+    # Объёмы: turnover(quote)
+    turn_curr = float(curr["turnover_quote"])
+    turn_hist = [float(x["turnover_quote"]) for x in hist]
+    mean_turn, _ = _mean_std(turn_hist)
+    vol_mult = (turn_curr / mean_turn) if mean_turn > 0 else None
 
-    def do_GET(self):
-        if self.path.startswith("/health"):
-            self._json({
-                "status": "ok",
-                "mode": MODE,
-                "adaptive": ADAPTIVE_SIGNALS,
-                "port": HTTP_PORT
-            })
-            return
-        if self.path.startswith("/signals"):
-            with _SIGNALS_LOCK:
-                data = list(_SIGNALS)
-            self._json({"kind": "signals", "count": len(data), "data": data})
-            return
-        self._json({"error": "not found"}, 404)
+    # vol24h_usd
+    vol24h = float(vol24h_map.get(sym, 0.0))
+
+    # ts / bar_ts
+    bar_ts = int(curr["start_ms"])
+    ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(bar_ts // 1000))
+
+    # OI z-score
+    oi_z: Optional[float] = None
+    if OI_SOURCE == "bybit":
+        oi_series = _oi_series_bybit(sym, interval_min, window + 1)
+        if oi_series and len(oi_series) >= (window + 1):
+            oi_hist = oi_series[:-1]
+            oi_curr = float(oi_series[-1])
+            oi_z = _zscore(oi_curr, oi_hist)
+
+    return {
+        "ts": ts_str,
+        "symbol": sym,
+        "close": close,
+        "zprice": round(zprice, 3) if zprice is not None else None,
+        "vol_mult": round(vol_mult, 2) if vol_mult is not None else None,
+        "vol24h_usd": vol24h,
+        "bar_ts": bar_ts,
+        "oi_z": round(oi_z, 2) if oi_z is not None else None,
+    }
 
 
-def _http_thread():
-    srv = HTTPServer(("0.0.0.0", HTTP_PORT), Handler)
-    print(f"{_now_iso()} | INFO | HTTP on :{HTTP_PORT} (/health /signals)")
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
+def _rebuild_signals():
+    """
+    Переcчитывает кешированный список сигналов.
+    НИЧЕГО не фильтруем по порогам — это делает push_signals.py.
+    """
+    start = time.time()
+    universe = _STATE["universe"]
+    if not universe:
+        return
+
+    # 24h обороты одной пачкой
+    vol24h_map = _tickers24h_bybit(universe)
+
+    res: List[Dict[str, Any]] = []
+    n = 0
+    for sym in universe:
+        m = _calc_metrics_for_symbol(sym, INTERVAL_MIN, WINDOW, vol24h_map)
+        if m:
+            res.append(m)
+        n += 1
+        # Небольшой троттлинг, чтобы не убить API
+        if n % 10 == 0:
+            time.sleep(0.2)
+
+    _STATE["signals"] = res
+    _STATE["last_update"] = int(time.time())
+
+    took = time.time() - start
+    logging.info(f"signals rebuilt: {len(res)} rows in {took:.1f}s (universe={len(universe)})")
 
 
-# =========================
-# Главный цикл
-# =========================
+def _worker_loop():
+    while True:
+        try:
+            _rebuild_signals()
+        except Exception as e:
+            logging.exception(f"rebuild error: {e}")
+        time.sleep(max(2, POLL_SEC))
 
-def main_loop():
-    syms = get_universe()
-    print(f"{_now_iso()} | INFO | [universe] n={len(syms)} mode={UNIVERSE_MODE}")
 
-    while not _STOP.is_set():
-        t0 = time.time()
-        fired = 0
-        print(f"{_now_iso()} | INFO | [sigpulse] scan start n={len(syms)}")
+# -------------------- HTTP API --------------------
 
-        for s in syms:
-            sig = check_symbol(s)
-            if sig:
-                print(f"{_now_iso()} | INFO | [signal] {sig}")
-                with _SIGNALS_LOCK:
-                    _SIGNALS.append(sig)
-                    if len(_SIGNALS) > 200:
-                        del _SIGNALS[:-200]
-                fired += 1
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "mode": _STATE["mode"],
+        "adaptive": ADAPTIVE,
+        "port": HTTP_PORT,
+        "last_update": _STATE["last_update"],
+        "universe": len(_STATE["universe"]),
+        "interval_min": INTERVAL_MIN,
+        "window": WINDOW,
+        "source": {"kline": KLINE_SOURCE, "oi": OI_SOURCE},
+    })
 
-        dt = time.time() - t0
-        print(f"{_now_iso()} | INFO | [sigpulse] scan end fired={fired} dt={dt:.1f}s")
-        time.sleep(max(1, SLEEP_SEC))
 
+@app.route("/signals", methods=["GET"])
+def signals():
+    # Отдаём КЕШ — чтобы /signals был быстрым и стабильным.
+    return jsonify({
+        "data": _STATE["signals"],
+        "count": len(_STATE["signals"]),
+        "last_update": _STATE["last_update"],
+        "interval_min": INTERVAL_MIN,
+        "window": WINDOW,
+    })
+
+
+# -------------------- Entry -----------------------
 
 def main():
-    if MODE.lower() != "signals_5m":
-        print(f"{_now_iso()} | WARNING | MODE={MODE} — в этом билде доступен только signals_5m")
+    # 1) поднимем вселенную
+    _STATE["universe"] = _load_universe()
 
-    th = threading.Thread(target=_http_thread, daemon=True)
-    th.start()
+    # 2) старт воркера
+    t = threading.Thread(target=_worker_loop, daemon=True)
+    t.start()
 
-    try:
-        main_loop()
-    except KeyboardInterrupt:
-        pass
+    # 3) HTTP
+    app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
