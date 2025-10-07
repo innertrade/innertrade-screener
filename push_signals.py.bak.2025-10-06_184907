@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+InnerTrade – Push Signals Forwarder (clean version)
+"""
+import os, sys, time, logging
+from typing import Dict, Any, Optional, List
+import requests
+
+def send(sig, side, oi_z):
+    import os, requests
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat  = os.getenv("TELEGRAM_CHAT_ID")
+    if not (token and chat):
+        return
+    sym = str(sig.get("symbol","")).upper()
+    z   = float(sig.get("zprice") or 0.0)
+    vol = float(sig.get("vol_mult") or 0.0)
+    v24 = float(sig.get("vol24h_usd") or 0.0)
+    px  = sig.get("close")
+    arrow = "UP" if z >= 0 else "DOWN"
+    titles = {
+        "pre_long":        f"{arrow} {sym} (PRE-LONG)",
+        "pre_short":       f"{arrow} {sym} (PRE-SHORT)",
+        "long_confirmed":  f"OK {arrow} {sym} (LONG CONFIRMED)",
+        "short_confirmed": f"OK {arrow} {sym} (SHORT CONFIRMED)",
+    }
+    title = titles.get(side, f"{arrow} {sym}")
+    oi_line = "Awaiting OI confirmation" if str(side).startswith("pre_") else (
+        f"OI z={oi_z:+.2f}σ" if isinstance(oi_z,(int,float)) else ""
+    )
+    lines = [title, f"Price dZ={abs(z):+.2f}σ", f"Volume x{vol:.2f}"]
+    if oi_line: lines.append(oi_line)
+    lines.append(f"24h Volume ~= ${v24:,.0f}")
+    if px is not None: lines.append(f"Last price: {px}")
+    text = "\n".join(lines)
+    url  = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {"chat_id": chat, "text": text}
+    try:
+        requests.post(url, json=data, timeout=10)
+    except Exception:
+        pass
+
+ENGINE_URL = os.getenv("ENGINE_URL", "http://127.0.0.1:8080/signals")
+POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "8"))
+MIN_Z = float(os.getenv("MIN_Z", "1.8"))
+MIN_VOL_X = float(os.getenv("MIN_VOL_X", "1.6"))
+MIN_V24_USD = float(os.getenv("MIN_V24_USD", "20000000"))
+MIN_OI_Z = float(os.getenv("MIN_OI_Z", "0.8"))
+SYMBOL_COOLDOWN = int(os.getenv("SYMBOL_COOLDOWN", "120"))
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("forwarder")
+_last_sent: Dict[str, float] = {}
+
+def _fmt_money(v: float) -> str:
+    try: return f"${v:,.0f}"
+    except Exception: return f"${v:.0f}"
+
+def _fetch_engine() -> List[Dict[str, Any]]:
+    r = requests.get(ENGINE_URL, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    arr = data.get("data") or []
+    return arr if isinstance(arr, list) else []
+
+def classify(zprice: float, volx: float, v24: float, oi_z: Optional[float]) -> str:
+    try:
+        z = float(zprice); volx = float(volx); v24 = float(v24)
+    except Exception:
+        return "skip"
+    if abs(z) < MIN_Z or volx < MIN_VOL_X or v24 < MIN_V24_USD:
+        return "skip"
+    side = "long" if z >= 0 else "short"
+    if oi_z is None:
+        return f"pre_{side}"
+    try:
+        oz = float(oi_z)
+    except Exception:
+        return f"pre_{side}"
+    if abs(oz) >= MIN_OI_Z and ((oz >= 0 and z >= 0) or (oz <= 0 and z <= 0)):
+        return f"{side}_confirmed"
+    return f"pre_{side}"
+
+def make_kb(symbol: str):
+    try:
+        sym = symbol.upper()
+        return {"inline_keyboard":[[
+            {"text":"TradingView","url":f"https://www.tradingview.com/chart/?symbol=BYBIT:{sym}"},
+            {"text":"Bybit","url":f"https://www.bybit.com/en/trade/spot/{sym}"}
+        ]]}
+    except Exception:
+        return {}
+
+def send(sig: Dict[str, Any], side: str, oi_z: Optional[float]) -> None:
+    if not (TG_TOKEN and TG_CHAT):
+        log.warning("TELEGRAM creds missing – skip send()")
+        return
+    sym = str(sig.get("symbol","")).upper()
+    z = float(sig.get("zprice") or 0.0)
+    volx = float(sig.get("vol_mult") or 0.0)
+    v24 = float(sig.get("vol24h_usd") or 0.0)
+    px = sig.get("close")
+    arrow = "⬆️" if z >= 0 else "⬇️"
+    titles = {
+        "pre_long":        f"{arrow} {sym} (PRE-LONG)",
+        "pre_short":       f"{arrow} {sym} (PRE-SHORT)",
+        "long_confirmed":  f"✅ {arrow} {sym} (LONG CONFIRMED)",
+        "short_confirmed": f"✅ {arrow} {sym} (SHORT CONFIRMED)",
+    }
+    title = titles.get(side, f"{arrow} {sym}")
+    lines = []
+    lines.append(title)
+    lines.append(("🟢" if z >= 0 else "🔴") + f" Price Δ={abs(z):+.2f}σ")
+    lines.append(f"🟢 Volume ×{volx:.2f}")
+    lines.append(f"24h Volume ≈ {_fmt_money(v24)}")
+    if px is not None: lines.append(f"Last price: {px}")
+    if oi_z is not None: lines.append(f"Open Interest z={oi_z:+.2f}")
+    text = "\n".join(lines)
+    data = {"chat_id": TG_CHAT, "text": text}
+    kb = make_kb(sym)
+    if kb: data["reply_markup"] = kb
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    try: requests.post(url, json=data, timeout=10)
+    except Exception as e: log.error("send() failed: %s", e)
+
+def _cooldown_ok(key: str) -> bool:
+    now = time.time()
+    ts = _last_sent.get(key, 0)
+    if now - ts >= SYMBOL_COOLDOWN:
+        _last_sent[key] = now
+        return True
+    return False
+
+def loop() -> None:
+    log.info("forwarder start | host=%s Z>=%s Vx>=%s v24h>=%s | OI optional z>=%s",
+             ENGINE_URL, MIN_Z, MIN_VOL_X, f"{MIN_V24_USD:,.0f}", MIN_OI_Z)
+    while True:
+        try:
+            for sig in _fetch_engine():
+                try:
+                    sym = str(sig.get("symbol","")).upper()
+                    z = float(sig.get("zprice") or 0.0)
+                    volx = float(sig.get("vol_mult") or 0.0)
+                    v24 = float(sig.get("vol24h_usd") or 0.0)
+                    oi_z = sig.get("oi_z")
+                    oi_z = None if oi_z in (None,"","null") else float(oi_z)
+                except Exception:
+                    continue
+                res = classify(z, volx, v24, oi_z)
+                if res == "skip": continue
+                key = f"{sym}:{res}"
+                if not _cooldown_ok(key): continue
+                send(sig, res, oi_z)
+            time.sleep(POLL_INTERVAL_SEC)
+        except KeyboardInterrupt:
+            log.info("stopped by user"); break
+        except Exception as e:
+            log.error("forward err: %s", e); time.sleep(POLL_INTERVAL_SEC)
+
+if __name__ == "__main__":
+    loop()

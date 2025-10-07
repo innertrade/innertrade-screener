@@ -1,169 +1,155 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+InnerTrade – Push Signals Forwarder (real OI logic)
+"""
 
-import os
-import time
-import json
-import logging
-import requests
+import os, time, logging, requests
+from typing import Dict, Any, Optional, List
 
-# ---------- Конфигурация из ENV (с дефолтами для локального запуска) ----------
-HOST                = os.getenv("HOST", "http://127.0.0.1:8080")  # где крутится /signals
-ENGINE_URL          = f"{HOST.rstrip('/')}/signals"
+ENGINE_URL = os.getenv("ENGINE_URL", "http://127.0.0.1:8080/signals")
+POLL_SEC   = int(os.getenv("POLL_SEC", "8"))
 
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+# --- Thresholds ---
+Z_MIN   = 1.8
+VX_MIN  = 1.6
+V24_MIN = 20_000_000  # $20M
+OI_MIN = 0.05
 
-FORWARD_MIN_Z       = float(os.getenv("FORWARD_MIN_Z", "1.8"))
-FORWARD_MIN_VOLX    = float(os.getenv("FORWARD_MIN_VOLX", "1.6"))
-FORWARD_MIN_VOL24H  = float(os.getenv("FORWARD_MIN_VOL24H", "20000000"))
-FORWARD_MIN_OIZ     = float(os.getenv("FORWARD_MIN_OIZ", "0.8"))
-FORWARD_POLL_SEC    = int(os.getenv("FORWARD_POLL_SEC", "8"))
-
-# Жёсткая «якорная» анти-дубль логика: одна отправка на символ в рамках 5-мин свечи
-# (используем bar_ts из движка; 5 минут = 300000 мс)
-FIVE_MIN_MS = 300_000
-_last_sent_candle_by_symbol = {}  # sym -> candle_id (bar_ts // 300000)
-
-# ---------- Логирование ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%H:%M:%S"
 )
 
-# ---------- Telegram ----------
-def tg_send_text(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("No TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID; skip send")
-        return False
+def ok_long(sig: Dict[str, Any]) -> bool:
+    """Basic long filter"""
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }, timeout=10)
-        return resp.ok
-    except Exception as e:
-        logging.error(f"tg_send_text error: {e}")
-        return False
-
-# ---------- Форматирование сообщений ----------
-def human_money(n: float) -> str:
-    try:
-        if n >= 1e9:  return f"${n/1e9:.1f}B"
-        if n >= 1e6:  return f"${n/1e6:.1f}M"
-        if n >= 1e3:  return f"${n/1e3:.1f}K"
-        return f"${n:.0f}"
+        z   = float(sig.get("zprice") or 0.0)
+        vx  = float(sig.get("vol_mult") or 0.0)
+        v24 = float(sig.get("vol24h_usd") or 0.0)
+        return (z >= Z_MIN) and (vx >= VX_MIN) and (v24 >= V24_MIN)
     except Exception:
-        return f"${n}"
+        return False
 
-def classify(sig) -> tuple[str, str]:
-    """
-    Возвращает (direction, level)
-      direction: 'LONG' | 'SHORT'
-      level: 'PRE' | 'CONFIRMED'
-    """
-    z = float(sig.get("zprice") or 0.0)
-    oi_z = sig.get("oi_z", None)
-    direction = "LONG" if z >= 0 else "SHORT"
-    level = "PRE"
+def is_confirmed(sig: Dict[str, Any]) -> bool:
+    """OI confirmation only if oi_z exists and >= OI_MIN"""
+    try:
+        return float(sig.get("oi_z") or 0.0) >= OI_MIN
+    except Exception:
+        return False
+
+def send(sig: Dict[str, Any], side: str, oi_z: Optional[float]) -> None:
+    import os, requests, time, logging, time, logging, logging
+    token = os.getenv("TELEGRAM_BOT_TOKEN"); chat = os.getenv("TELEGRAM_CHAT_ID")
+    if not (token and chat):
+        logging.warning("send(): TELEGRAM env missing"); return
+    sym = str(sig.get("symbol","")).upper()
+    z   = float(sig.get("zprice") or 0.0)
+    vol = float(sig.get("vol_mult") or 0.0)
+    v24 = float(sig.get("vol24h_usd") or 0.0)
+    px  = sig.get("close")
+    arrow = "⬆️" if z >= 0 else "⬇️"
+
+    # заголовок по статусу
+    titles = {
+        "pre_long":        f"{arrow} {sym}  (PRE-LONG)",
+        "pre_short":       f"{arrow} {sym}  (PRE-SHORT)",
+        "long_confirmed":  f"✅ {arrow} {sym}  (LONG CONFIRMED)",
+        "short_confirmed": f"✅ {arrow} {sym}  (SHORT CONFIRMED)",
+    }
+    title = titles.get(side, f"{arrow} {sym}")
+
+    # строка про OI (если есть)
+    oi_line = ""
     if oi_z is not None:
         try:
-            if float(oi_z) >= FORWARD_MIN_OIZ:
-                level = "CONFIRMED"
+            oi_line = "OI z-score: {:+.2f}\n".format(float(oi_z))
         except Exception:
             pass
-    return direction, level
+    text = (
+        f"{title}\n"
+        f"{'🟢' if z>=0 else '🔴'} Price Δ = {abs(z):.2f}σ\n"
+        f"🟢 Volume ×{vol:.2f}\n"
+        f"{oi_line}"
+        f"24h Volume ≈ ${v24:,.0f}\n"
+        f"Last price: {px}"
+    )
+    tv_sym = sym.replace("USDT","USDT.P")  # часто так для perp; скорректируем по месту, если что
+    tv_url = f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{tv_sym}"
+    bybit_fut_url = f"https://www.bybit.com/trade/usdt/{sym}"  # страница фьючерсного контракта (USDT Perp)
 
-def format_message(sig) -> str:
-    sym = str(sig.get("symbol","")).upper()
-    z = float(sig.get("zprice") or 0.0)
-    vx = float(sig.get("vol_mult") or 0.0)
-    v24 = float(sig.get("vol24h_usd") or 0.0)
-    oi_z = sig.get("oi_z", None)
-    direction, level = classify(sig)
+    kb = {
+        "inline_keyboard": [[
+            {"text":"TradingView","url": tv_url},
+            {"text":"Bybit Futures","url": bybit_fut_url}
+        ]]
+    }
 
-    arrow = "⬆️" if direction == "LONG" else "⬇️"
-    preface = f"{arrow} <b>{sym}</b>  ({'PRE-' if level=='PRE' else ''}{direction if level=='PRE' else direction+' CONFIRMED'})"
-
-    lines = [
-        preface,
-        f"{'🟢' if z>=0 else '🔴'} Price Δ={z:+.2f}σ",
-        f"🟢 Volume ×{vx:.2f}",
-    ]
-    if level == "CONFIRMED":
-        lines.append(f"{'🟢' if oi_z and oi_z>=0 else '🔴'} OI Δ={float(oi_z):+.2f}σ")
-    else:
-        lines.append("⏳ Awaiting OI confirmation")
-    lines.append(f"24h Volume ≈ {human_money(v24)}")
-    return "\n".join(lines)
-
-# ---------- Фильтрация по жёстким порогам ----------
-def pass_thresholds(sig) -> bool:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {"chat_id": chat, "text": text, "reply_markup": kb, "disable_web_page_preview": True}
     try:
-        z = float(sig.get("zprice") or 0.0)
-        vx = float(sig.get("vol_mult") or 0.0)
-        v24 = float(sig.get("vol24h_usd") or 0.0)
-        if abs(z) < FORWARD_MIN_Z:        return False
-        if vx < FORWARD_MIN_VOLX:         return False
-        if v24 < FORWARD_MIN_VOL24H:      return False
-        return True
-    except Exception:
-        return False
+        requests.post(url, json=data, timeout=10)
+        logging.info(f"sent to TG | {sym} | {side} | z={z:.2f} volx={vol:.2f} oi_z={oi_z}")
+    except Exception as e:
+        logging.error(f"send(): telegram post error: {e}")
 
-# ---------- Анти-дубль на уровне свечи (жёсткая норма работы) ----------
-def not_sent_this_candle(sig) -> bool:
-    sym = str(sig.get("symbol","")).upper()
-    bts = int(sig.get("bar_ts") or 0)
-    if bts <= 0:
-        # без бар-таймстампа мы не знаем свечу — считаем, что нельзя
-        return False
-    cid = bts // FIVE_MIN_MS
-    last = _last_sent_candle_by_symbol.get(sym)
-    if last == cid:
-        return False
-    _last_sent_candle_by_symbol[sym] = cid
-    return True
 
-# ---------- Основной цикл ----------
 def poll_once():
     try:
-        resp = requests.get(ENGINE_URL, timeout=10)
-        data = resp.json().get("data", []) if resp.ok else []
+        r = requests.get(ENGINE_URL, timeout=10)
+        r.raise_for_status()
+        data = r.json().get("data", [])
     except Exception as e:
-        logging.error(f"poll error: {e}")
+        logging.error(f"engine error: {e}")
         return
 
-    sent = 0
     for sig in data:
-        if not pass_thresholds(sig):
-            continue
-        if not not_sent_this_candle(sig):
-            continue
-        text = format_message(sig)
-        ok = tg_send_text(text)
-        if ok:
-            sym = str(sig.get("symbol","")).upper()
-            z   = float(sig.get("zprice") or 0.0)
-            vx  = float(sig.get("vol_mult") or 0.0)
-            oi_z= sig.get("oi_z", None)
-            logging.info(f"sent to TG | {sym} | "
-                         f"{'pre_' if 'Awaiting' in text else ''}{'long' if z>=0 else 'short'} | "
-                         f"z={z:.2f} volx={vx:.2f} oi_z={oi_z}")
-            sent += 1
-
-    if sent == 0:
-        logging.info("no matches this tick")
+        try:
+            if not ok_long(sig):
+                continue
+            side = "long_confirmed" if is_confirmed(sig) else "pre_long"
+            send(sig, side, sig.get("oi_z"))
+        except Exception as e:
+            logging.error(f"forward err: {e}")
 
 def main():
-    logging.info(f"forwarder start | host={ENGINE_URL} "
-                 f"thresholds: |z|≥{FORWARD_MIN_Z}, vx≥{FORWARD_MIN_VOLX}, v24≥{FORWARD_MIN_VOL24H:,}, oi≥{FORWARD_MIN_OIZ}")
+    logging.info(
+        f"forwarder start | host={ENGINE_URL} "
+        f"thresholds: z≥{Z_MIN}, vx≥{VX_MIN}, v24≥{V24_MIN:,}, oi≥{OI_MIN}"
+    )
     while True:
         poll_once()
-        time.sleep(FORWARD_POLL_SEC)
+        time.sleep(POLL_SEC)
 
 if __name__ == "__main__":
     main()
+
+OK_Z = 1.8
+OK_VOLX = 1.6
+OK_V24 = 20_000_000
+
+# --- rate limit wrapper ---
+# Не слать по одной монете чаще, чем раз в MIN_INTERVAL_SEC (по умолчанию 120с)
+import os, time, logging  # на случай, если выше не импортнули
+LAST_SENT = {}
+try:
+    MIN_INTERVAL = int(os.getenv("MIN_INTERVAL_SEC", "120"))
+except Exception:
+    MIN_INTERVAL = 120
+
+_send_impl = send
+def send(sig: Dict[str, Any], side: str, oi_z: Optional[float]) -> None:
+    sym = str(sig.get("symbol","")).upper()
+    now = time.time()
+    last = LAST_SENT.get(sym, 0)
+    if now - last < MIN_INTERVAL:
+        try:
+            left = int(MIN_INTERVAL - (now - last))
+        except Exception:
+            left = MIN_INTERVAL
+        logging.info(f"skip (cooldown {left}s) {sym}")
+        return
+    LAST_SENT[sym] = now
+    _send_impl(sig, side, oi_z)
+# --- end rate limit wrapper ---

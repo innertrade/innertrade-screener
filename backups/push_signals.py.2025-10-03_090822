@@ -1,0 +1,143 @@
+import os, time, json, requests
+from datetime import datetime
+
+HOST      = os.getenv("HOST", "http://127.0.0.1:8080")
+TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT   = os.getenv("TELEGRAM_CHAT_ID")
+
+# Пороги
+MIN_Z        = float(os.getenv("FORWARD_MIN_Z",       "2.0"))
+MIN_VOLX     = float(os.getenv("FORWARD_MIN_VOLX",    "1.8"))
+MIN_OI_Z     = float(os.getenv("FORWARD_MIN_OIZ",     "1.0"))
+MIN_VOL24H   = float(os.getenv("FORWARD_MIN_VOL24H",  "10000000"))
+POLL_SEC     = int(os.getenv("FORWARD_POLL_SEC",      "8"))
+
+# OI окно/интервал
+OI_WINDOW    = int(os.getenv("FORWARD_OI_WINDOW",     "48"))
+OI_INTERVAL  = os.getenv("FORWARD_OI_INTERVAL",       "5min")
+
+# Таймауты/ретраи
+TIMEOUT_CONNECT = int(float(os.getenv("FORWARD_TIMEOUT_CONNECT","5")))
+TIMEOUT_READ    = int(float(os.getenv("FORWARD_TIMEOUT_READ","30")))
+MAX_RETRIES     = int(float(os.getenv("FORWARD_MAX_RETRIES","3")))
+RETRY_SLEEP_SEC = float(os.getenv("FORWARD_RETRY_SLEEP","1.0"))
+
+s    = requests.Session()
+seen = set()
+
+def fmt_money(x):
+    try:
+        v = float(x or 0)
+        if v >= 1_000_000_000: return f"${v/1_000_000_000:.1f}B"
+        if v >= 1_000_000:     return f"${v/1_000_000:.1f}M"
+        if v >= 1_000:         return f"${v/1_000:.1f}K"
+        return f"${v:.0f}"
+    except Exception:
+        return str(x)
+
+def build_markup(sym: str):
+    url_tv    = f"https://www.tradingview.com/chart/?symbol=BYBIT:{sym}.P&interval=5"
+    bybit_web = f"https://www.bybit.com/trade/usdt/{sym}"
+    return {"inline_keyboard":[
+        [{"text":"↗️ Open on Bybit","url":bybit_web},
+         {"text":"↗️ TradingView", "url":url_tv}]
+    ]}
+
+def pull_signals_json():
+    last = None
+    for _ in range(MAX_RETRIES):
+        try:
+            r = s.get(f"{HOST}/signals", timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(RETRY_SLEEP_SEC)
+    raise RuntimeError(f"/signals retries exceeded: {last}")
+
+def fetch_oi_z(sym: str):
+    try:
+        r = s.get(
+            "https://api.bybit.com/v5/market/open-interest",
+            params={"category":"linear","symbol":sym,"interval":OI_INTERVAL},
+            timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
+        )
+        j = r.json()
+        arr = (j.get("result",{}) or {}).get("list",[]) or []
+        vals = []
+        for it in arr:
+            v = it.get("openInterest") or it.get("openInterestValue")
+            if v is None: continue
+            try: vals.append(float(v))
+            except: pass
+        if len(vals) < max(10, OI_WINDOW//2):
+            return None
+        series = vals[-OI_WINDOW:]
+        mu  = sum(series)/len(series)
+        var = sum((x-mu)*(x-mu) for x in series)/len(series)
+        sd  = var**0.5
+        return 0.0 if sd==0 else (series[-1]-mu)/sd
+    except Exception:
+        return None
+
+def classify(zprice: float, volx: float, v24: float, oi_z):
+    if abs(zprice) < MIN_Z:   return None
+    if (volx or 0) < MIN_VOLX: return None
+    if (v24  or 0) < MIN_VOL24H: return None
+    if oi_z is None or oi_z < MIN_OI_Z:
+        return "neutral"
+    return "long" if zprice > 0 else "short"
+
+def send(sig, side, oi_z):
+    sym = str(sig["symbol"]).upper()
+    z   = float(sig.get("zprice") or 0.0)
+    vol = float(sig.get("vol_mult") or 0.0)
+    px  = sig.get("close")
+    v24 = fmt_money(sig.get("vol24h_usd"))
+    color = {"long":"🟢📈","short":"🔴📉","neutral":"🟡"}[side]
+    oi_text = "—" if oi_z is None else f"{oi_z:.2f}"
+    text = (
+        f"{color} {sym}\n"
+        f"Цена {px}\n"
+        f"Отклонение {z:+.3g}σ | Объём ×{vol:.2g} | OI z={oi_text}\n"
+        f"Оборот 24ч ≈ {v24}"
+    )
+    if TG_TOKEN and TG_CHAT:
+        try:
+            r = s.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={"chat_id": TG_CHAT, "text": text, "reply_markup": build_markup(sym)},
+                timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
+            )
+            if r.status_code != 200:
+                print(f"send error {sym}: {r.status_code} {r.text[:180]}", flush=True)
+        except Exception as e:
+            print("send exception:", e, flush=True)
+
+def main():
+    print(
+        f"forwarder start | host={HOST} z>={MIN_Z} volx>={MIN_VOLX} oiz>={MIN_OI_Z} "
+        f"v24h>={MIN_VOL24H} | OI window={OI_WINDOW} interval={OI_INTERVAL}",
+        flush=True
+    )
+    while True:
+        try:
+            j = pull_signals_json()
+            for sig in j.get("data", []):
+                key = (sig.get("symbol"), sig.get("bar_ts"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                z   = float(sig.get("zprice") or 0.0)
+                vol = float(sig.get("vol_mult") or 0.0)
+                v24 = float(sig.get("vol24h_usd") or 0.0)
+                oi_z = fetch_oi_z(str(sig.get("symbol","")).upper())
+                side = classify(z, vol, v24, oi_z)
+                if side is None:
+                    continue
+                send(sig, side, oi_z)
+        except Exception as e:
+            print("forward err:", e, flush=True)
+        time.sleep(max(1, POLL_SEC))
+
+if __name__ == "__main__":
+    main()

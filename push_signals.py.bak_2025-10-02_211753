@@ -1,0 +1,169 @@
+import os, time, json, requests, math
+from statistics import mean, pstdev
+
+HOST       = os.getenv("HOST", "http://127.0.0.1:8080")
+TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT    = os.getenv("TELEGRAM_CHAT_ID")
+
+# Пороги (настраиваются в .env)
+MIN_Z        = float(os.getenv("FORWARD_MIN_Z",       "2.0"))        # |zprice| минимум
+MIN_VOLX     = float(os.getenv("FORWARD_MIN_VOLX",    "1.8"))        # множитель объёма
+MIN_OI_Z     = float(os.getenv("FORWARD_MIN_OIZ",     "1.0"))        # z-score OI
+MIN_VOL24H   = float(os.getenv("FORWARD_MIN_VOL24H",  "10000000"))   # >= $10M по умолчанию
+POLL_SEC     = int(  os.getenv("FORWARD_POLL_SEC",    "8"))
+
+# Настройки окна для OI (Bybit)
+OI_WINDOW    = int(  os.getenv("FORWARD_OI_WINDOW",   "48"))         # 48×5м ≈ 4ч
+OI_INTERVAL  =        os.getenv("FORWARD_OI_INTERVAL","5min")        # 5min/15min/30min/1h
+
+s = requests.Session()
+seen = set()  # ключ уникальности: (symbol, bar_ts)
+
+def fmt_money(x):
+    try:
+        v = float(x or 0)
+        if v >= 1_000_000_000: return f"${v/1_000_000_000:.1f}B"
+        if v >= 1_000_000:     return f"${v/1_000_000:.1f}M"
+        if v >= 1_000:         return f"${v/1_000:.1f}K"
+        return f"${v:.0f}"
+    except Exception:
+        return str(x)
+
+def build_markup(sym: str):
+    # По просьбе: две кнопки в ОДНОЙ строке
+    url_tv    = f"https://www.tradingview.com/chart/?symbol=BYBIT:{sym}.P&interval=5"
+    bybit_web = f"https://www.bybit.com/trade/usdt/{sym}"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "↗️ Open on Bybit", "url": bybit_web},
+                {"text": "↗️ TradingView",   "url": url_tv},
+            ]
+        ]
+    }
+
+def fetch_oi_stats(sym: str):
+    """
+    Возвращает (oi_delta_pct, oi_z) для последнего бара.
+    oi_delta_pct — изменение к среднему (%), oi_z — z-score в окне.
+    Если данных мало/ошибка — (None, None).
+    """
+    try:
+        r = s.get(
+            "https://api.bybit.com/v5/market/open-interest",
+            params={"category":"linear","symbol":sym,"interval":OI_INTERVAL},
+            timeout=10,
+        )
+        j = r.json()
+        arr = (j.get("result",{}) or {}).get("list",[]) or []
+        vals = []
+        for it in arr:
+            # возможные ключи: "openInterest" или "openInterestValue"
+            v = it.get("openInterest") or it.get("openInterestValue")
+            if v is None: 
+                continue
+            vals.append(float(v))
+        if len(vals) < 8:
+            return (None, None)
+        series = vals[-OI_WINDOW:]
+        mu = mean(series)
+        sd = pstdev(series) if len(series) > 1 else 0.0
+        last = series[-1]
+        oi_z = (last - mu) / sd if sd > 0 else 0.0
+        oi_delta_pct = (last/mu - 1.0)*100.0 if mu > 0 else 0.0
+        return (oi_delta_pct, oi_z)
+    except Exception:
+        return (None, None)
+
+def classify(sig: dict):
+    """
+    Возвращает кортеж:
+      (label, color, oi_delta_pct, oi_z) где
+        label: "long"|"short"|None
+        color: "green"|"red"|None
+    Логика допуска в сигнал:
+      - |zprice| >= MIN_Z
+      - vol_mult >= MIN_VOLX
+      - vol24h_usd >= MIN_VOL24H
+      - oi_z >= MIN_OI_Z
+      - Направление:
+         * long  : zprice > 0 и OI↑
+         * short : zprice < 0 и OI↑
+    """
+    try:
+        z     = float(sig.get("zprice") or 0.0)
+        volx  = float(sig.get("vol_mult") or 0.0)
+        vol24 = float(sig.get("vol24h_usd") or 0.0)
+        if abs(z) < MIN_Z or volx < MIN_VOLX or vol24 < MIN_VOL24H:
+            return (None, None, None, None)
+
+        sym = str(sig.get("symbol","")).upper()
+        oi_delta_pct, oi_z = fetch_oi_stats(sym)
+        if oi_z is None:  # нет достаточных данных — отбрасываем
+            return (None, None, None, None)
+        if oi_z < MIN_OI_Z:
+            return (None, None, oi_delta_pct, oi_z)
+
+        # Направление по цене, OI должен быть ↑ (z>0)
+        if z > 0 and oi_z >= MIN_OI_Z:
+            return ("long", "green", oi_delta_pct, oi_z)
+        if z < 0 and oi_z >= MIN_OI_Z:
+            return ("short","red",  oi_delta_pct, oi_z)
+
+        return (None, None, oi_delta_pct, oi_z)
+    except Exception:
+        return (None, None, None, None)
+
+def main():
+    print(f"forwarder start | host={HOST} z>={MIN_Z} volx>={MIN_VOLX} oiz>={MIN_OI_Z} v24h>={MIN_VOL24H}", flush=True)
+    seen = set()
+    while True:
+        try:
+            j = s.get(f"{HOST}/signals", timeout=10).json()
+            for sig in j.get("data", []):
+                key = (sig.get("symbol"), sig.get("bar_ts"))
+                if key in seen:
+                    continue
+                # Классификация
+                label, color, oi_dpct, oi_z = classify(sig)
+                if label is None:
+                    continue
+                seen.add(key)
+
+                sym = str(sig["symbol"]).upper()
+                px  = sig.get("close")
+                z   = sig.get("zprice")
+                vol = sig.get("vol_mult")
+                v24 = fmt_money(sig.get("vol24h_usd"))
+
+                # Цветной кружок по направлению
+                dot = "🟢" if color=="green" else "🔴"
+
+                # Текст
+                # Пример: 🟢 XVGUSDT | px 0.00774 | z +3.23 | vol×2.5 | OI z +1.8 | OI Δ +12.4% | 24h $12.3M
+                text = (
+                    f"{dot} {sym}\n"
+                    f"px {px} | z {z:+.3g} | vol×{vol:.2f}\n"
+                )
+                if oi_z is not None and oi_dpct is not None:
+                    text += f"OI z {oi_z:+.2f} | OI Δ {oi_dpct:+.1f}%\n"
+                text += f"24h {v24}"
+
+                # Кнопки (в одной строке)
+                buttons = build_markup(sym)
+
+                if TG_TOKEN and TG_CHAT:
+                    r = s.post(
+                        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                        json={"chat_id": TG_CHAT, "text": text, "reply_markup": buttons},
+                        timeout=10,
+                    )
+                    if r.status_code != 200:
+                        print(f"send error {sym}: {r.status_code} {r.text[:180]}", flush=True)
+        except Exception as e:
+            print("forward err:", e, flush=True)
+
+        time.sleep(POLL_SEC)
+
+if __name__ == "__main__":
+    main()

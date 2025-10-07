@@ -1,0 +1,137 @@
+import os, time, math, requests
+
+def make_kb(sym: str):
+    base = sym[:-4] if sym.endswith("USDT") else sym
+    bybit = f"https://www.bybit.com/en/trade/spot/{base}/USDT"
+    tv = f"https://www.tradingview.com/symbols/{base}USDT/"
+    return {"inline_keyboard":[[
+        {"text":"Bybit","url": bybit},
+        {"text":"TradingView","url": tv}
+    ]]}
+
+HOST = os.getenv("HOST", "http://127.0.0.1:8080")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT  = os.getenv("TELEGRAM_CHAT_ID")
+
+Z_UP     = float(os.getenv("FORWARD_MIN_Z", "1.8"))
+Z_DOWN   = float(os.getenv("FORWARD_MIN_Z_SHORT", os.getenv("FORWARD_MIN_Z","1.8")))
+VOLX_TH  = float(os.getenv("FORWARD_MIN_VOLX", "1.6"))
+VOL24_TH = float(os.getenv("FORWARD_MIN_VOL24H", "20000000"))
+OI_TH    = float(os.getenv("FORWARD_MIN_OIZ", "0.6"))
+
+PRE_ENABLED = os.getenv("FORWARD_PRE_ENABLED","true").lower()=="true"
+PRE_COOLDOWN = int(os.getenv("FORWARD_PRE_COOLDOWN_MIN","10")) * 60
+PRE_REQUIRE_OI_FLAT = os.getenv("FORWARD_PRE_REQUIRE_OI_FLAT","true").lower()=="true"
+
+OI_WIN   = int(os.getenv("FORWARD_OI_WINDOW","48"))
+OI_INT   = os.getenv("FORWARD_OI_INTERVAL","5min")
+
+T_CONN = float(os.getenv("TIMEOUT_CONNECT","5"))
+T_READ = float(os.getenv("TIMEOUT_READ","8"))
+
+def fmt_money(v):
+    try:
+        v = float(v)
+    except: return str(v)
+
+def arrow(val, up, dn=None):
+    if dn is None: dn = -up
+    if val >= up: return "↑"
+    if val <= dn: return "↓"
+    return "≈0"
+
+def get_oiz(session, sym):
+    try:
+        r = session.get("https://api.bybit.com/v5/market/open-interest",
+                        params={"category":"linear","symbol":sym,"intervalTime":OI_INT},
+                        timeout=(T_CONN,T_READ))
+        arr = (r.json().get("result") or {}).get("list") or []
+        vals = [float(it.get("openInterest") or it.get("openInterestValue"))
+                for it in arr if (it.get("openInterest") or it.get("openInterestValue"))]
+        if len(vals) < 4: return None
+        series = vals[-OI_WIN:] if len(vals) > OI_WIN else vals
+        mu = sum(series)/len(series)
+        var = sum((x-mu)**2 for x in series)/len(series)
+        sd = math.sqrt(var) if var>0 else 0.0
+        return (series[-1]-mu)/sd if sd>0 else 0.0
+    except:
+        return None
+
+def send_msg(session, text):
+    if not (TOKEN and CHAT): return
+    try:
+        session.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                     json={"chat_id": CHAT, "text": text, "disable_web_page_preview": True, "reply_markup": make_kb(sym)},
+                     timeout=(T_CONN,T_READ))
+    except: pass
+
+def main():
+    if not PRE_ENABLED:
+        print("PRE disabled via env.")
+        return
+    s = requests.Session()
+    pre_cache = {}     # sym -> {"side","t","z","volx","v24"}
+    last_pre_at = {}   # sym -> ts
+    while True:
+        try:
+            data = s.get(f"{HOST}/signals", timeout=(T_CONN,T_READ)).json().get("data",[])
+        except Exception as e:
+            time.sleep(30); continue
+
+        # базовый отбор по цене/объёму/ликвидности
+        base = []
+        for d in data:
+            try:
+                v24 = float(d.get("vol24h_usd",0))
+                z   = float(d.get("zprice",0))
+                vx  = float(d.get("vol_mult",0))
+            except: 
+                continue
+            if v24 >= VOL24_TH and abs(z) >= min(Z_UP, Z_DOWN) and vx >= VOLX_TH:
+                base.append((d["symbol"], z, vx, v24))
+
+        # вычислим OI z и решим PRE/CONFIRM
+        for sym, z, vx, v24 in base:
+            oiz = get_oiz(s, sym)
+            a_p  = arrow(z,  Z_UP, -Z_DOWN)
+            a_v  = arrow(vx, VOLX_TH)
+            a_oi = arrow(oiz, OI_TH) if oiz is not None else "≈0"
+
+            # PRE: Price & Volume по направлению, OI ≈ 0 (строго)
+            pre_side = "LONG" if (a_p=="↑" and a_v=="↑") else ("SHORT" if (a_p=="↓" and a_v=="↑") else None)
+            if pre_side and (a_oi=="≈0"):
+                now = int(time.time())
+                if now - last_pre_at.get(sym, 0) >= PRE_COOLDOWN and sym not in pre_cache:
+                    pre_cache[sym] = {"side": pre_side, "t": now, "z": z, "volx": vx, "v24": v24}
+                    last_pre_at[sym] = now
+                    icon = "⬇️" if pre_side=="SHORT" else "⬆️"
+                    text = (
+                        f"{icon} {sym}  (PRE-{pre_side})\n"
+                        f"🟢 Price Δ={z:+.2f}\n"
+                        f"🟢 Volume ×{vx:.2f}\n"
+                        f"⏳ Awaiting OI confirmation\n"
+                        f"f"24h Volume ≈ {fmt_money(v24)}""
+                    )
+                    send_msg(s, text)
+
+            # CONFIRM: тот же side + OI↑
+            if sym in pre_cache:
+                side = pre_cache[sym]["side"]
+                if (side=="LONG" and a_oi=="↑") or (side=="SHORT" and a_oi=="↑"):
+                    z0, vx0, v240 = pre_cache[sym]["z"], pre_cache[sym]["volx"], pre_cache[sym]["v24"]
+                    icon = "⬇️" if side=="SHORT" else "⬆️"
+                    oi_line = f"🟢 OI Δ={oiz:+.2f}" if (oiz is not None) else "🟡 OI Δ=n/a"
+                    text = (
+                        f"✅ {icon} {sym}  ({side} CONFIRMED)\n"
+                        f"🟢 Price Δ={z0:+.2f}\n"
+                        f"🟢 Volume ×{vx0:.2f}\n"
+                        f"{oi_line}\n"
+                        f"f"24h Volume ≈ {fmt_money(v24)}""
+                    )
+                    send_msg(s, text)
+                    pre_cache.pop(sym, None)
+
+        time.sleep(60)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,159 @@
+import os, time, json, requests
+from statistics import mean, pstdev
+from datetime import datetime
+
+HOST      = os.getenv("HOST", "http://127.0.0.1:8080")
+TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT   = os.getenv("TELEGRAM_CHAT_ID")
+
+MIN_Z      = float(os.getenv("FORWARD_MIN_Z", "2.5"))
+MIN_VOLX   = float(os.getenv("FORWARD_MIN_VOLX", "3.0"))
+MIN_VOL24H = float(os.getenv("FORWARD_MIN_VOL24H", "1000000"))
+POLL_SEC   = int(os.getenv("FORWARD_POLL_SEC", "8"))
+
+OI_WINDOW   = int(os.getenv("FORWARD_OI_WINDOW", "48"))
+OI_INTERVAL = os.getenv("FORWARD_OI_INTERVAL", "5min")  # 5min/15min/30min/1h
+
+s = requests.Session()
+seen = set()
+
+def fmt_money(x):
+    try:
+        v = float(x or 0)
+        if v >= 1_000_000_000: return f"${v/1_000_000_000:.1f}B"
+        if v >= 1_000_000:     return f"${v/1_000_000:.1f}M"
+        if v >= 1_000:         return f"${v/1_000:.1f}K"
+        return f"${v:.0f}"
+    except Exception:
+        return str(x)
+
+def build_markup(sym: str):
+    url_tv    = f"https://www.tradingview.com/chart/?symbol=BYBIT:{sym}.P&interval=5"
+    bybit_web = f"https://www.bybit.com/trade/usdt/{sym}"
+    return {"inline_keyboard": [[
+        {"text": "↗️ Open on Bybit", "url": bybit_web},
+        {"text": "↗️ TradingView",   "url": url_tv},
+    ]]}
+
+def fetch_oi_stats(sym: str):
+    """История OI: вернёт (delta_pct, z_score) или (None, None)."""
+    try:
+        r = s.get(
+            "https://api.bybit.com/v5/market/open-interest",
+            params={
+                "category": "linear",
+                "symbol": sym,
+                "interval": OI_INTERVAL,
+                "limit": 200
+            },
+            timeout=10,
+        )
+        j = r.json()
+        arr = j.get("result", {}).get("list", []) or []
+        vals = []
+        for it in arr:
+            oi = it.get("openInterest") or it.get("openInterestValue")
+            if oi is None: continue
+            try: vals.append(float(oi))
+            except: pass
+        if len(vals) < 3:
+            print(f"[oi] no history sym={sym} len={len(vals)}", flush=True)
+            return (None, None)
+        series = vals[-OI_WINDOW:]
+        if len(series) < 3:
+            print(f"[oi] short window sym={sym} len={len(series)}", flush=True)
+            return (None, None)
+        cur, base = series[-1], series[0]
+        if base == 0:
+            return (None, None)
+        delta_pct = (cur / base - 1.0) * 100.0
+        mu = mean(series)
+        sd = pstdev(series) if len(series) > 1 else 0.0
+        z = (cur - mu) / sd if sd > 0 else 0.0
+        return (delta_pct, z)
+    except Exception as e:
+        print(f"[oi] err {sym}: {e}", flush=True)
+        return (None, None)
+
+def fetch_oi_now(sym: str):
+    """Текущее OI: вернёт (oi_value_float | None)."""
+    try:
+        r = s.get(
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "linear", "symbol": sym},
+            timeout=10,
+        )
+        j = r.json()
+        lst = j.get("result", {}).get("list", []) or []
+        if not lst:
+            print(f"[oi-now] empty list sym={sym}", flush=True)
+            return None
+        it = lst[0]
+        oi = it.get("openInterest") or it.get("openInterestValue")
+        return float(oi) if oi is not None else None
+    except Exception as e:
+        print(f"[oi-now] err {sym}: {e}", flush=True)
+        return None
+
+def pass_filters(sig: dict) -> bool:
+    try:
+        z   = float(sig.get("zprice") or 0.0)
+        vx  = float(sig.get("vol_mult") or 0.0)
+        v24 = float(sig.get("vol24h_usd") or 0.0)
+        return (z >= MIN_Z) and (vx >= MIN_VOLX) and (v24 >= MIN_VOL24H)
+    except Exception:
+        return False
+
+print(f"forwarder start | host={HOST} z>={MIN_Z} volx>={MIN_VOLX} v24h>={MIN_VOL24H} | OI window={OI_WINDOW} interval={OI_INTERVAL}", flush=True)
+
+while True:
+    try:
+        j = s.get(f"{HOST}/signals", timeout=10).json()
+        for sig in j.get("data", []):
+            sym = str(sig.get("symbol","")).upper()
+            key = (sym, sig.get("bar_ts"))
+            if key in seen: 
+                continue
+            if not pass_filters(sig):
+                continue
+            seen.add(key)
+
+            px  = sig.get("close")
+            z   = sig.get("zprice")
+            vx  = sig.get("vol_mult")
+            v24 = fmt_money(sig.get("vol24h_usd"))
+            ts  = sig.get("ts") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+            # OI: сначала история (Δ% и z), иначе текущее значение
+            oi_delta, oi_z = fetch_oi_stats(sym)
+            oi_line = ""
+            if oi_delta is not None and oi_z is not None:
+                sign = "+" if oi_delta >= 0 else ""
+                oi_line = f"\nOI Δ {sign}{oi_delta:.2f}% | z={oi_z:.2f}σ"
+            else:
+                oi_now = fetch_oi_now(sym)
+                if oi_now is not None:
+                    oi_line = f"\nOI ≈ {fmt_money(oi_now)}"
+                else:
+                    print(f"[oi] no data for {sym}", flush=True)
+
+            text = (
+                f"🟢📈 {sym}\n"
+                f"Цена {px}\n"
+                f"Отклонение +{z}σ | Объём ×{vx}\n"
+                f"Оборот 24ч ≈ {v24}"
+                f"{oi_line}\n"
+                f"{ts}"
+            )
+
+            if TG_TOKEN and TG_CHAT:
+                resp = s.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={"chat_id": TG_CHAT, "text": text, "reply_markup": build_markup(sym)},
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    print(f"[send] {sym}: {resp.status_code} {resp.text[:160]}", flush=True)
+    except Exception as e:
+        print("forward err:", e, flush=True)
+    time.sleep(POLL_SEC)

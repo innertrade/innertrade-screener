@@ -1,0 +1,149 @@
+import os, time, json, requests
+from datetime import datetime
+
+HOST      = os.getenv("HOST", "http://127.0.0.1:8080")
+TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT   = os.getenv("TELEGRAM_CHAT_ID")
+
+# Пороги
+Z_TH      = float(os.getenv("FORWARD_MIN_Z",      "2.0"))        # zprice
+V_TH      = float(os.getenv("FORWARD_MIN_VOLX",   "2.0"))        # vol_mult
+OI_TH     = float(os.getenv("FORWARD_MIN_OIZ",    "1.5"))        # OI z-score
+MIN_VOL24 = float(os.getenv("FORWARD_MIN_VOL24H", "10000000"))   # $10M
+POLL_SEC  = int(  os.getenv("FORWARD_POLL_SEC",   "8"))
+
+# OI окно/интервал
+OI_WINDOW   = int(os.getenv("FORWARD_OI_WINDOW", "48"))
+OI_INTERVAL =      os.getenv("FORWARD_OI_INTERVAL","5min")
+
+# Таймауты/ретраи
+TIMEOUT_CONNECT = int(float(os.getenv("FORWARD_TIMEOUT_CONNECT","5")))
+TIMEOUT_READ    = int(float(os.getenv("FORWARD_TIMEOUT_READ","30")))
+MAX_RETRIES     = int(float(os.getenv("FORWARD_MAX_RETRIES","3")))
+RETRY_SLEEP_SEC = float(os.getenv("FORWARD_RETRY_SLEEP","1.0"))
+
+s = requests.Session()
+seen = set()
+
+def fmt_money(x):
+    try:
+        v = float(x or 0)
+        if v >= 1_000_000_000: return f"${v/1_000_000_000:.1f}B"
+        if v >= 1_000_000:     return f"${v/1_000_000:.1f}M"
+        if v >= 1_000:         return f"${v/1_000:.1f}K"
+        return f"${v:.0f}"
+    except Exception:
+        return str(x)
+
+def build_markup(sym: str):
+    url_tv    = f"https://www.tradingview.com/chart/?symbol=BYBIT:{sym}.P&interval=5"
+    bybit_web = f"https://www.bybit.com/trade/usdt/{sym}"
+    return {"inline_keyboard": [[
+        {"text": "↗️ Open on Bybit", "url": bybit_web},
+        {"text": "↗️ TradingView",   "url": url_tv},
+    ]]}
+
+def fetch_oi_z(sym: str):
+    """Вернёт z-score OI по окну; None при ошибке/мало данных."""
+    try:
+        r = s.get(
+            "https://api.bybit.com/v5/market/open-interest",
+            params={"category":"linear","symbol":sym,"interval":OI_INTERVAL},
+            timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
+        )
+        j = r.json()
+        arr = (j.get("result", {}) or {}).get("list", []) or []
+        vals = []
+        for it in arr:
+            v = it.get("openInterest") or it.get("openInterestValue")
+            if v is None: continue
+            try: vals.append(float(v))
+            except: pass
+        if len(vals) < 3:
+            return None
+        series = vals[-OI_WINDOW:] if len(vals) > OI_WINDOW else vals
+        mu = sum(series)/len(series)
+        var = sum((x-mu)**2 for x in series)/len(series)
+        sd = var**0.5 if var>0 else 0.0
+        if sd == 0: return 0.0
+        return (series[-1]-mu)/sd
+    except Exception:
+        return None
+
+def arrows(z, volx, oi_z):
+    """Вернёт стрелки ↑/≈0/↓ для цены, объёма, OI."""
+    def arrow(val, up_th, dn_th=None):
+        if dn_th is None: dn_th = -up_th
+        if val >= up_th:  return "↑"
+        if val <= dn_th:  return "↓"
+        return "≈0"
+    a_p  = arrow(z,    Z_TH)
+    a_v  = "↑" if volx >= V_TH else "≈0"
+    a_oi = arrow(oi_z, OI_TH) if oi_z is not None else "≈0"
+    return a_p, a_v, a_oi
+
+def classify(a_p, a_v, a_oi):
+    """Только 2 сценария: LONG / SHORT. Остальное — None (не шлём)."""
+    # LONG: ↑ ↑ ↑
+    if a_p=="↑" and a_v=="↑" and a_oi=="↑":
+        return "LONG", "🟢📈"
+    # SHORT: ↓ ↑ ↑
+    if a_p=="↓" and a_v=="↑" and a_oi=="↑":
+        return "SHORT","🔴📉"
+    return None, None
+
+def pull_signals():
+    for _ in range(MAX_RETRIES):
+        try:
+            r = s.get(f"{HOST}/signals", timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+            return r.json()
+        except Exception:
+            time.sleep(RETRY_SLEEP_SEC)
+    raise RuntimeError("signals: retries exceeded")
+
+def main():
+    print(f"forwarder start | host={HOST} Z>={Z_TH} Vx>={V_TH} OIz>={OI_TH} v24h>={MIN_VOL24} | OI window={OI_WINDOW} interval={OI_INTERVAL}", flush=True)
+    while True:
+        try:
+            j = pull_signals()
+            for sig in j.get("data", []):
+                sym = str(sig.get("symbol","")).upper()
+                bar_ts = sig.get("bar_ts")
+                key = (sym, bar_ts)
+                if key in seen:
+                    continue
+
+                z   = float(sig.get("zprice") or 0.0)
+                vol = float(sig.get("vol_mult") or 0.0)
+                v24 = float(sig.get("vol24h_usd") or 0.0)
+                px  = sig.get("close")
+
+                if v24 < MIN_VOL24:
+                    continue
+
+                oi_z = fetch_oi_z(sym)
+                a_p, a_v, a_oi = arrows(z, vol, oi_z)
+                cls, mark = classify(a_p, a_v, a_oi)
+                if cls is None:
+                    continue
+
+                seen.add(key)
+                legend = f"P:{a_p} V:{a_v} OI:{a_oi}"
+                text = (
+                    f"{mark} {sym}\n"
+                    f"Цена {px}\n"
+                    f"{legend} | z={z:+.2f} | vol×{vol:.2f} | OI z={('—' if oi_z is None else f'{oi_z:+.2f}')}\n"
+                    f"Оборот 24ч ≈ {fmt_money(v24)}"
+                )
+                if TG_TOKEN and TG_CHAT:
+                    s.post(
+                        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                        json={"chat_id": TG_CHAT, "text": text, "reply_markup": build_markup(sym)},
+                        timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
+                    )
+        except Exception as e:
+            print("forward err:", e, flush=True)
+        time.sleep(max(1, POLL_SEC))
+
+if __name__ == "__main__":
+    main()

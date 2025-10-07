@@ -1,0 +1,53 @@
+import os, time, json, requests
+from datetime import datetime
+
+HOST      = os.getenv("HOST", "http://127.0.0.1:8080")
+TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT   = os.getenv("TELEGRAM_CHAT_ID")
+
+# Пороги
+MIN_Z        = float(os.getenv("FORWARD_MIN_Z", "2.0"))
+MIN_VOLX     = float(os.getenv("FORWARD_MIN_VOLX", "1.8"))
+MIN_OI_Z     = float(os.getenv("FORWARD_MIN_OIZ", "1.0"))
+MIN_VOL24H   = float(os.getenv("FORWARD_MIN_VOL24H", "10000000"))
+POLL_SEC     = int(os.getenv("FORWARD_POLL_SEC", "8"))
+
+# Таймауты и ретраи
+TIMEOUT_CONNECT = int(os.getenv("FORWARD_TIMEOUT_CONNECT","5"))
+TIMEOUT_READ    = int(os.getenv("FORWARD_TIMEOUT_READ","30"))
+MAX_RETRIES     = int(os.getenv("FORWARD_MAX_RETRIES","3"))
+RETRY_SLEEP_SEC = float(os.getenv("FORWARD_RETRY_SLEEP","1.0"))
+
+s = requests.Session()
+
+def pull_signals():
+    for _ in range(MAX_RETRIES):
+        try:
+            r = s.get(f"{HOST}/signals", timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+            return r.json()
+        except Exception as e:
+            print("pull_signals retry:", e, flush=True)
+            time.sleep(RETRY_SLEEP_SEC)
+    raise RuntimeError("signals: retries exceeded")
+
+def fmt_money(x):
+    try:
+        v = float(x or 0)
+        if v >= 1_000_000_000: return f"${v/1_000_000_000:.1f}B"
+        if v >= 1_000_000:     return f"${v/1_000_000:.1f}M"
+        if v >= 1_000:         return f"${v/1_000:.1f}K"
+        return f"${v:.0f}"
+    except Exception:
+        return str(x)
+
+# ... остальная логика у тебя без изменений ...
+# (parse сигналов, фильтры, build_markup, send в Telegram)
+# Важно: только заменили блок получения сигналов на pull_signals()
+
+while True:
+    try:
+        j = pull_signals()
+        # тут твоя обработка сигналов (как раньше)
+    except Exception as e:
+        print("forward err:", e, flush=True)
+    time.sleep(POLL_SEC)

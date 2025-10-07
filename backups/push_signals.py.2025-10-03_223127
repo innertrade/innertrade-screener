@@ -1,0 +1,199 @@
+import os, time, json, math, requests
+from collections import deque
+
+HOST      = os.getenv("HOST", "http://127.0.0.1:8080")
+TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT   = os.getenv("TELEGRAM_CHAT_ID")
+
+# Пороги
+Z_TH        = float(os.getenv("FORWARD_MIN_Z",      "1.8"))
+V_TH        = float(os.getenv("FORWARD_MIN_VOLX",   "1.8"))
+OI_TH       = float(os.getenv("FORWARD_MIN_OIZ",    "1.0"))
+MIN_VOL24   = float(os.getenv("FORWARD_MIN_VOL24H", "10000000"))
+POLL_SEC    = int(  os.getenv("FORWARD_POLL_SEC",   "8"))
+
+# OI (Bybit v5 linear)
+OI_WINDOW   = int(os.getenv("FORWARD_OI_WINDOW",   "48"))
+OI_INTERVAL =      os.getenv("FORWARD_OI_INTERVAL","5min")
+ALLOW_OI_NONE = os.getenv("FORWARD_ALLOW_OI_NONE","false").lower() == "true"
+
+# Сеть / ретраи / антифлуд
+TIMEOUT_CONNECT = int(float(os.getenv("FORWARD_TIMEOUT_CONNECT","5")))
+TIMEOUT_READ    = int(float(os.getenv("FORWARD_TIMEOUT_READ","30")))
+MAX_RETRIES     = int(float(os.getenv("FORWARD_MAX_RETRIES","2")))
+RETRY_SLEEP_SEC = float(os.getenv("FORWARD_RETRY_SLEEP","1.0"))
+SEND_LIMIT      = int(os.getenv("FORWARD_SEND_LIMIT","5"))
+COOLDOWN_MIN    = int(os.getenv("FORWARD_COOLDOWN_MIN","30"))
+
+s = requests.Session()
+
+seen = set()                 # (symbol, bar_ts) — чтобы не спамить один и тот же бар
+last_sent_at = {}            # symbol -> unix_ts (кулдаун)
+hist = {}                    # symbol -> deque последних баров (на будущее, если захочешь консенсус)
+
+def fmt_money(x: float) -> str:
+    try:
+        v = float(x or 0)
+        if v >= 1_000_000_000: return f"${v/1_000_000_000:.1f}B"
+        if v >= 1_000_000:     return f"${v/1_000_000:.1f}M"
+        if v >= 1_000:         return f"${v/1_000:.1f}K"
+        return f"${v:.0f}"
+    except Exception:
+        return str(x)
+
+def build_markup(sym: str):
+    url_tv    = f"https://www.tradingview.com/chart/?symbol=BYBIT:{sym}.P&interval=5"
+    bybit_web = f"https://www.bybit.com/trade/usdt/{sym}"
+    return {"inline_keyboard": [[
+        {"text": "↗️ Bybit",       "url": bybit_web},
+        {"text": "↗️ TradingView", "url": url_tv},
+    ]]}
+
+def fetch_oi_z(sym: str):
+    """Z-score OI по Bybit v5 linear. None — если мало данных/ошибка."""
+    try:
+        r = s.get(
+            "https://api.bybit.com/v5/market/open-interest",
+            params={"category":"linear","symbol":sym,"interval":OI_INTERVAL},
+            timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
+        )
+        j = r.json()
+        arr = (j.get("result",{}) or {}).get("list",[]) or []
+        vals=[]
+        for it in arr:
+            v = it.get("openInterest") or it.get("openInterestValue")
+            if v is None: continue
+            try: vals.append(float(v))
+            except: pass
+        if len(vals) < 3:
+            return None
+        series = vals[-OI_WINDOW:] if len(vals) > OI_WINDOW else vals
+        mu = sum(series)/len(series)
+        var = sum((x-mu)**2 for x in series)/len(series)
+        sd = math.sqrt(var) if var>0 else 0.0
+        if sd == 0: return 0.0
+        return (series[-1]-mu)/sd
+    except Exception:
+        return None
+
+def arrows(z, volx, oi_z):
+    def arrow(val, up_th):
+        if val >= up_th:  return "↑"
+        if val <= -up_th: return "↓"
+        return "≈0"
+    a_p  = arrow(z,   Z_TH)
+    a_v  = "↑" if volx >= V_TH else "≈0"
+    a_oi = ("↑" if ALLOW_OI_NONE and oi_z is None else
+            ("≈0" if oi_z is None else ("↑" if oi_z >= OI_TH else ("↓" if oi_z <= -OI_TH else "≈0"))))
+    return a_p, a_v, a_oi
+
+def classify(a_p, a_v, a_oi):
+    if a_p=="↑" and a_v=="↑" and a_oi=="↑":
+        return "LONG", "🟢📈"
+    if a_p=="↓" and a_v=="↑" and a_oi=="↑":
+        return "SHORT","🔴📉"
+    return None, None
+
+def pull_signals():
+    for _ in range(1+MAX_RETRIES):
+        try:
+            r = s.get(f"{HOST}/signals", timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+            return r.json()
+        except Exception:
+            time.sleep(RETRY_SLEEP_SEC)
+    raise RuntimeError("signals: retries exceeded")
+
+def main():
+    print(f"forwarder start | host={HOST} Z>={Z_TH} Vx>={V_TH} OIz>={OI_TH} v24h>={MIN_VOL24:.0f} | OI window={OI_WINDOW} interval={OI_INTERVAL}", flush=True)
+    while True:
+        try:
+            j = pull_signals()
+            data = j.get("data", []) or []
+            loop_sent = set()
+            sent_this_tick = 0
+
+            for sig in data:
+                sym    = str(sig.get("symbol","")).upper()
+                bar_ts = sig.get("bar_ts")
+                key    = (sym, bar_ts)
+
+                # per-bar dedupe
+                if key in seen:
+                    continue
+                # per-tick anti-dup
+                if sym in loop_sent:
+                    continue
+                # cooldown
+                now_ts = int(time.time())
+                last = last_sent_at.get(sym, 0)
+                if last and (now_ts - last) < COOLDOWN_MIN*60:
+                    # print(f"skip {sym} cooldown {now_ts-last}s < {COOLDOWN_MIN*60}s", flush=True)
+                    continue
+
+                # извлекаем метрики
+                try:
+                    z   = float(sig.get("zprice") or 0.0)
+                    vx  = float(sig.get("vol_mult") or 0.0)
+                    v24 = float(sig.get("vol24h_usd") or 0.0)
+                    px  = sig.get("close")
+                except Exception:
+                    continue
+
+                # отсев неликвида
+                if v24 < MIN_VOL24:
+                    # print(f"skip {sym} low v24={fmt_money(v24)} < {fmt_money(MIN_VOL24)}", flush=True)
+                    continue
+
+                # риск: получаем OI с Bybit
+                oi_z = fetch_oi_z(sym)
+                if (oi_z is None) and not ALLOW_OI_NONE:
+                    # требуем реальный OI
+                    # print(f"skip {sym} no OI (not enough data)", flush=True)
+                    continue
+
+                a_p, a_v, a_oi = arrows(z, vx, oi_z)
+                cls, mark = classify(a_p, a_v, a_oi)
+                if cls is None:
+                    # print(f"skip {sym} reason P:{a_p} V:{a_v} OI:{a_oi}", flush=True)
+                    continue
+
+                # лимит отправок на тик
+                if sent_this_tick >= SEND_LIMIT:
+                    break
+
+                # формируем текст
+                oi_str = "—" if oi_z is None else f"{oi_z:+.2f}"
+                legend = f"P:{a_p} V:{a_v} OI:{a_oi}"
+                text = (
+                    f"{mark} {cls} | {sym}\n"
+                    f"Цена {px}\n"
+                    f"{legend} | z={z:+.2f} | vol×{vx:.2f} | OI z={oi_str}\n"
+                    f"Оборот 24ч ≈ {fmt_money(v24)}"
+                )
+
+                # отправка
+                if TG_TOKEN and TG_CHAT:
+                    r = s.post(
+                        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                        json={"chat_id": TG_CHAT, "text": text, "reply_markup": build_markup(sym), "disable_web_page_preview": True},
+                        timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
+                    )
+                    try:
+                        ok = (r.status_code == 200) and (r.json().get("ok") is True)
+                    except Exception:
+                        ok = False
+                    print(f"sent {sym} {cls} -> http={r.status_code} ok={ok}", flush=True)
+
+                # отметки дедупа/кулдауна
+                seen.add(key)
+                loop_sent.add(sym)
+                last_sent_at[sym] = now_ts
+                sent_this_tick += 1
+
+        except Exception as e:
+            print("forward err:", e, flush=True)
+
+        time.sleep(max(1, POLL_SEC))
+
+if __name__ == "__main__":
+    main()

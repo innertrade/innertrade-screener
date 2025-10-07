@@ -1,0 +1,171 @@
+import os, time, json, requests
+from datetime import datetime
+
+# --------- ENV / пороги ----------
+HOST        = os.getenv("HOST", "http://127.0.0.1:8080")
+TG_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT     = os.getenv("TELEGRAM_CHAT_ID")
+
+MIN_Z       = float(os.getenv("FORWARD_MIN_Z",      "1.8"))
+MIN_VOLX    = float(os.getenv("FORWARD_MIN_VOLX",   "1.6"))
+MIN_VOL24H  = float(os.getenv("FORWARD_MIN_VOL24H", "20000000"))  # 20M — как просили
+MIN_OI_Z    = float(os.getenv("FORWARD_MIN_OIZ",    "0.8"))       # OI — только для CONFIRMED
+POLL_SEC    = int(float(os.getenv("FORWARD_POLL_SEC","8")))
+
+OI_WINDOW   = int(os.getenv("FORWARD_OI_WINDOW",    "48"))
+OI_INTERVAL = os.getenv("FORWARD_OI_INTERVAL",      "5min")
+
+TIMEOUT_CONNECT = 5
+TIMEOUT_READ    = 30
+
+s = requests.Session()
+seen = set()
+
+# --------- utils ----------
+def fmt_money(v):
+    try:
+        x = float(v or 0)
+        if x >= 1_000_000_000: return f"${x/1_000_000_000:.1f}B"
+        if x >= 1_000_000:     return f"${x/1_000_000:.1f}M"
+        if x >= 1_000:         return f"${x/1_000:.1f}K"
+        return f"${x:.0f}"
+    except:
+        return str(v)
+
+
+def make_kb(sym: str):
+    s = (sym or "").upper()
+    bybit = f"https://www.bybit.com/trade/usdt/{s}"  # USDT-Perp futures
+    tv    = f"https://www.tradingview.com/chart/?symbol=BYBIT:{s}.P&interval=5"
+    return {
+        "inline_keyboard": [[
+            {"text": "Bybit Futures", "url": bybit},
+            {"text": "TradingView", "url": tv}
+        ]]
+    }
+
+
+def pull_signals():
+    r = s.get(f"{HOST}/signals", timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+def fetch_oi_z(sym: str):
+    try:
+        r = s.get(
+            "https://api.bybit.com/v5/market/open-interest",
+            params={"category": "linear", "symbol": sym, "interval": OI_INTERVAL},
+            timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
+        )
+        j = r.json()
+        arr = (j.get("result", {}) or {}).get("list", []) or []
+        vals = []
+        for it in arr:
+            v = it.get("openInterest") or it.get("openInterestValue")
+            if v is None: 
+                continue
+            try:
+                vals.append(float(v))
+            except:
+                pass
+        if len(vals) < max(10, OI_WINDOW//2):
+            return None
+        series = vals[-OI_WINDOW:]
+        mu  = sum(series)/len(series)
+        var = sum((x-mu)*(x-mu) for x in series)/len(series)
+        sd  = var**0.5
+        return 0.0 if sd == 0 else (series[-1]-mu)/sd
+    except Exception:
+        return None
+
+# --------- логика классификации ----------
+def classify(zprice: float, volx: float, v24: float, oi_z):
+    """
+    Базовый сигнал (PRE-*): abs(z)>=MIN_Z, volx>=MIN_VOLX, v24>=MIN_VOL24H.
+    CONFIRMED: дополнительно oi_z>=MIN_OI_Z.
+    """
+    base_ok = (abs(zprice) >= MIN_Z) and (volx >= MIN_VOLX) and (v24 >= MIN_VOL24H)
+    if not base_ok:
+        return None
+    direction = "long" if zprice > 0 else "short"
+    if oi_z is None or oi_z < MIN_OI_Z:
+        return f"pre_{direction}"
+    return f"{direction}_confirmed"
+
+# --------- отправка ----------
+def send(sig, side, oi_z):
+    if not (TG_TOKEN and TG_CHAT):
+        return
+    sym = str(sig.get("symbol","")).upper()
+    z   = float(sig.get("zprice") or 0.0)
+    vol = float(sig.get("vol_mult") or 0.0)
+    v24 = float(sig.get("vol24h_usd") or 0.0)
+
+    up = z >= 0
+    arrow = "⬆️" if up else "⬇️"
+    price_line = f"{'🟢' if up else '🔴'} Price Δ={abs(z):+.2f}σ"
+    vol_line   = f"🟢 Volume ×{vol:.2f}"
+
+    if side == "pre_long":
+        title = f"{arrow} {sym}  (PRE-LONG)"
+        text  = f"{title}\n{price_line}\n{vol_line}\n⏳ Awaiting OI confirmation\n24h Volume ≈ {fmt_money(v24)}"
+    elif side == "pre_short":
+        title = f"{arrow} {sym}  (PRE-SHORT)"
+        text  = f"{title}\n{price_line}\n{vol_line}\n⏳ Awaiting OI confirmation\n24h Volume ≈ {fmt_money(v24)}"
+    elif side == "long_confirmed":
+        title   = f"✅ {arrow} {sym}  (LONG CONFIRMED)"
+        oi_line = f"🟢 OI Δ={oi_z:+.2f}σ" if oi_z is not None else "🟡 OI Δ=—"
+        text    = f"{title}\n{price_line}\n{vol_line}\n{oi_line}\n24h Volume ≈ {fmt_money(v24)}"
+    elif side == "short_confirmed":
+        title   = f"✅ {arrow} {sym}  (SHORT CONFIRMED)"
+        oi_line = f"🔴 OI Δ={oi_z:+.2f}σ" if oi_z is not None else "🟡 OI Δ=—"
+        text    = f"{title}\n{price_line}\n{vol_line}\n{oi_line}\n24h Volume ≈ {fmt_money(v24)}"
+    else:
+        return
+
+    try:
+        r = s.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={
+                "chat_id": TG_CHAT,
+                "text": text,
+                "reply_markup": make_kb(sym),
+                "disable_web_page_preview": True
+            },
+            timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
+        )
+        if r.status_code != 200:
+            print(f"send error {sym}: {r.status_code} {r.text[:200]}", flush=True)
+    except Exception as e:
+        print("send exception:", e, flush=True)
+
+# --------- цикл ----------
+def main():
+    print(
+        f"forwarder start | host={HOST} Z>={MIN_Z} Vx>={MIN_VOLX} v24h>={MIN_VOL24H:.0f} | "
+        f"OI optional z>={MIN_OI_Z} | OI window={OI_WINDOW} interval={OI_INTERVAL}",
+        flush=True
+    )
+    while True:
+        try:
+            data = pull_signals()
+            for sig in data:
+                z   = float(sig.get("zprice") or 0.0)
+                vol = float(sig.get("vol_mult") or 0.0)
+                v24 = float(sig.get("vol24h_usd") or 0.0)
+                sym = str(sig.get("symbol","")).upper()
+                oi_z = fetch_oi_z(sym)
+                side = classify(z, vol, v24, oi_z)
+                if side is None:
+                    continue
+                key = (sym, sig.get("bar_ts"), side)
+                if key in seen:
+                    continue
+                seen.add(key)
+                send(sig, side, oi_z)
+        except Exception as e:
+            print("forward err:", e, flush=True)
+        time.sleep(max(1, POLL_SEC))
+
+if __name__ == "__main__":
+    main()

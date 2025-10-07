@@ -1,0 +1,206 @@
+import os, time, json, math, requests
+
+HOST      = os.getenv("HOST", "http://127.0.0.1:8080")
+TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT   = os.getenv("TELEGRAM_CHAT_ID")
+COOLDOWN_MIN = int(os.getenv("FORWARD_COOLDOWN_MIN","30"))
+
+# Пороги
+Z_TH      = float(os.getenv("FORWARD_MIN_Z",      "1.8"))
+V_TH      = float(os.getenv("FORWARD_MIN_VOLX",   "1.8"))
+OI_TH     = float(os.getenv("FORWARD_MIN_OIZ",    "1.0"))
+MIN_VOL24 = float(os.getenv("FORWARD_MIN_VOL24H", "10000000"))
+POLL_SEC  = int(  os.getenv("FORWARD_POLL_SEC",   "8"))
+
+# OI (Bybit v5)
+OI_WINDOW   = int(os.getenv("FORWARD_OI_WINDOW",   "48"))
+OI_INTERVAL =      os.getenv("FORWARD_OI_INTERVAL","5min")
+ALLOW_OI_NONE = os.getenv("FORWARD_ALLOW_OI_NONE","false").lower()=="true"
+
+# Сеть / ретраи
+TIMEOUT_CONNECT = int(float(os.getenv("FORWARD_TIMEOUT_CONNECT","5")))
+TIMEOUT_READ    = int(float(os.getenv("FORWARD_TIMEOUT_READ","30")))
+MAX_RETRIES     = int(float(os.getenv("FORWARD_MAX_RETRIES","2")))
+RETRY_SLEEP_SEC = float(os.getenv("FORWARD_RETRY_SLEEP","1.0"))
+
+# Антифлуд и «15m-консенсус»
+SEND_LIMIT_PER_TICK = int(os.getenv("FORWARD_SEND_LIMIT","5"))
+CONSENSUS_N         = int(os.getenv("FORWARD_CONSENSUS_BARS","3"))
+
+s = requests.Session()
+seen = set()
+last_sent_at = {}  # symbol -> unix_ts of last send
+  # (symbol, bar_ts)
+consensus_hits = {}     # символ -> текущая серия попаданий подряд
+consensus_lastbar = {}  # символ -> последний bar_ts, чтобы не путать серии
+
+def fmt_money(x: float) -> str:
+    try:
+        v = float(x or 0)
+        if v >= 1_000_000_000: return f"${v/1_000_000_000:.1f}B"
+        if v >= 1_000_000:     return f"${v/1_000_000:.1f}M"
+        if v >= 1_000:         return f"${v/1_000:.1f}K"
+        return f"${v:.0f}"
+    except Exception:
+        return str(x)
+
+def build_markup(sym: str):
+    url_tv    = f"https://www.tradingview.com/chart/?symbol=BYBIT:{sym}.P&interval=5"
+    bybit_web = f"https://www.bybit.com/trade/usdt/{sym}"
+    return {"inline_keyboard": [[
+        {"text": "↗️ Bybit", "url": bybit_web},
+        {"text": "↗️ TradingView", "url": url_tv},
+    ]]}
+
+def pull_signals():
+    for _ in range(MAX_RETRIES+1):
+        try:
+            r = s.get(f"{HOST}/signals", timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+            return r.json()
+        except Exception:
+            time.sleep(RETRY_SLEEP_SEC)
+    raise RuntimeError("signals: retries exceeded")
+
+def fetch_oi_z(sym: str):
+    """Z-score OI (Bybit v5, linear). None — если мало данных/ошибка."""
+    try:
+        r = s.get(
+            "https://api.bybit.com/v5/market/open-interest",
+            params={"category":"linear","symbol":sym,"interval":OI_INTERVAL},
+            timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
+        )
+        j = r.json()
+        arr  = (j.get("result",{}) or {}).get("list",[]) or []
+        vals = []
+        for it in arr:
+            v = it.get("openInterest") or it.get("openInterestValue")
+            if v is None: continue
+            try: vals.append(float(v))
+            except: pass
+        if len(vals) < 3:
+            return None
+        series = vals[-OI_WINDOW:] if len(vals) > OI_WINDOW else vals
+        mu = sum(series)/len(series)
+        var = sum((x-mu)**2 for x in series)/len(series)
+        sd = math.sqrt(var) if var>0 else 0.0
+        if sd==0: return 0.0
+        return (series[-1]-mu)/sd
+    except Exception:
+        return None
+
+def classify(z: float, volx: float, oiz):
+    """Ровно 2 сценария: LONG (цена ↑, объём ↑, OI ↑) и SHORT (цена ↓, объём ↑, OI ↑)."""
+    # объём: нужен всплеск
+    if volx < V_TH: return None, None, None
+    # OI: нужен рост (или допускаем None, если включён флаг)
+    oi_ok = (oiz is not None and oiz >= OI_TH) or (ALLOW_OI_NONE and oiz is None)
+    if not oi_ok: return None, None, None
+    # цена:
+    if z >= Z_TH:
+        return "LONG", "🟢", "↑"
+    if z <= -Z_TH:
+        return "SHORT","🔴","↓"
+    return None, None, None
+
+def main():
+    print(f"forwarder start | host={HOST} Z>={Z_TH} Vx>={V_TH} OIz>={OI_TH} v24h>={MIN_VOL24} | OI window={OI_WINDOW} interval={OI_INTERVAL} | consensus={CONSENSUS_N}x5m", flush=True)
+    while True:
+        send_cnt = 0
+        try:
+            j = pull_signals()
+            loop_sent = set()
+            loop_sent = set()
+            for sig in j.get("data", []):
+
+                # --- per-item identifiers (dedupe/cooldown need these) ---
+now_ts = int(time.time())
+                # --- per-item identifiers ---
+now_ts = int(time.time())
+                # per-bar dedupe
+                if key in seen:
+                    # уже отправлен этот бар ранее
+                    continue
+                # per-tick anti-dup by symbol
+                if sym in loop_sent:
+                    # в этом тике уже отправили этот символ
+                    continue
+                # cooldown by symbol
+                last = last_sent_at.get(sym, 0)
+                if last and now_ts - last < COOLDOWN_MIN*60:
+                    # пропускаем из-за кулдауна
+                    # print(f"skip {sym} cooldown {now_ts-last}s < {COOLDOWN_MIN*60}s", flush=True)
+                    continue
+if (sym, bar_ts) in seen:
+                    continue
+
+                z   = float(sig.get("zprice") or 0.0)
+                vol = float(sig.get("vol_mult") or 0.0)
+                v24 = float(sig.get("vol24h_usd") or 0.0)
+                px  = sig.get("close")
+
+                # Ликвидность
+                if v24 < MIN_VOL24:
+                    continue
+
+                # OI z-score
+                oiz = fetch_oi_z(sym)
+
+                # === 15m-консенсус: считаем попадания подряд на уникальных барах ===
+                last_bar = consensus_lastbar.get(sym)
+                if last_bar != bar_ts:
+                    consensus_lastbar[sym] = bar_ts  # фиксируем новый бар
+
+                pre_ok = (abs(z) >= Z_TH) and (vol >= V_TH) and ( (oiz is not None and oiz >= OI_TH) or (ALLOW_OI_NONE and oiz is None) )
+
+                if pre_ok:
+                    consensus_hits[sym] = consensus_hits.get(sym, 0) + 1
+                else:
+                    consensus_hits[sym] = 0
+
+                if consensus_hits[sym] < CONSENSUS_N:
+                    # ждём подтверждений
+                    continue
+
+                # После набора N подряд — финальная классификация (строгая по направлению цены)
+                cls, emoji, price_arrow = classify(z, vol, oiz)
+                if cls is None:
+                    continue
+
+                seen.add((sym, bar_ts))
+
+                vol_arrow = "↑"  # раз vol>=V_TH
+                oi_arrow  = "↑" if (oiz is not None and oiz >= OI_TH) else ("—" if oiz is None and ALLOW_OI_NONE else "≈0")
+                oistr     = "—" if oiz is None else f"{oiz:+.2f}"
+
+                text = (
+                    f"{emoji} {sym} — {cls}\n"
+                    f"Цена: {px}\n"
+                    f"P:{price_arrow} V:{vol_arrow} OI:{oi_arrow} | z={z:+.2f} | vol×{vol:.2f} | OI z={oistr}\n"
+                    f"Оборот 24ч ≈ {fmt_money(v24)}\n"
+                    f"(15m consensus: {CONSENSUS_N}×5m)"
+                )
+
+                if TG_TOKEN and TG_CHAT and send_cnt < SEND_LIMIT_PER_TICK:
+                    r = s.post(
+                        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                        json={"chat_id": TG_CHAT, "text": text, "reply_markup": build_markup(sym)},
+                        timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
+                    )
+                    try:
+                        ok = (r.status_code == 200) and (r.json().get("ok") is True)
+                    except Exception:
+                        ok = False
+                    print(f"sent {sym} {cls} -> http={r.status_code} ok={ok}", flush=True)
+                    if ok:
+                        seen.add(key)
+                        loop_sent.add(sym)
+                        last_sent_at[sym] = now_ts
+                    send_cnt += 1
+
+        except Exception as e:
+            print("forward err:", e, flush=True)
+
+        time.sleep(max(1, POLL_SEC))
+
+if __name__ == "__main__":
+    main()
