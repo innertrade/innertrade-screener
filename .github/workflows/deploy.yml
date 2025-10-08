@@ -10,39 +10,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Ensure tools
+      - name: Install ssh-client & rsync
         run: |
           sudo apt-get update
-          sudo apt-get install -y rsync openssh-client
+          sudo apt-get install -y openssh-client rsync
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Prepare SSH
         run: |
           install -m 600 -D /dev/null ~/.ssh/id_ed25519
           printf "%s" "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
-
-      - name: Rsync code to VPS (without .env/.venv)
-        run: |
-          RSYNC_EXCLUDES="--exclude .git --exclude .github --exclude .venv --exclude .env"
-          rsync -az $RSYNC_EXCLUDES ./ deploy@${{ secrets.DEPLOY_HOST }}:/home/deploy/apps/screener-bot/
-
-      - name: Install deps & restart services
-        run: |
-          ssh deploy@${{ secrets.DEPLOY_HOST }} '
-            set -e
-            cd /home/deploy/apps/screener-bot
-            python3 -m venv .venv || true
-            . .venv/bin/activate
-            python -m pip install --upgrade pip
-            if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-            sudo systemctl daemon-reload || true
-            sudo systemctl restart screener.service || true
-            sudo systemctl restart push_signals.service || true
-            sudo systemctl restart menu_bot.service || true
-            sudo systemctl --no-pager --full status screener.service || true
-            sudo systemctl --no-pager --full status push_signals.service || true
-            sudo systemctl --no-pager --full status menu_bot.service || true
-          '
