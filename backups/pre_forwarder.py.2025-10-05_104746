@@ -138,6 +138,6 @@ while True:
         # (на будущее) SHORT PRE: a_p=="↓" and a_v=="↑" и OI≈0/не↑
 
     if pre_sent==0:
-        print(f"tick: base={len(base)} no PRE", flush=True)
+# DISABLED:         print(f"tick: base={len(base)} no PRE", flush=True)
 
     time.sleep(45)

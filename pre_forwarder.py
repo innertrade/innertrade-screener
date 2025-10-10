@@ -1,143 +1,70 @@
-import os, time, math, requests
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+pre_forwarder: library-only
+Экспортирует oi_z_score(sym, interval="5min", window=48) без побочных эффектов.
+Не печатает и не запускает циклов. Используется из push_signals.py.
+"""
+import os
+import statistics
+import requests
 
-# --- ENV / пороги ---
-HOST   = os.getenv("HOST","http://127.0.0.1:8080")
-TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN","")
-CHAT   = os.getenv("TELEGRAM_CHAT_ID","")
+_T_CONN = 5
+_T_READ = 8
 
-Z_TH   = float(os.getenv("FORWARD_MIN_Z","1.8"))
-Z_SHORT= float(os.getenv("FORWARD_MIN_Z_SHORT",os.getenv("FORWARD_MIN_Z","1.8")))
-V_TH   = float(os.getenv("FORWARD_MIN_VOLX","1.6"))
-MIN_V24= float(os.getenv("FORWARD_MIN_VOL24H","20000000"))
-OI_TH  = float(os.getenv("FORWARD_MIN_OIZ","0.6"))
-WIN    = int(os.getenv("FORWARD_OI_WINDOW","48"))
-INTERV = os.getenv("FORWARD_OI_INTERVAL","5min")
+def _map_symbol_to_bybit_linear(symbol: str):
+    if not symbol:
+        return None
+    s = symbol.upper().replace("-", "").replace("PERP", "")
+    if s.endswith("USDT") and len(s) >= 7:
+        return s
+    return None
 
-PRE_ENABLED   = os.getenv("FORWARD_PRE_ENABLED","true").lower()=="true"
-PRE_FLAT_ONLY = os.getenv("FORWARD_PRE_REQUIRE_OI_FLAT","true").lower()=="true"
-PRE_COOLDOWN  = int(os.getenv("FORWARD_PRE_COOLDOWN_MIN","10"))*60
+_session = requests.Session()
+_session.headers.update({"User-Agent": "innertrade-pre-forwarder/1.0"})
 
-T_CONN = 5; T_READ = 8
-
-def fmt_money(x):
+def _fetch_oi_series_bybit(symbol: str, interval: str, limit: int):
+    """Возвращает список openInterest по времени ВПЕРЁД (старое → новое)."""
+    bybit_symbol = _map_symbol_to_bybit_linear(symbol)
+    if not bybit_symbol:
+        return None
+    url = "https://api.bybit.com/v5/market/open-interest"
+    params = {"category":"linear","symbol":bybit_symbol,"intervalTime":interval,"limit":str(limit)}
     try:
-        v = float(x or 0)
-        if v >= 1_000_000_000: return f"${v/1_000_000_000:.1f}B"
-        if v >= 1_000_000:     return f"${v/1_000_000:.1f}M"
-        if v >= 1_000:         return f"${v/1_000:.1f}K"
-        return f"${v:.0f}"
-    except Exception:
-        return str(x)
-
-def make_kb(sym: str):
-    base = sym[:-4] if sym.endswith("USDT") else sym
-    bybit = f"https://www.bybit.com/en/trade/spot/{base}/USDT"
-    tv    = f"https://www.tradingview.com/symbols/{base}USDT/"
-    return {"inline_keyboard":[[
-        {"text":"Bybit","url": bybit},
-        {"text":"TradingView","url": tv}
-    ]]}
-
-def arrow(val, up_th, dn_th=None):
-    if dn_th is None: dn_th = -up_th
-    if val >= up_th: return "↑"
-    if val <= dn_th: return "↓"
-    return "≈0"
-
-def oi_z_score(sym: str):
-    try:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/open-interest",
-            params={"category":"linear","symbol":sym,"intervalTime":INTERV},
-            timeout=(T_CONN,T_READ)
-        )
-        arr = (r.json().get("result",{}) or {}).get("list",[]) or []
-        vals = [float(it.get("openInterest") or it.get("openInterestValue"))
-                for it in arr if (it.get("openInterest") or it.get("openInterestValue")) is not None]
-        if len(vals) < 4: return None
-        series = vals[-WIN:] if len(vals)>WIN else vals
-        mu = sum(series)/len(series)
-        var = sum((x-mu)**2 for x in series)/len(series)
-        sd = math.sqrt(var) if var>0 else 0.0
-        return 0.0 if sd==0 else (series[-1]-mu)/sd
+        r = _session.get(url, params=params, timeout=(_T_CONN, _T_READ))
+        r.raise_for_status()
+        rows = (r.json().get("result") or {}).get("list") or []
+        series = [float(x["openInterest"]) for x in reversed(rows) if x.get("openInterest") is not None]
+        return series if series else None
     except Exception:
         return None
 
-last_pre_at = {}  # sym -> ts последнего PRE
+def oi_z_score(sym: str, interval: str = None, window: int = None):
+    """
+    Z-скор по ΔOI:
+      d_t = OI[t] - OI[t-1]
+      oi_z = (d_last - mean(d_tail)) / stdev(d_tail), tail = последние `window` d_t
+    Возвращает float или None.
+    """
+    if interval is None:
+        interval = os.getenv("FORWARD_OI_INTERVAL", "5min")
+    if window is None:
+        window = int(os.getenv("FORWARD_OI_WINDOW", "48"))
 
-def send_pre(sym, z, volx, v24, side):
-    if not (TOKEN and CHAT): return
-    icon = "⬇️" if side=="SHORT" else "⬆️"
-    text = (
-        f"{icon} {sym}  (PRE-{side})\n"
-        f"🟢 Price Δ={z:+.2f}\n"
-        f"🟢 Volume ×{volx:.2f}\n"
-        f"⏳ Awaiting OI confirmation\n"
-        f"24h Volume ≈ {fmt_money(v24)}"
-    )
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT, "text": text, "reply_markup": make_kb(sym),
-                  "disable_web_page_preview": True},
-            timeout=(T_CONN,T_READ)
-        )
-    except Exception:
-        pass
+    limit = max(window + 2, 10)
+    series = _fetch_oi_series_bybit(sym, interval, limit)
+    if not series or len(series) < window + 1:
+        return None
 
-print(f"PRE forwarder start | {HOST} Z>={Z_TH} Vx>={V_TH} OIz~0 (flat_only={PRE_FLAT_ONLY}) v24h>={MIN_V24} | OI window={WIN} interval={INTERV} | cooldown={PRE_COOLDOWN}s", flush=True)
+    diffs = [series[i] - series[i-1] for i in range(1, len(series))]
+    tail = diffs[-window:]
+    if not tail:
+        return None
 
-if not PRE_ENABLED:
-    print("PRE disabled via env.", flush=True)
-    raise SystemExit(0)
+    mu = statistics.mean(tail)
+    sd = statistics.pstdev(tail)
+    if not sd:
+        return None
+    return (diffs[-1] - mu) / sd
 
-session = requests.Session()
-
-while True:
-    try:
-        data = session.get(f"{HOST}/signals", timeout=(T_CONN,T_READ)).json().get("data",[]) or []
-    except Exception as e:
-        print(f"ERR fetch /signals: {e}", flush=True)
-        time.sleep(30); continue
-
-    # базовый фильтр по цене/объёму/ликвидности
-    base = []
-    for d in data:
-        try:
-            v24 = float(d.get("vol24h_usd",0))
-            z   = float(d.get("zprice",0))
-            vx  = float(d.get("vol_mult",0))
-            sym = d.get("symbol")
-            if v24 >= MIN_V24 and abs(z) >= min(Z_TH, Z_SHORT) and vx >= V_TH:
-                base.append((sym, z, vx, v24))
-        except Exception:
-            continue
-
-    pre_sent = 0
-    for sym, z, vx, v24 in base[:120]:
-        # классификация по стрелкам
-        a_p = arrow(z, Z_TH, -Z_SHORT)
-        a_v = arrow(vx, V_TH)
-
-        # OI z
-        oiz = oi_z_score(sym)
-        a_oi = "≈0" if oiz is None else arrow(oiz, OI_TH)
-
-        # условие PRE
-        if a_p=="↑" and a_v=="↑":
-            ok_oi = (a_oi=="≈0") if PRE_FLAT_ONLY else (a_oi!="↑")
-            if ok_oi:
-                now = int(time.time())
-                last = last_pre_at.get(sym, 0)
-                if now - last >= PRE_COOLDOWN:
-                    send_pre(sym, z, vx, v24, "LONG")
-                    last_pre_at[sym] = now
-                    pre_sent += 1
-                    print(f"PRE=> {sym} P:{a_p} V:{a_v} OI:{a_oi} | z={z:+.2f} volx={vx:.2f} oiz={('None' if oiz is None else f'{oiz:+.2f}')}", flush=True)
-
-        # (на будущее) SHORT PRE: a_p=="↓" and a_v=="↑" и OI≈0/не↑
-
-    if pre_sent==0:
-        print(f"tick: base={len(base)} no PRE", flush=True)
-
-    time.sleep(45)
+# никаких запусков при импорте
