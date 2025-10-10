@@ -1,0 +1,1 @@
+forwarder start | host=http://127.0.0.1:8080 Z>=1.2 Vx>=1.2 OIz>=0.0 v24h>=10000000.0 | OI window=24 interval=5min | consensus=1x5m
