@@ -10,3 +10,28 @@ __pycache__/
 # ignore virtual environments
 .venv/
 venv/
+
+# --- local/venv/pycache ---
+.venv/
+venv/
+__pycache__/
+
+# --- env & secrets (локальные копии) ---
+.env
+.env.*
+!.env.example
+
+# --- backups, времянки, очереди ---
+*.bak
+*.bak.*
+backups/
+*.queue
+*.q
+*.pending
+tg_buffer*
+/0
+
+# --- редакторы ---
+*.swp
+*.swx
+*.tmp
