@@ -6,3 +6,7 @@ backups/*
 __pycache__/
 *.pyc
 0
+
+# ignore virtual environments
+.venv/
+venv/
