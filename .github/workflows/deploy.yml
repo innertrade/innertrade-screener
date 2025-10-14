@@ -1,66 +1,48 @@
 name: Deploy to VPS
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
-  workflow_dispatch: {}
+    branches: ["main"]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
-    env:
-      VPS_HOST: ${{ secrets.VPS_HOST }}
-      VPS_USER: ${{ secrets.VPS_USER }}
-      VPS_PATH: ${{ secrets.VPS_PATH }}
-
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare SSH key
-        shell: bash
+      - name: Write SSH key from secret
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf "%s\n" "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          # Добавим host key, чтобы ssh/rsync не спрашивали подтверждение
-          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+
+      - name: Add host key
+        run: ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+
+      - name: Test SSH connectivity
+        run: ssh -vvv -i ~/.ssh/id_ed25519 "$VPS_USER@$VPS_HOST" 'echo OK && uname -a'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
 
       - name: Rsync code to VPS
-        shell: bash
         run: |
-          rsync -az --delete \
-            --exclude ".git" \
-            --exclude ".github" \
-            ./ "${VPS_USER}"@"${VPS_HOST}":"${VPS_PATH}"/
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" ./ "$VPS_USER@$VPS_HOST:$VPS_PATH/"
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PATH: ${{ secrets.VPS_PATH }}
 
-      - name: Remote setup & restart service
-        shell: bash
+      - name: Restart service and show logs
         run: |
-          ssh "${VPS_USER}"@"${VPS_HOST}" bash -lc '
-            set -e
-            cd "'"${VPS_PATH}"'"
-            # права на код — пользователю deploy (если заливаем под root)
-            if id deploy >/dev/null 2>&1; then
-              chown -R deploy:deploy .
-            fi
-
-            # venv + зависимости (если есть requirements.txt)
-            if [ -f requirements.txt ]; then
-              python3 -m venv .venv || true
-              . .venv/bin/activate
-              pip install -U pip
-              pip install -r requirements.txt
-            fi
-
-            # перезапуск сервиса
-            systemctl daemon-reload || true
-            systemctl restart push_signals.service
-
-            sleep 3
-            echo "=== systemctl status (short) ==="
-            systemctl --no-pager --full status push_signals.service | sed -n "1,40p" || true
-            echo "=== last logs ==="
-            journalctl -u push_signals.service -n 120 --no-pager || true
-          '
+          ssh -i ~/.ssh/id_ed25519 "$VPS_USER@$VPS_HOST" \
+            'sudo systemctl restart push_signals.service && sleep 4 && sudo journalctl -u push_signals.service -n 80 --no-pager'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
