@@ -1,0 +1,21 @@
+[Unit]
+Description=InnerTrade Screener HTTP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/apps/innertrade-screener
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python -u main.py
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

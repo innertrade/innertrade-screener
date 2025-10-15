@@ -1,140 +1,38 @@
-import os, time, json, requests
-from datetime import datetime, timedelta
+from __future__ import annotations
+import os
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_OK = set(str(x).strip() for x in [
-    os.getenv("TELEGRAM_CHAT_ID"),
-    os.getenv("TELEGRAM_ALERT_CHAT_ID"),
-    os.getenv("TELEGRAM_ALLOWED_CHAT_ID"),
-] if x)
-API     = f"https://api.telegram.org/bot{TOKEN}"
-STATE_F = "signals_state.json"
+load_dotenv()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID","0"))
 
-def msk_now():
-    return (datetime.utcnow() + timedelta(hours=3)).strftime("MSK %H:%M")
+MSK = timezone(timedelta(hours=3))
 
-def load_state():
-    try:
-        with open(STATE_F,"r") as f: return json.load(f)
-    except: return {"signals1": True, "signals2": False}
+KB = ReplyKeyboardMarkup(
+    [
+        ["📊 Дашборд баблы", "🌡 Температура рынка"],
+        ["📰 Новости", "🧮 Калькулятор"],
+        ["📡 Сигналы 1: ✅ ON", "⚙️ Сигналы 2: ⛔ OFF"],
+    ],
+    resize_keyboard=True
+)
 
-def save_state(st):
-    try:
-        with open(STATE_F,"w") as f: json.dump(st,f)
-    except: pass
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
+    await update.message.reply_text(f"Привет! Время: {now}", reply_markup=KB)
 
-def kb_main(st):
-    s1 = "✅ ON" if st.get("signals1",True) else "⛔ OFF"
-    s2 = "✅ ON" if st.get("signals2",False) else "⛔ OFF"
-    return {
-        "inline_keyboard":[
-            [{"text":"📊 Дашборд баблы","callback_data":"DASH"}],
-            [{"text":"🌡 Температура рынка","callback_data":"TEMP"}],
-            [{"text":"🗞 Новости","callback_data":"NEWS"}],
-            [{"text":"🧮 Калькулятор","callback_data":"CALC"}],
-            [{"text":f"📡 Сигналы 1: {s1}","callback_data":"TOGGLE_S1"}],
-            [{"text":f"⚙️ Сигналы 2: {s2}","callback_data":"TOGGLE_S2"}],
-        ]
-    }
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
+    await update.message.reply_text(f"Вы нажали: {txt}", reply_markup=KB)
 
-def remove_reply_kb(chat_id):
-    import requests
-    try:
-        requests.post(f"{API}/sendMessage", json={"chat_id": chat_id, "text": " ", "reply_markup": {"remove_keyboard": True}}, timeout=10)
-    except: pass
-
-def send(chat_id, text, kb=None, reply_kb=None):
-    data = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    if kb: data["reply_markup"] = kb
-    if reply_kb: data["reply_markup"] = reply_kb
-    try:
-        requests.post(f"{API}/sendMessage", json=data, timeout=15)
-    except Exception as e:
-        print("send err:", e, flush=True)
-
-def answer_cb(id, text=""):
-    try:
-        requests.post(f"{API}/answerCallbackQuery", json={"callback_query_id": id, "text": text}, timeout=10)
-    except: pass
-
-def allowed(chat_id):
-    return (not CHAT_OK) or (str(chat_id) in CHAT_OK)
-
-def do_dashboard(chat_id):
-    # без ключей даём полезные ссылки (картинки добавим позже)
-    text = ("📊 Дашборд баблы\n"
-            f"{msk_now()}\n\n"
-            "• Онлайн-баблы (24h turnover): https://cryptobubbles.net?currency=USDT&timeframe=24h\n"
-            "• CoinMarketCap Gainers/Losers (24h): https://coinmarketcap.com/gainers-losers/")
-    send(chat_id, text)
-
-def do_temp(chat_id):
-    text = ("🌡 Температура рынка\n"
-            f"{msk_now()}\n\n"
-            "• Fear & Greed (Alt): https://coinmarketcap.com/alpha/fear-and-greed-index/\n"
-            "• Total Market Cap: https://coinmarketcap.com/charts/\n"
-            "• Алткоин индекс (идея): https://www.blockchaincenter.net/altcoin-season-index/")
-    send(chat_id, text)
-
-def do_news(chat_id):
-    text = ("🗞 Новости / Календарь\n"
-            f"{msk_now()}\n\n"
-            "• CryptoPanic: https://cryptopanic.com/\n"
-            "• Coindesk: https://www.coindesk.com/\n"
-            "• Календарь макро (UTC): https://www.investing.com/economic-calendar/\n"
-            "• Списки событий/листингов: https://coinmarketcal.com/")
-    send(chat_id, text)
-
-def do_calc(chat_id):
-    text = ("🧮 Калькулятор\n"
-            f"{msk_now()}\n\n"
-            "Заглушка. Как только пришлёшь формулы — подключу.")
-    send(chat_id, text)
-
-def toggle_and_refresh(chat_id, key):
-    st = load_state()
-    st[key] = not st.get(key, False)
-    save_state(st)
-    send(chat_id, "⚙️ Настройки обновлены.", kb_main(st))
-
-def poll():
-    if not TOKEN:
-        print("No TELEGRAM_BOT_TOKEN", flush=True); return
-    offset = None
-    st = load_state()
-    print("menu-bot started | polling…", flush=True)
-    while True:
-        try:
-            r = requests.get(f"{API}/getUpdates", params={"timeout":25, "offset": offset}, timeout=30)
-            j = r.json()
-            for upd in j.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message") or upd.get("edited_message")
-                cb  = upd.get("callback_query")
-
-                if cb:
-                    cid = cb["message"]["chat"]["id"]
-                    if not allowed(cid): continue
-                    data = cb.get("data","")
-                    if   data=="DASH":  do_dashboard(cid); answer_cb(cb["id"], "Готово")
-                    elif data=="TEMP":  do_temp(cid);      answer_cb(cb["id"], "Готово")
-                    elif data=="NEWS":  do_news(cid);      answer_cb(cb["id"], "Готово")
-                    elif data=="CALC":  do_calc(cid);      answer_cb(cb["id"], "Готово")
-                    elif data=="TOGGLE_S1": toggle_and_refresh(cid, "signals1"); answer_cb(cb["id"], "Переключено")
-                    elif data=="TOGGLE_S2": toggle_and_refresh(cid, "signals2"); answer_cb(cb["id"], "Переключено")
-                    else: answer_cb(cb["id"])
-                    continue
-
-                if msg:
-                    cid = msg["chat"]["id"]
-                    if not allowed(cid): continue
-                    text = (msg.get("text") or "").strip()
-                    if text in ('/start','/menu','меню','Меню'):
-                        remove_reply_kb(cid)
-                        send(cid, f'Привет! {msk_now()}', reply_kb=reply_kb_main(st))
-        except Exception as e:
-            print("poll err:", e, flush=True)
-            time.sleep(1)
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    app.run_polling()
 
 if __name__ == "__main__":
-    poll()
+    main()
