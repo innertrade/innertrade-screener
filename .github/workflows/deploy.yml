@@ -1,64 +1,31 @@
-name: Deploy to VPS
+- name: Provision app on VPS
+  run: |
+    set -euo pipefail
+    APP=/home/deploy/apps/innertrade-screener
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+    # 2) Проставляем секреты в .env
+    sed -i \
+      -e "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}|" \
+      -e "s|^TELEGRAM_CHAT_ID=.*|TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}|" \
+      "$APP/.env"
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    # 3) Пересоздаём venv и ставим зависимости + certifi
+    python3 -m venv "$APP/.venv"
+    "$APP/.venv/bin/pip" install -U pip wheel certifi
+    "$APP/.venv/bin/pip" install -r "$APP/requirements.txt"
 
-      - name: SSH deploy
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            set -euo pipefail
-            APP=/home/deploy/apps/innertrade-screener
-
-            # 1) Обновляем код из origin/main
-            if [ -d "$APP/.git" ]; then
-              git -C "$APP" fetch --all
-              git -C "$APP" reset --hard origin/main
-            else
-              git clone https://github.com/innertrade/innertrade-screener "$APP"
-            fi
-
-            # 2) .env из примера + Secrets
-            cp -f "$APP/.env.example" "$APP/.env"
-            sed -i \
-              -e "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}|" \
-              -e "s|^TELEGRAM_CHAT_ID=.*|TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}|" \
-              "$APP/.env"
-
-            # 3) Пересоздаём venv и ставим зависимости + certifi
-            python3 -m venv "$APP/.venv"
-            "$APP/.venv/bin/pip" install -U pip wheel certifi
-            "$APP/.venv/bin/pip" install -r "$APP/requirements.txt"
-
-            # 4) Делаем стабильный путь к CA-бандлу (фикс TLS ошибок)
-            CERT_FILE=$("$APP/.venv/bin/python" - <<'PY'
+    # 4) Делаем стабильный путь к CA-бандлу (фикс TLS ошибок)
+    CERT_FILE=$("$APP/.venv/bin/python" - <<'PY'
 import certifi, sys
 sys.stdout.write(certifi.where())
 PY
 )
-            ln -sf "$CERT_FILE" "$APP/cacert.pem"
+    ln -sf "$CERT_FILE" "$APP/cacert.pem"
 
-            # 5) Обновляем systemd units, подсовываем переменную с CA
-            install -m 644 "$APP/deploy/systemd/"*.service /etc/systemd/system/
-            systemctl daemon-reload
+    # 5) Обновляем systemd units
+    install -m 644 "$APP/deploy/systemd/"*.service /etc/systemd/system/
+    systemctl daemon-reload
 
-            # 6) Включаем и рестартим
-            systemctl enable --now screener.service push_signals.service menu_bot.service
-            systemctl restart screener.service push_signals.service menu_bot.service
-
-            # 7) Быстрые проверки (не фейлят пайплайн)
-            set +e
-            curl -sS http://127.0.0.1:8080/health || true
-            curl -sS http://127.0.0.1:8080/signals | head -c 500 || true
+    # 6) Включаем и рестартим
+    systemctl enable --now screener.service push_signals.service menu_bot.service
+    systemctl restart screener.service push_signals.service menu_bot.service
