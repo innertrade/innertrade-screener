@@ -1,9 +1,9 @@
 name: Deploy to VPS
 
 on:
-  workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -12,37 +12,53 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Write SSH key from secret
-        run: |
-          mkdir -p ~/.ssh
-          printf "%s\n" "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-        env:
-          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            APP=/home/deploy/apps/innertrade-screener
 
-      - name: Add host key
-        run: ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
+            # 1) Обновляем код из origin/main
+            if [ -d "$APP/.git" ]; then
+              git -C "$APP" fetch --all
+              git -C "$APP" reset --hard origin/main
+            else
+              git clone https://github.com/innertrade/innertrade-screener "$APP"
+            fi
 
-      - name: Test SSH connectivity
-        run: ssh -vvv -i ~/.ssh/id_ed25519 "$VPS_USER@$VPS_HOST" 'echo OK && uname -a'
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
+            # 2) .env из примера + Secrets
+            cp -f "$APP/.env.example" "$APP/.env"
+            sed -i \
+              -e "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}|" \
+              -e "s|^TELEGRAM_CHAT_ID=.*|TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}|" \
+              "$APP/.env"
 
-      - name: Rsync code to VPS
-        run: |
-          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" ./ "$VPS_USER@$VPS_HOST:$VPS_PATH/"
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_PATH: ${{ secrets.VPS_PATH }}
+            # 3) Пересоздаём venv и ставим зависимости + certifi
+            python3 -m venv "$APP/.venv"
+            "$APP/.venv/bin/pip" install -U pip wheel certifi
+            "$APP/.venv/bin/pip" install -r "$APP/requirements.txt"
 
-      - name: Restart service and show logs
-        run: |
-          ssh -i ~/.ssh/id_ed25519 "$VPS_USER@$VPS_HOST" \
-            'sudo systemctl restart push_signals.service && sleep 4 && sudo journalctl -u push_signals.service -n 80 --no-pager'
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
+            # 4) Делаем стабильный путь к CA-бандлу (фикс TLS ошибок)
+            CERT_FILE=$("$APP/.venv/bin/python" - <<'PY'
+import certifi, sys
+sys.stdout.write(certifi.where())
+PY
+)
+            ln -sf "$CERT_FILE" "$APP/cacert.pem"
+
+            # 5) Обновляем systemd units, подсовываем переменную с CA
+            install -m 644 "$APP/deploy/systemd/"*.service /etc/systemd/system/
+            systemctl daemon-reload
+
+            # 6) Включаем и рестартим
+            systemctl enable --now screener.service push_signals.service menu_bot.service
+            systemctl restart screener.service push_signals.service menu_bot.service
+
+            # 7) Быстрые проверки (не фейлят пайплайн)
+            set +e
+            curl -sS http://127.0.0.1:8080/health || true
+            curl -sS http://127.0.0.1:8080/signals | head -c 500 || true
