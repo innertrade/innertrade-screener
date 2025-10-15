@@ -1,9 +1,23 @@
+name: Deploy screener
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'main.py'
+      - 'push_signals.py'
+      - 'menu_bot.py'
+      - 'requirements.txt'
+      - 'deploy/systemd/**'
+      - '.github/workflows/deploy.yml'
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo (meta)
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Deploy over SSH
@@ -12,26 +26,30 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
+          command_timeout: 30m
           script: |
             set -euo pipefail
+
             APP=/home/deploy/apps/innertrade-screener
 
-            # 0) Директория и владельцы
-            install -d -m 755 -o deploy -g deploy "$APP"
-
-            # 1) Репозиторий: всегда ставим origin на SSH и обновляем main ИМЕННО от deploy
+            # 1) Репозиторий на сервере (через SSH-remote)
+            sudo install -d -m 755 -o deploy -g deploy "$APP"
             sudo -u deploy -H bash -lc "
               cd '$APP'
-              [ -d .git ] || git init
-              git remote set-url origin git@github.com:innertrade/innertrade-screener.git 2>/dev/null ||
-              git remote add origin git@github.com:innertrade/innertrade-screener.git
+              if [ ! -d .git ]; then
+                git init
+                git remote add origin git@github.com:innertrade/innertrade-screener.git
+              else
+                git remote set-url origin git@github.com:innertrade/innertrade-screener.git || true
+              fi
               git fetch --depth=1 origin main
               git reset --hard origin/main
             "
 
-            # 2) .env: создать при отсутствии и проставить секреты
+            # 2) .env и секреты
             cd "$APP"
-            [ -f .env ] || install -m 600 /dev/null .env && chown deploy:deploy .env
+            [ -f .env ] || { install -m 600 /dev/null .env; chown deploy:deploy .env; }
             grep -q '^TELEGRAM_BOT_TOKEN=' .env || echo 'TELEGRAM_BOT_TOKEN=' >> .env
             grep -q '^TELEGRAM_CHAT_ID='   .env || echo 'TELEGRAM_CHAT_ID='   >> .env
             sed -i \
@@ -39,20 +57,16 @@ jobs:
               -e "s|^TELEGRAM_CHAT_ID=.*|TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}|" \
               .env
 
-            # 3) venv + зависимости + certifi
+            # 3) venv + зависимости (+ certifi)
             python3 -m venv .venv
             ./.venv/bin/pip install -U pip wheel certifi
             ./.venv/bin/pip install -r requirements.txt
 
-            # 4) Фикс TLS: стабильный путь к CA bundle
-            CERT_FILE=$(
-              ./.venv/bin/python - <<'PY'
-import certifi, sys; sys.stdout.write(certifi.where())
-PY
-            )
+            # 4) Стабильный путь к CA bundle (фикс TLS)
+            CERT_FILE=$(.venv/bin/python -c "import certifi, sys; print(certifi.where(), end='')")
             ln -sf "$CERT_FILE" "$APP/cacert.pem"
 
-            # 5) systemd units и рестарт
+            # 5) systemd units и рестарт сервисов
             install -m 644 deploy/systemd/*.service /etc/systemd/system/
             systemctl daemon-reload
             systemctl enable --now screener.service push_signals.service menu_bot.service || true
