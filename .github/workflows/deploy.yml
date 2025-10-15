@@ -5,9 +5,7 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'main.py'
-      - 'push_signals.py'
-      - 'menu_bot.py'
+      - '**/*.py'
       - 'requirements.txt'
       - 'deploy/systemd/**'
       - '.github/workflows/deploy.yml'
@@ -15,7 +13,6 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -26,6 +23,7 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
           script: |
             set -euo pipefail
             APP=/home/deploy/apps/innertrade-screener
@@ -33,7 +31,7 @@ jobs:
             install -d -m 755 "$APP"
             cd "$APP"
 
-            # Синхронизируем код из GitHub (жёстко на main)
+            # Синхронизация кода с main
             if [ ! -d .git ]; then
               git init
               git remote add origin https://github.com/innertrade/innertrade-screener.git
@@ -41,29 +39,25 @@ jobs:
             git fetch --depth=1 origin main
             git reset --hard origin/main
 
-            # .env: создаём при отсутствии и проставляем секреты
+            # .env: создать при отсутствии и проставить секреты
             [ -f .env ] || install -m 600 /dev/null .env
             grep -q '^TELEGRAM_BOT_TOKEN=' .env || echo 'TELEGRAM_BOT_TOKEN=' >> .env
             grep -q '^TELEGRAM_CHAT_ID='   .env || echo 'TELEGRAM_CHAT_ID='   >> .env
             sed -i \
-              -e 's|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}|' \
-              -e 's|^TELEGRAM_CHAT_ID=.*|TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}|' \
+              -e "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}|" \
+              -e "s|^TELEGRAM_CHAT_ID=.*|TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}|" \
               .env
 
-            # Виртуальное окружение + зависимости + certifi
+            # venv + зависимости (+ certifi)
             python3 -m venv .venv
             ./.venv/bin/pip install -U pip wheel certifi
             ./.venv/bin/pip install -r requirements.txt
 
-            # Стабильный путь к CA-бандлу (фикс TLS-ошибок)
-            CERT_FILE=$(
-              ./.venv/bin/python - <<'PY'
-import certifi, sys; sys.stdout.write(certifi.where())
-PY
-            )
+            # Стабильный путь к CA-бандлу (без heredoc)
+            CERT_FILE=$("./.venv/bin/python" -c 'import certifi,sys; sys.stdout.write(certifi.where())')
             ln -sf "$CERT_FILE" "$APP/cacert.pem"
 
-            # Обновляем systemd-юниты и перезапускаем сервисы
+            # Обновить systemd-юниты и перезапустить сервисы
             install -m 644 deploy/systemd/*.service /etc/systemd/system/
             systemctl daemon-reload
             systemctl enable --now screener.service push_signals.service menu_bot.service || true
