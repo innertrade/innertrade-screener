@@ -1,0 +1,65 @@
+name: Deploy to VPS (no-console)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # SSH на ваш VPS и весь деплой внутри
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}           # напр. 95.181.224.42
+          username: ${{ secrets.SSH_USER }}       # deploy
+          key: ${{ secrets.SSH_KEY }}             # приватный ключ, чей pub вы уже добавили в /home/deploy/.ssh/authorized_keys
+          script_stop: true
+          script: |
+            set -euo pipefail
+            APP_DIR=/home/deploy/apps/innertrade-screener
+            cd "$APP_DIR"
+
+            echo "== 1) обновляем код из main =="
+            if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+              git fetch --all --prune
+              git checkout main
+              git pull --ff-only
+            else
+              echo "not a git repo at $APP_DIR"; exit 1
+            fi
+
+            echo "== 2) CA и .env =="
+            # добавим переменные для TLS (если их нет)
+            touch .env
+            grep -q '^SSL_CERT_FILE=' .env      || echo 'SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt' >> .env
+            grep -q '^REQUESTS_CA_BUNDLE=' .env || echo 'REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt' >> .env
+
+            echo "== 3) venv + зависимости =="
+            python3 -m venv .venv
+            ./.venv/bin/pip install -U pip wheel
+            ./.venv/bin/pip install -r requirements.txt
+
+            echo "== 4) systemd юниты из репозитория =="
+            sudo install -m 644 deploy/systemd/*.service /etc/systemd/system/
+
+            echo "== 5) перезапуск сервисов =="
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now screener.service push_signals.service menu_bot.service
+            sudo systemctl restart screener.service push_signals.service menu_bot.service
+
+            echo "== 6) smoke-check =="
+            curl -s http://127.0.0.1:8080/health || true
+            echo
+            curl -s http://127.0.0.1:8080/signals | head -c 600 || true
+            echo
+
+            echo "== 7) хвосты логов (на случай диагностики) =="
+            sudo journalctl -u screener.service     -n 20 --no-pager || true
+            sudo journalctl -u push_signals.service -n 20 --no-pager || true
+            sudo journalctl -u menu_bot.service     -n 20 --no-pager || true
