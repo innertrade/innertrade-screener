@@ -6,8 +6,8 @@ Screener Engine (stable 5m)
 - HTTP: /health, /signals
 - Mode: signals_5m
 - Source: Bybit v5
-- All thresholds/интервалы берём из .env, но движок сам НИЧЕГО не фильтрует
-  (фильтрация/классификация — в push_signals.py). Движок лишь считает метрики.
+- Все пороги/интервалы берём из .env. Движок только считает метрики,
+  фильтрация/классификация — в push_signals.py.
 
 Зависимости: Flask, requests
 """
@@ -15,25 +15,24 @@ Screener Engine (stable 5m)
 import os
 import time
 import math
-import json
 import logging
 import threading
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import requests
 from flask import Flask, jsonify
 
 # -------------------- ENV --------------------
 
-HTTP_PORT           = int(os.getenv("HTTP_PORT", "8080"))
-KLINE_SOURCE        = os.getenv("KLINE_SOURCE", "bybit").lower()  # bybit
-OI_SOURCE           = os.getenv("OI_SOURCE", "bybit").lower()     # bybit
-INTERVAL_MIN        = int(os.getenv("INTERVAL_MIN", "5"))         # 5-мин режим
-WINDOW              = int(os.getenv("WINDOW", "48"))              # глубина окна (48 * 5м ≈ 4ч)
-UNIVERSE_ENV        = os.getenv("UNIVERSE", "").strip()           # пусто => авто по Bybit linear USDT
-POLL_SEC            = int(os.getenv("POLL_SEC", "8"))             # как часто обновлять кеш
-HTTP_TIMEOUT        = float(os.getenv("HTTP_TIMEOUT", "8.0"))     # таймаут HTTP
-ADAPTIVE            = os.getenv("ADAPTIVE", "1") == "1"           # просто флаг для /health
+HTTP_PORT     = int(os.getenv("HTTP_PORT", "8080"))
+KLINE_SOURCE  = os.getenv("KLINE_SOURCE", "bybit").lower()     # bybit
+OI_SOURCE     = os.getenv("OI_SOURCE", "bybit").lower()        # bybit
+INTERVAL_MIN  = int(os.getenv("INTERVAL_MIN", "5"))            # 5-мин режим
+WINDOW        = int(os.getenv("WINDOW", "48"))                 # окно (48*5м ≈ 4ч)
+UNIVERSE_ENV  = os.getenv("UNIVERSE", "").strip()              # пусто => авто по Bybit linear USDT
+POLL_SEC      = int(os.getenv("POLL_SEC", "8"))                # частота пересчёта кеша
+HTTP_TIMEOUT  = float(os.getenv("HTTP_TIMEOUT", "8.0"))        # таймаут HTTP
+ADAPTIVE      = os.getenv("ADAPTIVE", "1") == "1"              # просто флаг для /health
 
 # -------------------- LOG --------------------
 
@@ -51,6 +50,7 @@ _STATE = {
     "last_update": 0,       # epoch sec
     "universe": [],         # список символов
     "mode": "signals_5m",
+    "started": False,       # чтобы init случился ровно один раз под gunicorn
 }
 
 # ------------------ Helpers ------------------
@@ -63,6 +63,7 @@ def _get(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
         if r.ok:
             return r.json()
+        logging.warning(f"HTTP non-200 {url} {r.status_code}: {r.text[:200]}")
     except Exception as e:
         logging.warning(f"HTTP GET fail {url}: {e}")
     return None
@@ -70,21 +71,21 @@ def _get(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def _universe_bybit_linear_usdt() -> List[str]:
     """
-    Берём все торгуемые линейные (USDT) контракты с Bybit.
+    Все торгуемые линейные (USDT) фьючерсы на Bybit.
     """
     url = f"{BYBIT_BASE}/v5/market/instruments-info"
     params = {"category": "linear", "status": "Trading"}
     j = _get(url, params)
     out: List[str] = []
-    if j and j.get("retCode") == 0:
+    if j and j.get("retCode") == 0 and j.get("result", {}).get("list"):
         for it in j["result"]["list"]:
-            # Отфильтруем только USDT линейные
             if str(it.get("quoteCoin", "")).upper() == "USDT":
                 sym = str(it.get("symbol", "")).upper()
                 if sym:
                     out.append(sym)
+    out = sorted(list(set(out)))
     logging.info(f"universe(bybit linear USDT): {len(out)} symbols")
-    return sorted(list(set(out)))
+    return out
 
 
 def _load_universe() -> List[str]:
@@ -104,14 +105,13 @@ def _kline_bybit(symbol: str, interval_min: int, limit: int) -> Optional[List[Di
     params = {
         "category": "linear",
         "symbol": symbol,
-        "interval": str(interval_min),  # для kline Bybit принимает '5','15','30','60',...
+        "interval": str(interval_min),  # '5'
         "limit": str(limit),
     }
     j = _get(url, params)
     if not (j and j.get("retCode") == 0 and j.get("result", {}).get("list")):
         return None
-    # Bybit отдаёт в обратном порядке (последняя вперёд); перевернём:
-    rows = j["result"]["list"][::-1]
+    rows = j["result"]["list"][::-1]  # Bybit отдаёт в обратном порядке
 
     out = []
     # row: [startMs, open, high, low, close, volume(base), turnover(quote)]
@@ -124,27 +124,16 @@ def _kline_bybit(symbol: str, interval_min: int, limit: int) -> Optional[List[Di
                 "low": float(row[3]),
                 "close": float(row[4]),
                 "volume_base": float(row[5]),
-                "turnover_quote": float(row[6]),  # в USDT
+                "turnover_quote": float(row[6]),  # USDT
             })
         except Exception:
             return None
     return out
 
 
-def _map_oi_interval(interval_min: int) -> str:
-    """
-    Bybit OI (v5) ждёт строковые интервалы: '5min','15min','30min','60min','240min','1d'
-    """
-    if interval_min in (1, 3, 5, 15, 30, 60, 240):
-        return f"{interval_min}min" if interval_min < 1440 else "1d"
-    # запасной вариант
-    return f"{interval_min}min"
-
-
 def _tickers24h_bybit(symbols: List[str]) -> Dict[str, float]:
     """
-    Вернём словарь symbol -> vol24h_usd (turnover24h).
-    /v5/market/tickers?category=linear
+    symbol -> vol24h_usd (turnover24h). /v5/market/tickers?category=linear
     """
     url = f"{BYBIT_BASE}/v5/market/tickers"
     params = {"category": "linear"}
@@ -163,32 +152,30 @@ def _tickers24h_bybit(symbols: List[str]) -> Dict[str, float]:
 
 def _oi_series_bybit(symbol: str, interval_min: int, limit: int) -> Optional[List[float]]:
     """
-    Вернём ряд Open Interest (значения, возрастающая временная ось).
-    /v5/market/open-interest?category=linear&symbol=BTCUSDT&interval=5min&limit=xx
+    Ряд Open Interest (возрастающая временная ось).
+    /v5/market/open-interest?category=linear&symbol=...&interval=5&limit=xx
     """
     url = f"{BYBIT_BASE}/v5/market/open-interest"
-    interval_str = _map_oi_interval(interval_min)
     params = {
         "category": "linear",
         "symbol": symbol,
-        "interval": interval_str,        # ВАЖНО: строка '5min/15min/...'
+        "interval": str(interval_min),   # ВАЖНО: строка '5', '15', '30', ...
         "limit": str(limit),
     }
     j = _get(url, params)
     if not (j and j.get("retCode") == 0 and j.get("result", {}).get("list")):
         return None
-    rows = j["result"]["list"][::-1]  # в возрастающий порядок
+    rows = j["result"]["list"][::-1]
     out: List[float] = []
     for row in rows:
         try:
-            # row: {'openInterest': 'xxxx', 'timestamp': 'ms'}
             out.append(float(row.get("openInterest") or 0.0))
         except Exception:
             return None
     return out
 
 
-def _mean_std(vals: List[float]) -> Tuple[float, float]:
+def _mean_std(vals: List[float]) -> (float, float):
     n = len(vals)
     if n == 0:
         return 0.0, 0.0
@@ -212,45 +199,29 @@ def _zscore(curr: float, hist: List[float]) -> Optional[float]:
 def _calc_metrics_for_symbol(sym: str, interval_min: int, window: int,
                              vol24h_map: Dict[str, float]) -> Optional[Dict[str, Any]]:
     """
-    Возвращает одну запись для /signals:
-    {
-      "ts": "YYYY-mm-dd HH:MM:SS",
-      "symbol": "BTCUSDT",
-      "close": 61234.5,
-      "zprice": 2.31,
-      "vol_mult": 1.87,
-      "vol24h_usd": 123456789.0,
-      "bar_ts": 1759812000000,
-      "oi_z": 0.91 | None
-    }
+    Запись для /signals
     """
     kl = _kline_bybit(sym, interval_min, limit=window + 1)
     if not kl or len(kl) < (window + 1):
         return None
 
-    # Берём последнюю свечу как "текущую"
     curr = kl[-1]
-    hist = kl[:-1]  # окно истории без текущей
+    hist = kl[:-1]
 
-    # Цена и Z по цене
     close = float(curr["close"])
     close_hist = [float(x["close"]) for x in hist]
     zprice = _zscore(close, close_hist)
 
-    # Объёмы: turnover(quote)
     turn_curr = float(curr["turnover_quote"])
     turn_hist = [float(x["turnover_quote"]) for x in hist]
     mean_turn, _ = _mean_std(turn_hist)
     vol_mult = (turn_curr / mean_turn) if mean_turn > 0 else None
 
-    # vol24h_usd
     vol24h = float(vol24h_map.get(sym, 0.0))
 
-    # ts / bar_ts
     bar_ts = int(curr["start_ms"])
     ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(bar_ts // 1000))
 
-    # OI z-score
     oi_z: Optional[float] = None
     if OI_SOURCE == "bybit":
         oi_series = _oi_series_bybit(sym, interval_min, window + 1)
@@ -258,14 +229,6 @@ def _calc_metrics_for_symbol(sym: str, interval_min: int, window: int,
             oi_hist = oi_series[:-1]
             oi_curr = float(oi_series[-1])
             oi_z = _zscore(oi_curr, oi_hist)
-
-    # Fallback: если не получилось через прямой OI — считаем альтернативой
-    if oi_z is None:
-        try:
-            from oi_fallback import oi_z_score_ext
-            oi_z = oi_z_score_ext(sym, interval=f"{interval_min}min", window=window)
-        except Exception:
-            oi_z = None
 
     return {
         "ts": ts_str,
@@ -281,26 +244,22 @@ def _calc_metrics_for_symbol(sym: str, interval_min: int, window: int,
 
 def _rebuild_signals():
     """
-    Переcчитывает кешированный список сигналов.
-    НИЧЕГО не фильтруем по порогам — это делает push_signals.py.
+    Пересчитывает кешированный список сигналов.
     """
     start = time.time()
     universe = _STATE["universe"]
     if not universe:
+        logging.info("rebuild skipped: universe is empty")
         return
 
-    # 24h обороты одной пачкой
     vol24h_map = _tickers24h_bybit(universe)
 
     res: List[Dict[str, Any]] = []
-    n = 0
-    for sym in universe:
+    for i, sym in enumerate(universe, 1):
         m = _calc_metrics_for_symbol(sym, INTERVAL_MIN, WINDOW, vol24h_map)
         if m:
             res.append(m)
-        n += 1
-        # Небольшой троттлинг, чтобы не убить API
-        if n % 10 == 0:
+        if (i % 10) == 0:
             time.sleep(0.2)
 
     _STATE["signals"] = res
@@ -311,7 +270,6 @@ def _rebuild_signals():
 
 
 def _worker_loop():
-    logging.info(f"runtime init: universe={len(_STATE['universe'])}, interval={INTERVAL_MIN}m, window={WINDOW}")
     logging.info("background worker started")
     while True:
         try:
@@ -321,7 +279,27 @@ def _worker_loop():
         time.sleep(max(2, POLL_SEC))
 
 
+def start_runtime():
+    """
+    Инициализация, которая нужна и под gunicorn (импорт модуля), и под локальным запуском.
+    Запускаем ОДИН раз.
+    """
+    if _STATE.get("started"):
+        return
+    _STATE["universe"] = _load_universe()
+    logging.info(f"runtime init: universe={len(_STATE['universe'])}, interval={INTERVAL_MIN}m, window={WINDOW}")
+    t = threading.Thread(target=_worker_loop, daemon=True)
+    t.start()
+    _STATE["started"] = True
+
+
 # -------------------- HTTP API --------------------
+
+@app.before_first_request
+def _flask_bootstrap():
+    # Под gunicorn это гарантированно вызовется один раз на воркера
+    start_runtime()
+
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -329,7 +307,7 @@ def health():
         "status": "ok",
         "mode": _STATE["mode"],
         "adaptive": ADAPTIVE,
-        "port": HTTP_PORT,  # просто метаданные; фактический порт = у gunicorn
+        "port": HTTP_PORT,
         "last_update": _STATE["last_update"],
         "universe": len(_STATE["universe"]),
         "interval_min": INTERVAL_MIN,
@@ -340,7 +318,7 @@ def health():
 
 @app.route("/signals", methods=["GET"])
 def signals():
-    # Отдаём КЕШ — чтобы /signals был быстрым и стабильным.
+    # Отдаём КЕШ — чтобы /signals был быстрым
     return jsonify({
         "data": _STATE["signals"],
         "count": len(_STATE["signals"]),
@@ -353,12 +331,8 @@ def signals():
 # -------------------- Entry -----------------------
 
 def main():
-    # 1) поднимем вселенную
-    _STATE["universe"] = _load_universe()
-    # 2) старт воркера
-    t = threading.Thread(target=_worker_loop, daemon=True)
-    t.start()
-    # 3) HTTP (при прямом запуске, gunicorn это не трогает)
+    # Локальный запуск `python main.py`
+    start_runtime()
     app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, threaded=True)
 
 
