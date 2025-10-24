@@ -1,3 +1,7 @@
+cd /home/deploy/apps/innertrade-screener
+cp main.py main.py.bak.$(date +%F_%H%M%S)
+
+cat > main.py <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -6,9 +10,8 @@ Screener Engine (stable 5m)
 - HTTP: /health, /signals
 - Mode: signals_5m
 - Source: Bybit v5
-- Скринер считает метрики, фильтрация — в push_signals.py
-
-Зависимости: Flask, requests  (Flask < 3.0)
+- Фильтрации по порогам нет — только расчёт метрик (фильтрует push_signals.py)
+Зависимости: Flask, requests
 """
 
 import os
@@ -21,40 +24,29 @@ from typing import Dict, Any, List, Optional
 import requests
 from flask import Flask, jsonify
 
-# -------------------- ENV --------------------
-
 HTTP_PORT     = int(os.getenv("HTTP_PORT", "8080"))
-KLINE_SOURCE  = os.getenv("KLINE_SOURCE", "bybit").lower()   # bybit
-OI_SOURCE     = os.getenv("OI_SOURCE", "bybit").lower()      # bybit
-INTERVAL_MIN  = int(os.getenv("INTERVAL_MIN", "5"))          # 5-мин режим
-WINDOW        = int(os.getenv("WINDOW", "48"))               # 48 * 5m ≈ 4h
-UNIVERSE_ENV  = os.getenv("UNIVERSE", "").strip()            # пусто => авто по Bybit linear USDT
-POLL_SEC      = int(os.getenv("POLL_SEC", "8"))              # частота обновления кеша
-HTTP_TIMEOUT  = float(os.getenv("HTTP_TIMEOUT", "8.0"))      # таймаут HTTP
-ADAPTIVE      = os.getenv("ADAPTIVE", "1") == "1"            # просто флаг для /health
+KLINE_SOURCE  = os.getenv("KLINE_SOURCE", "bybit").lower()
+OI_SOURCE     = os.getenv("OI_SOURCE", "bybit").lower()
+INTERVAL_MIN  = int(os.getenv("INTERVAL_MIN", "5"))
+WINDOW        = int(os.getenv("WINDOW", "48"))
+UNIVERSE_ENV  = os.getenv("UNIVERSE", "").strip()
+POLL_SEC      = int(os.getenv("POLL_SEC", "8"))
+HTTP_TIMEOUT  = float(os.getenv("HTTP_TIMEOUT", "8.0"))
+ADAPTIVE      = os.getenv("ADAPTIVE", "1") == "1"
 
-# -------------------- LOG --------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-# -------------------- HTTP -------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 app = Flask(__name__)
 
 _STATE = {
-    "signals": [],          # кеш последнего расчёта
-    "last_update": 0,       # epoch sec
-    "universe": [],         # список символов
+    "signals": [],
+    "last_update": 0,
+    "universe": [],
     "mode": "signals_5m",
+    "_bg_started": False,
 }
 
-# ------------------ Helpers ------------------
-
 BYBIT_BASE = "https://api.bybit.com"
-
 
 def _get(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
@@ -62,16 +54,12 @@ def _get(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if r.ok:
             return r.json()
         else:
-            logging.warning(f"HTTP GET {url} -> {r.status_code}: {r.text[:200]}")
+            logging.warning(f"HTTP {r.status_code} for {url} params={params} body={r.text[:200]}")
     except Exception as e:
         logging.warning(f"HTTP GET fail {url}: {e}")
     return None
 
-
 def _universe_bybit_linear_usdt() -> List[str]:
-    """
-    Берём все торгуемые линейные (USDT) контракты с Bybit.
-    """
     url = f"{BYBIT_BASE}/v5/market/instruments-info"
     params = {"category": "linear", "status": "Trading"}
     j = _get(url, params)
@@ -83,37 +71,23 @@ def _universe_bybit_linear_usdt() -> List[str]:
                 if sym:
                     out.append(sym)
     logging.info(f"universe(bybit linear USDT): {len(out)} symbols")
-    return sorted(list(set(out)))
-
+    return sorted(set(out))
 
 def _load_universe() -> List[str]:
     if UNIVERSE_ENV:
         arr = [s.strip().upper() for s in UNIVERSE_ENV.split(",") if s.strip()]
-        logging.info(f"universe(from env UNIVERSE): {len(arr)} symbols")
+        logging.info(f"universe(from .env UNIVERSE): {len(arr)} symbols")
         return arr
     return _universe_bybit_linear_usdt()
 
-
 def _kline_bybit(symbol: str, interval_min: int, limit: int) -> Optional[List[Dict[str, Any]]]:
-    """
-    Bybit kline (linear): /v5/market/kline
-    Возвращаем список свечей по времени (возрастающе).
-    """
     url = f"{BYBIT_BASE}/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": str(interval_min),  # '5'
-        "limit": str(limit),
-    }
+    params = {"category": "linear", "symbol": symbol, "interval": str(interval_min), "limit": str(limit)}
     j = _get(url, params)
     if not (j and j.get("retCode") == 0 and j.get("result", {}).get("list")):
         return None
-    # Bybit отдаёт в обратном порядке; перевернём в возрастающий:
     rows = j["result"]["list"][::-1]
-
     out = []
-    # row: [startMs, open, high, low, close, volume(base), turnover(quote)]
     for row in rows:
         try:
             out.append({
@@ -123,18 +97,13 @@ def _kline_bybit(symbol: str, interval_min: int, limit: int) -> Optional[List[Di
                 "low": float(row[3]),
                 "close": float(row[4]),
                 "volume_base": float(row[5]),
-                "turnover_quote": float(row[6]),  # в USDT
+                "turnover_quote": float(row[6]),
             })
         except Exception:
             return None
     return out
 
-
 def _tickers24h_bybit(symbols: List[str]) -> Dict[str, float]:
-    """
-    Вернём словарь symbol -> vol24h_usd (turnover24h).
-    /v5/market/tickers?category=linear
-    """
     url = f"{BYBIT_BASE}/v5/market/tickers"
     params = {"category": "linear"}
     j = _get(url, params)
@@ -149,24 +118,19 @@ def _tickers24h_bybit(symbols: List[str]) -> Dict[str, float]:
                     out[sym] = 0.0
     return out
 
-
 def _oi_series_bybit(symbol: str, interval_min: int, limit: int) -> Optional[List[float]]:
-    """
-    Вернём ряд Open Interest (значения, возрастающий порядок).
-    /v5/market/open-interest?category=linear&symbol=BTCUSDT&interval=5&limit=xx
-    ВАЖНО: interval — строка: '5','15','30',... (без 'min').
-    """
+    # ВАЖНО: здесь intervalTime='<N>min', а не 'interval'
     url = f"{BYBIT_BASE}/v5/market/open-interest"
     params = {
         "category": "linear",
         "symbol": symbol,
-        "interval": str(interval_min),
+        "intervalTime": f"{interval_min}min",
         "limit": str(limit),
     }
     j = _get(url, params)
     if not (j and j.get("retCode") == 0 and j.get("result", {}).get("list")):
         return None
-    rows = j["result"]["list"][::-1]  # возрастающий порядок
+    rows = j["result"]["list"][::-1]
     out: List[float] = []
     for row in rows:
         try:
@@ -174,9 +138,6 @@ def _oi_series_bybit(symbol: str, interval_min: int, limit: int) -> Optional[Lis
         except Exception:
             return None
     return out
-
-
-# ==================== Math ====================
 
 def _mean_std(vals: List[float]) -> (float, float):
     n = len(vals)
@@ -186,7 +147,6 @@ def _mean_std(vals: List[float]) -> (float, float):
     var = sum((x - m) ** 2 for x in vals) / max(1, (n - 1))
     return m, math.sqrt(var)
 
-
 def _zscore(curr: float, hist: List[float]) -> Optional[float]:
     if len(hist) < 5:
         return None
@@ -195,14 +155,8 @@ def _zscore(curr: float, hist: List[float]) -> Optional[float]:
         return None
     return (curr - m) / s
 
-
-# ==================== Metrics ====================
-
 def _calc_metrics_for_symbol(sym: str, interval_min: int, window: int,
                              vol24h_map: Dict[str, float]) -> Optional[Dict[str, Any]]:
-    """
-    Возвращает одну запись для /signals.
-    """
     kl = _kline_bybit(sym, interval_min, limit=window + 1)
     if not kl or len(kl) < (window + 1):
         return None
@@ -214,20 +168,16 @@ def _calc_metrics_for_symbol(sym: str, interval_min: int, window: int,
     close_hist = [float(x["close"]) for x in hist]
     zprice = _zscore(close, close_hist)
 
-    # объёмы: turnover(quote)
     turn_curr = float(curr["turnover_quote"])
     turn_hist = [float(x["turnover_quote"]) for x in hist]
     mean_turn, _ = _mean_std(turn_hist)
     vol_mult = (turn_curr / mean_turn) if mean_turn > 0 else None
 
-    # vol24h_usd
     vol24h = float(vol24h_map.get(sym, 0.0))
 
-    # ts / bar_ts
     bar_ts = int(curr["start_ms"])
     ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(bar_ts // 1000))
 
-    # OI z-score
     oi_z: Optional[float] = None
     if OI_SOURCE == "bybit":
         oi_series = _oi_series_bybit(sym, interval_min, window + 1)
@@ -247,12 +197,7 @@ def _calc_metrics_for_symbol(sym: str, interval_min: int, window: int,
         "oi_z": round(oi_z, 2) if oi_z is not None else None,
     }
 
-
 def _rebuild_signals():
-    """
-    Пересчитывает кешированный список сигналов.
-    Ничего не фильтруем — только метрики.
-    """
     start = time.time()
     universe = _STATE["universe"]
     if not universe:
@@ -268,14 +213,13 @@ def _rebuild_signals():
             res.append(m)
         n += 1
         if n % 10 == 0:
-            time.sleep(0.2)  # лёгкий троттлинг API
+            time.sleep(0.2)
 
     _STATE["signals"] = res
     _STATE["last_update"] = int(time.time())
 
     took = time.time() - start
     logging.info(f"signals rebuilt: {len(res)} rows in {took:.1f}s (universe={len(universe)})")
-
 
 def _worker_loop():
     logging.info("background worker started")
@@ -286,24 +230,13 @@ def _worker_loop():
             logging.exception(f"rebuild error: {e}")
         time.sleep(max(2, POLL_SEC))
 
-
-# ---------- Инициализация для gunicorn (импортом) ----------
-
-_INIT_DONE = False
-def _init_runtime():
-    global _INIT_DONE
-    if _INIT_DONE:
-        return
-    _STATE["universe"] = _load_universe()
-    logging.info(f"runtime init: universe={len(_STATE['universe'])}, interval={INTERVAL_MIN}m, window={WINDOW}")
-    t = threading.Thread(target=_worker_loop, daemon=True)
-    t.start()
-    _INIT_DONE = True
-
-# ВАЖНО: для gunicorn main() не вызывается — делаем init на импорте.
-_init_runtime()
-
-# -------------------- HTTP API --------------------
+def _bootstrap():
+    if not _STATE.get("_bg_started"):
+        _STATE["universe"] = _load_universe()
+        logging.info(f"runtime init: universe={len(_STATE['universe'])}, interval={INTERVAL_MIN}m, window={WINDOW}")
+        t = threading.Thread(target=_worker_loop, daemon=True)
+        t.start()
+        _STATE["_bg_started"] = True
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -319,10 +252,8 @@ def health():
         "source": {"kline": KLINE_SOURCE, "oi": OI_SOURCE},
     })
 
-
 @app.route("/signals", methods=["GET"])
 def signals():
-    # отдаём кеш — быстро и стабильно
     return jsonify({
         "data": _STATE["signals"],
         "count": len(_STATE["signals"]),
@@ -331,13 +262,11 @@ def signals():
         "window": WINDOW,
     })
 
-
-# -------------------- Local run -------------------
+_bootstrap()
 
 def main():
-    # локальный запуск (без gunicorn) — init уже выполнен выше
     app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, threaded=True)
-
 
 if __name__ == "__main__":
     main()
+PY
