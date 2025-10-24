@@ -162,6 +162,18 @@ def _oi_series_bybit(symbol: str, interval_min: int, limit: int) -> Optional[Lis
         "limit": str(limit),
     }
     j = _get(url, params)
+    
+    # Диагностическое логирование OI
+    if j:
+        logging.info(f"OI DEBUG: {symbol} - retCode={j.get('retCode')}, retMsg={j.get('retMsg')}")
+        if j.get("retCode") == 0 and j.get("result", {}).get("list"):
+            list_len = len(j["result"]["list"])
+            logging.info(f"OI DEBUG: {symbol} - received {list_len} OI data points")
+        else:
+            logging.warning(f"OI DEBUG: {symbol} - no data in response")
+    else:
+        logging.warning(f"OI DEBUG: {symbol} - no response from API")
+    
     if not (j and j.get("retCode") == 0 and j.get("result", {}).get("list")):
         if j:
             logging.warning(
@@ -254,8 +266,10 @@ def _rebuild_signals():
     start = time.time()
     universe = _STATE["universe"]
     if not universe:
+        logging.warning("Universe is empty, skipping rebuild")
         return
 
+    logging.info(f"Starting rebuild for {len(universe)} symbols")
     vol24h_map = _tickers24h_bybit(universe)
 
     res: List[Dict[str, Any]] = []
@@ -266,17 +280,20 @@ def _rebuild_signals():
             res.append(m)
         n += 1
         if n % 10 == 0:
-            time.sleep(0.2)
+            time.sleep(0.2)  # Rate limit protection
 
     _STATE["signals"] = res
     _STATE["last_update"] = int(time.time())
 
     took = time.time() - start
-    logging.info(f"signals rebuilt: {len(res)} rows in {took:.1f}s (universe={len(universe)})")
+    oi_non_null = len([s for s in res if s.get("oi_z") is not None])
+    logging.info(f"signals rebuilt: {len(res)} rows, OI non-null: {oi_non_null} in {took:.1f}s (universe={len(universe)})")
 
 
 def _worker_loop():
-    logging.info(f"runtime init: universe={len(_STATE['universe'])}, interval={INTERVAL_MIN}m, window={WINDOW}")
+    logging.info(f"Config: source_kline={KLINE_SOURCE}, source_oi={OI_SOURCE}, "
+                 f"interval_min={INTERVAL_MIN}, window={WINDOW}, poll_sec={POLL_SEC}, "
+                 f"universe_size={len(_STATE['universe'])}")
     logging.info("background worker started")
     while True:
         try:
