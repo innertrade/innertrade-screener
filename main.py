@@ -50,6 +50,7 @@ _STATE: Dict[str, Any] = {
     "last_update": 0,       # epoch sec
     "universe": [],         # список символов
     "mode": "signals_5m",
+    "_bg_started": False,   # защита от повторного старта воркера
 }
 
 # ------------------ Helpers ------------------
@@ -157,7 +158,7 @@ def _oi_series_bybit(symbol: str, interval_min: int, limit: int) -> Optional[Lis
     params = {
         "category": "linear",
         "symbol": symbol,
-        "intervalTime": f"{interval_min}min",  # <-- ключ и формат, которые требуются Bybit
+        "intervalTime": f"{interval_min}min",  # <-- правильный ключ и формат
         "limit": str(limit),
     }
     j = _get(url, params)
@@ -281,6 +282,22 @@ def _worker_loop():
         time.sleep(max(2, POLL_SEC))
 
 
+def _start_background_once():
+    if _STATE.get("_bg_started"):
+        return
+    _STATE["_bg_started"] = True
+    # 1) поднимем вселенную
+    _STATE["universe"] = _load_universe()
+    logging.info(f"runtime init: universe={len(_STATE['universe'])}, interval={INTERVAL_MIN}m, window={WINDOW}")
+    # 2) старт воркера
+    t = threading.Thread(target=_worker_loop, daemon=True)
+    t.start()
+
+
+# ---- ВАЖНО: запускаем инициализацию ПРИ ИМПОРТЕ (работает под gunicorn) ----
+_start_background_once()
+
+
 # -------------------- HTTP API --------------------
 
 @app.route("/health", methods=["GET"])
@@ -309,15 +326,10 @@ def signals():
     })
 
 
-# -------------------- Entry -----------------------
+# -------------------- Entry (локальный run) -----------------------
 
 def main():
-    _STATE["universe"] = _load_universe()
-    logging.info(f"runtime init: universe={len(_STATE['universe'])}, interval={INTERVAL_MIN}m, window={WINDOW}")
-
-    t = threading.Thread(target=_worker_loop, daemon=True)
-    t.start()
-
+    # при локальном запуске всё уже инициализировано импортом
     app.run(host="0.0.0.0", port=HTTP_PORT, debug=False, threaded=True)
 
 
