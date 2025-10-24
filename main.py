@@ -1,3 +1,5 @@
+cd /home/deploy/apps/innertrade-screener
+cat > main.py <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -7,7 +9,6 @@ Screener Engine (stable 5m)
 - Mode: signals_5m
 - Source: Bybit v5
 - Фильтрации по порогам нет — только расчёт метрик (фильтрует push_signals.py)
-
 Зависимости: Flask, requests
 """
 
@@ -24,14 +25,14 @@ from flask import Flask, jsonify
 # -------------------- ENV --------------------
 
 HTTP_PORT           = int(os.getenv("HTTP_PORT", "8080"))
-KLINE_SOURCE        = os.getenv("KLINE_SOURCE", "bybit").lower()  # bybit
-OI_SOURCE           = os.getenv("OI_SOURCE", "bybit").lower()     # bybit
-INTERVAL_MIN        = int(os.getenv("INTERVAL_MIN", "5"))         # 5-мин режим
-WINDOW              = int(os.getenv("WINDOW", "48"))              # глубина окна (48 * 5м ≈ 4ч)
-UNIVERSE_ENV        = os.getenv("UNIVERSE", "").strip()           # пусто => авто по Bybit linear USDT
-POLL_SEC            = int(os.getenv("POLL_SEC", "8"))             # как часто обновлять кеш
-HTTP_TIMEOUT        = float(os.getenv("HTTP_TIMEOUT", "8.0"))     # таймаут HTTP
-ADAPTIVE            = os.getenv("ADAPTIVE", "1") == "1"           # просто флаг для /health
+KLINE_SOURCE        = os.getenv("KLINE_SOURCE", "bybit").lower()   # bybit
+OI_SOURCE           = os.getenv("OI_SOURCE", "bybit").lower()      # bybit
+INTERVAL_MIN        = int(os.getenv("INTERVAL_MIN", "5"))          # 5-мин режим
+WINDOW              = int(os.getenv("WINDOW", "48"))               # глубина окна (48 * 5м ≈ 4ч)
+UNIVERSE_ENV        = os.getenv("UNIVERSE", "").strip()            # пусто => авто по Bybit linear USDT
+POLL_SEC            = int(os.getenv("POLL_SEC", "8"))              # как часто обновлять кеш
+HTTP_TIMEOUT        = float(os.getenv("HTTP_TIMEOUT", "8.0"))      # таймаут HTTP
+ADAPTIVE            = os.getenv("ADAPTIVE", "1") == "1"            # просто флаг для /health
 
 # -------------------- LOG --------------------
 
@@ -322,3 +323,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+PY
