@@ -70,21 +70,22 @@ def _get(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def _universe_bybit_linear_usdt() -> List[str]:
     """
-    Берём все торгуемые линейные (USDT) контракты с Bybit.
+    Берём все торгуемые линейные USDT-перпетуалы с Bybit.
     """
     url = f"{BYBIT_BASE}/v5/market/instruments-info"
-    params = {"category": "linear", "status": "Trading"}
+    # Ключевое: contractType=LinearPerpetual — исключаем dated futures и всё не-перпетуальное
+    params = {"category": "linear", "status": "Trading", "contractType": "LinearPerpetual"}
     j = _get(url, params)
     out: List[str] = []
     if j and j.get("retCode") == 0:
         for it in j["result"]["list"]:
-            # Отфильтруем только USDT линейные
             if str(it.get("quoteCoin", "")).upper() == "USDT":
                 sym = str(it.get("symbol", "")).upper()
                 if sym:
                     out.append(sym)
-    logging.info(f"universe(bybit linear USDT): {len(out)} symbols")
-    return sorted(list(set(out)))
+    out = sorted(list(set(out)))
+    logging.info(f"universe(bybit linear USDT perp): {len(out)} symbols")
+    return out
 
 
 def _load_universe() -> List[str]:
@@ -154,13 +155,13 @@ def _tickers24h_bybit(symbols: List[str]) -> Dict[str, float]:
 def _oi_series_bybit(symbol: str, interval_min: int, limit: int) -> Optional[List[float]]:
     """
     Вернём ряд Open Interest (значения, возрастающая временная ось).
-    /v5/market/open-interest?category=linear&symbol=BTCUSDT&interval=5&limit=xx
+    /v5/market/open-interest?category=linear&symbol=BTCUSDT&interval=5min&limit=xx
     """
     url = f"{BYBIT_BASE}/v5/market/open-interest"
     params = {
         "category": "linear",
         "symbol": symbol,
-        "interval": str(interval_min),
+        "interval": f"{int(interval_min)}min",  # <-- ключевой фикс: '5min'
         "limit": str(limit),
     }
     j = _get(url, params)
