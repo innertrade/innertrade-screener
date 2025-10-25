@@ -20,58 +20,28 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Deploy over SSH
+      - name: Upload wipe & sync script
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "scripts/its_wipe_sync_run.sh"
+          target: "/root"
+
+      - name: Run wipe & sync
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: root
           key: ${{ secrets.VPS_SSH_KEY }}
           script_stop: true
-          command_timeout: 30m
+          command_timeout: 45m
+          envs: TELEGRAM_BOT_TOKEN,TELEGRAM_CHAT_ID
           script: |
             set -euo pipefail
-            APP=/home/deploy/apps/innertrade-screener
-
-            # Код из GitHub (SSH-remote, чтобы не спрашивал логин/пароль)
-            install -d -m 755 -o deploy -g deploy "$APP"
-            su -s /bin/bash -c "
-              set -e
-              cd '$APP'
-              if [ ! -d .git ]; then
-                git init
-                git remote add origin git@github.com:innertrade/innertrade-screener.git
-              else
-                git remote set-url origin git@github.com:innertrade/innertrade-screener.git || true
-              fi
-              git fetch --depth=1 origin main
-              git reset --hard origin/main
-            " deploy
-
-            cd "$APP"
-
-            # .env: создать при отсутствии и обновить секреты
-            [ -f .env ] || { install -m 600 /dev/null .env && chown deploy:deploy .env; }
-            grep -q '^TELEGRAM_BOT_TOKEN=' .env || echo 'TELEGRAM_BOT_TOKEN=' >> .env
-            grep -q '^TELEGRAM_CHAT_ID='   .env || echo 'TELEGRAM_CHAT_ID='   >> .env
-            sed -i \
-              -e "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}|" \
-              -e "s|^TELEGRAM_CHAT_ID=.*|TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}|" \
-              .env
-            chown deploy:deploy .env
-
-            # venv + зависимости + certifi
-            su -s /bin/bash -c "
-              python3 -m venv '$APP/.venv'
-              '$APP/.venv/bin/pip' install -U pip wheel certifi
-              '$APP/.venv/bin/pip' install -r '$APP/requirements.txt'
-            " deploy
-
-            # Фикс TLS: стабильный путь к CA bundle
-            CERT_FILE=$("$APP/.venv/bin/python" -c "import certifi, sys; print(certifi.where(), end='')")
-            ln -sf "$CERT_FILE" "$APP/cacert.pem"
-
-            # systemd units и рестарт сервисов
-            install -m 644 "$APP/deploy/systemd/"*.service /etc/systemd/system/
-            systemctl daemon-reload
-            systemctl enable --now screener.service push_signals.service menu_bot.service || true
-            systemctl restart screener.service push_signals.service menu_bot.service || true
+            install -m 755 /root/scripts/its_wipe_sync_run.sh /root/its_wipe_sync_run.sh
+            bash /root/its_wipe_sync_run.sh

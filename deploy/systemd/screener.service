@@ -9,7 +9,8 @@ User=deploy
 Group=deploy
 WorkingDirectory=/home/deploy/apps/innertrade-screener
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python -u main.py
+Environment=HTTP_PORT=8088
+ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/gunicorn --bind 0.0.0.0:8088 --workers 2 --threads 2 --timeout 90 main:app
 Restart=always
 RestartSec=2
 KillSignal=SIGINT
