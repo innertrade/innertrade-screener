@@ -22,7 +22,7 @@ from flask import Flask, jsonify
 
 # -------------------- ENV --------------------
 
-HTTP_PORT           = int(os.getenv("HTTP_PORT", "8080"))
+HTTP_PORT           = int(os.getenv("HTTP_PORT", "8088"))
 KLINE_SOURCE        = os.getenv("KLINE_SOURCE", "bybit").lower()     # bybit
 OI_SOURCE           = os.getenv("OI_SOURCE", "bybit").lower()        # bybit
 INTERVAL_MIN        = int(os.getenv("INTERVAL_MIN", "5"))            # 5-мин режим
