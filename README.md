@@ -39,6 +39,33 @@ bash /root/its_wipe_sync_run.sh
 
 Все параметры (URL репозитория, каталог приложения, имя сервиса) можно переопределить переменными окружения. Подробности — в самом скрипте.
 
+## Нормализация серверного окружения
+
+Если на сервере остаются процессы со статусом `cwd -> (deleted)` или активны легаси-сервисы `screener.service` / `push_trend.service`, используйте сценарий `its_fix_stack.sh`.
+
+**Двухшаговый запуск:**
+
+1. Создайте (или обновите) файл и выставьте права:
+
+   ```bash
+   sudo install -Dm755 its_fix_stack.sh /root/its_fix_stack.sh
+   ```
+
+2. Выполните сценарий от `root`:
+
+   ```bash
+   sudo bash /root/its_fix_stack.sh
+   ```
+
+Скрипт сам:
+
+* завершит процессы `python`/`gunicorn`/`push_trend` со сброшенным рабочим каталогом;
+* отключит `screener.service` и `push_trend.service`;
+* перезапустит `innertrade-screener.service`, `menu_bot.service`, `push_signals.service`;
+* проверит, что `127.0.0.1:8088` слушает gunicorn и `/health` отвечает `status: "ok"`.
+
+После выполнения убедитесь, что повторный запуск не приводит к ошибкам, а `systemctl list-unit-files | grep -E 'screener|push_trend'` показывает состояние `disabled`.
+
 ## Детектор дрейфа `main.py`
 
 `scripts/detect_main_drift.py` сравнивает локальный `main.py` c версией из `origin/main` и дополнительно проверяет, что в коде присутствует строка `intervalTime` и отсутствуют артефакты вида `"interval": str(`.
