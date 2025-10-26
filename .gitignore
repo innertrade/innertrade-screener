@@ -5,6 +5,7 @@ __pycache__/
 *.bak*
 *.log
 *.out
+runtime/*.json
 
 # ignore virtual environments
 .venv/
