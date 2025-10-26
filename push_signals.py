@@ -7,7 +7,22 @@ from typing import Optional, Dict, Any
 
 import requests
 from dotenv import load_dotenv
-from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+
+from push_state import get_push_enabled, set_push_enabled, write_runtime_status, log_event
+
+import requests as _rq
+
+
+def tg_send_http(token: str, chat_id: int, text: str, reply_markup=None):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    if reply_markup and hasattr(reply_markup, "to_dict"):
+        payload["reply_markup"] = reply_markup.to_dict()
+    try:
+        _rq.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[tg_send_http] post failed: {e}")
 
 from push_state import get_push_enabled, set_push_enabled, write_runtime_status, log_event
 
@@ -26,7 +41,6 @@ FORWARD_OI_INTERVAL = os.getenv("FORWARD_OI_INTERVAL", "5min")
 FORWARD_POLL_SEC = int(float(os.getenv("FORWARD_POLL_SEC", "8")))
 FLAG_REFRESH_SEC = int(float(os.getenv("PUSH_FLAG_REFRESH_SEC", "3")))
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 _SENT_BARS: Dict[str, int] = {}
 
 def _map_symbol_to_bybit_linear(sym: str) -> str:
@@ -64,7 +78,7 @@ def _get_oi_z(symbol: str) -> Optional[float]:
         return None
 
 def _send_telegram(sig: Dict[str, Any], oiz: Optional[float]):
-    if not bot or TELEGRAM_CHAT_ID == 0:
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID == 0:
         return
     symbol = sig["symbol"]
     z = float(sig.get("zprice") or 0.0)
@@ -85,7 +99,7 @@ def _send_telegram(sig: Dict[str, Any], oiz: Optional[float]):
         [InlineKeyboardButton("Bybit Futures", url=_bybit_futures_link(symbol)),
          InlineKeyboardButton("TradingView", url=f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{_format_tv_symbol(symbol)}")]
     ])
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, reply_markup=kb, disable_web_page_preview=True)
+    tg_send_http(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, text, kb)
 
 def _should_forward(sig: Dict[str, Any]) -> bool:
     z = abs(float(sig.get("zprice") or 0.0))
