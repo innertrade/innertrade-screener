@@ -1,89 +1,101 @@
 from __future__ import annotations
 
-import logging
 import os
 from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
-from telegram import ReplyKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram import Message, ReplyKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-from state_manager import (
-    ensure_state_file,
-    get_push_enabled,
-    get_trend_enabled,
-    set_push_enabled,
-    set_trend_enabled,
-    toggle_push_enabled,
-    toggle_trend_enabled,
-)
+from push_state import get_push_enabled, set_push_enabled
+
+from push_state import get_push_enabled, set_push_enabled
 
 load_dotenv()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 MSK = timezone(timedelta(hours=3))
 
-LOGGER = logging.getLogger(__name__)
 
-# --- UI strings ---
-BTN_DASHBOARD = "📊 Дашборд баблы"
-BTN_THERMAL = "🌡 Температура рынка"
-BTN_NEWS = "📰 Новости"
-BTN_CALC = "🧮 Калькулятор"
-BTN_SIGNALS = "📡 Сигналы"
-BTN_TREND = "📈 TRND"
-STATE_ON = "✅ ON"
-STATE_OFF = "⛔ OFF"
-CMD_ON = "ON"
-CMD_OFF = "OFF"
-CMD_TRND = "TRND"
-CMD_TREND_ON = "TRND ON"
-CMD_TREND_OFF = "TRND OFF"
-
-
-def _render_toggle(label: str, enabled: bool) -> str:
-    return f"{label}: {STATE_ON if enabled else STATE_OFF}"
-
-
-def _build_keyboard() -> ReplyKeyboardMarkup:
-    push = get_push_enabled()
-    trend = get_trend_enabled()
-    keyboard = [
-        [BTN_DASHBOARD, BTN_THERMAL],
-        [BTN_NEWS, BTN_CALC],
+def _build_keyboard(push_enabled: bool) -> ReplyKeyboardMarkup:
+    status_label = "✅ ON" if push_enabled else "⛔ OFF"
+    return ReplyKeyboardMarkup(
         [
-            _render_toggle(BTN_SIGNALS, push),
-            _render_toggle(BTN_TREND, trend),
+            ["📊 Дашборд баблы", "🌡 Температура рынка"],
+            ["📰 Новости", "🧮 Калькулятор"],
+            [f"📡 Сигналы: {status_label}", "ℹ️ Команды: /on /off"],
         ],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-
-async def _reply_with_confirmation(update: Update, text: str) -> None:
-    try:
-        await update.message.reply_text(text, reply_markup=_build_keyboard())
-    except Exception as exc:  # pragma: no cover - telegram runtime guards
-        LOGGER.error("Failed to send confirmation: %s", exc)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ensure_state_file()
-    now = datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
-    await update.message.reply_text(
-        f"Привет! Время: {now}", reply_markup=_build_keyboard()
+        resize_keyboard=True,
     )
 
 
-async def _handle_push_toggle(update: Update) -> None:
-    new_state = toggle_push_enabled()
-    status = "Рассылка включена" if new_state else "Рассылка приостановлена"
-    await _reply_with_confirmation(update, status)
+def _authorized(update: Update) -> bool:
+    if CHAT_ID == 0:
+        return True
+    if not update.effective_chat:
+        return False
+    return update.effective_chat.id == CHAT_ID
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    if not _authorized(update):
+        await message.reply_text("Недостаточно прав для управления ботом.")
+        return
+    push_enabled = get_push_enabled()
+    now = datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
+    await message.reply_text(
+        f"Привет! Время: {now}",
+        reply_markup=_build_keyboard(push_enabled),
+    )
+
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    if not _authorized(update):
+        await message.reply_text("Недостаточно прав для управления ботом.")
+        return
+    push_enabled = get_push_enabled()
+    txt = (update.message.text or "").strip()
+    await message.reply_text(
+        f"Вы нажали: {txt}\nТекущее состояние рассылки: {'ON' if push_enabled else 'OFF'}",
+        reply_markup=_build_keyboard(push_enabled),
+    )
+
+
+async def cmd_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    if not _authorized(update):
+        await message.reply_text("Недостаточно прав для управления рассылкой.")
+        return
+    set_push_enabled(True, source="menu_bot")
+    await message.reply_text(
+        "Рассылка включена ✅",
+        reply_markup=_build_keyboard(True),
+    )
+
+
+async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    if not _authorized(update):
+        await message.reply_text("Недостаточно прав для управления рассылкой.")
+        return
+    set_push_enabled(False, source="menu_bot")
+    await message.reply_text(
+        "Рассылка приостановлена ⏸️",
+        reply_markup=_build_keyboard(False),
+    )
+
 
 
 async def _handle_trend_toggle(update: Update) -> None:
@@ -150,7 +162,9 @@ def main() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CommandHandler("on", cmd_on))
+    app.add_handler(CommandHandler("off", cmd_off))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     app.run_polling()
 
 

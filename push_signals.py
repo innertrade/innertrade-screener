@@ -1,22 +1,30 @@
 from __future__ import annotations
-
 import argparse
-import logging
 import os
+import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Optional, Dict, Any
 
 import requests
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
-from state_manager import (
-    ensure_state_file,
-    get_push_enabled,
-    get_trend_enabled,
-    set_push_enabled,
-    set_trend_enabled,
-)
+from push_state import get_push_enabled, set_push_enabled, write_runtime_status, log_event
+
+import requests as _rq
+
+
+def tg_send_http(token: str, chat_id: int, text: str, reply_markup=None):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    if reply_markup and hasattr(reply_markup, "to_dict"):
+        payload["reply_markup"] = reply_markup.to_dict()
+    try:
+        _rq.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[tg_send_http] post failed: {e}")
+
+from push_state import get_push_enabled, set_push_enabled, write_runtime_status, log_event
 
 load_dotenv()
 
@@ -31,10 +39,8 @@ FORWARD_MIN_OIZ = float(os.getenv("FORWARD_MIN_OIZ", "0.8"))
 FORWARD_OI_WINDOW = int(float(os.getenv("FORWARD_OI_WINDOW", "48")))
 FORWARD_OI_INTERVAL = os.getenv("FORWARD_OI_INTERVAL", "5min")
 FORWARD_POLL_SEC = int(float(os.getenv("FORWARD_POLL_SEC", "8")))
-FORWARD_TIMEOUT = int(float(os.getenv("FORWARD_TIMEOUT", "10")))
+FLAG_REFRESH_SEC = int(float(os.getenv("PUSH_FLAG_REFRESH_SEC", "3")))
 
-logger = logging.getLogger("push_signals")
-_session = requests.Session()
 _SENT_BARS: Dict[str, int] = {}
 
 
@@ -103,23 +109,10 @@ def _get_oi_z(symbol: str) -> Optional[float]:
         logger.debug("oi lookup failed for %s: %s", symbol, exc)
         return None
 
-
-def _state_allows(sig: Dict[str, Any]) -> bool:
-    channel = (sig.get("channel") or sig.get("group") or sig.get("stream") or "").upper()
-    if channel in {"TRND", "TVOI", "TREND"}:
-        return get_trend_enabled()
-    return get_push_enabled()
-
-
-def _should_forward(sig: Dict[str, Any]) -> bool:
-    z = abs(float(sig.get("zprice") or 0.0))
-    volx = float(sig.get("vol_mult") or 0.0)
-    v24 = float(sig.get("vol24h_usd") or 0.0)
-    return z >= FORWARD_MIN_Z and volx >= FORWARD_MIN_VOLX and v24 >= FORWARD_MIN_VOL24H
-
-
-def _format_signal(sig: Dict[str, Any], oiz: Optional[float]) -> tuple[str, InlineKeyboardMarkup]:
-    symbol = sig["symbol"].upper()
+def _send_telegram(sig: Dict[str, Any], oiz: Optional[float]):
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID == 0:
+        return
+    symbol = sig["symbol"]
     z = float(sig.get("zprice") or 0.0)
     volx = float(sig.get("vol_mult") or 0.0)
     v24 = float(sig.get("vol24h_usd") or 0.0)
@@ -132,121 +125,105 @@ def _format_signal(sig: Dict[str, Any], oiz: Optional[float]) -> tuple[str, Inli
         klass["oi_line"],
         f"24h Volume ≈ ${v24:,.0f}".replace(",", " "),
     ]
-    text = "\n".join(filter(None, lines))
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Bybit Futures", url=_bybit_futures_link(symbol)),
-                InlineKeyboardButton(
-                    "TradingView",
-                    url=f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{_format_tv_symbol(symbol)}",
-                ),
-            ]
-        ]
-    )
-    return text, kb
+    text = "\n".join([ln for ln in lines if ln])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Bybit Futures", url=_bybit_futures_link(symbol)),
+         InlineKeyboardButton("TradingView", url=f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{_format_tv_symbol(symbol)}")]
+    ])
+    tg_send_http(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, text, kb)
 
 
-def _send_signal(sig: Dict[str, Any], oiz: Optional[float]) -> None:
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        logger.debug("Telegram credentials missing; skipping send")
-        return
-    text, kb = _format_signal(sig, oiz)
-    sent = tg_send_http(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, text, kb)
-    if not sent:
-        logger.warning('telegram delivery failed for %%s', sig.get('symbol'))
-
-
-def _record_seen(symbol: str, bar_ts: int) -> None:
-    prev = _SENT_BARS.get(symbol)
-    if prev is None or bar_ts > prev:
-        _SENT_BARS[symbol] = bar_ts
-
-
-def forward_loop() -> None:
-    ensure_state_file()
-    logger.info(
-        "forward loop start | host=%s thresholds: z>=%.2f volx>=%.2f v24>=%s oiz>=%.2f",
-        HOST,
-        FORWARD_MIN_Z,
-        FORWARD_MIN_VOLX,
-        f"${FORWARD_MIN_VOL24H:,.0f}".replace(",", " "),
-        FORWARD_MIN_OIZ,
-    )
-    while True:
-        try:
-            data = _fetch_signals()
-        except Exception as exc:
-            logger.error("fetch error: %s", exc)
-            time.sleep(max(1, FORWARD_POLL_SEC))
-            continue
-
-        items = data.get("data") or []
-        for sig in items:
-            symbol = str(sig.get("symbol") or "").upper()
-            bar_ts = int(sig.get("bar_ts") or 0)
-            if not symbol or bar_ts <= 0:
-                continue
-            last_seen = _SENT_BARS.get(symbol)
-            if last_seen and last_seen >= bar_ts:
-                continue
-            if not _should_forward(sig):
-                _record_seen(symbol, bar_ts)
-                continue
-            if not _state_allows(sig):
-                _record_seen(symbol, bar_ts)
-                continue
-            oiz = _get_oi_z(symbol)
-            _send_signal(sig, oiz)
-            _record_seen(symbol, bar_ts)
-
-        time.sleep(max(1, FORWARD_POLL_SEC))
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="InnerTrade push signals forwarder")
-    parser.add_argument(
-        "--set",
-        choices={"on", "off"},
-        help="Toggle primary signal stream",
-    )
-    parser.add_argument(
-        "--trend",
-        choices={"on", "off"},
-        help="Toggle trend signal stream",
-    )
-    parser.add_argument(
-        "--status",
-        action="store_true",
-        help="Print current toggle state and exit",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    ensure_state_file()
-    args = parse_args()
-    if args.set:
-        enabled = args.set == "on"
-        set_push_enabled(enabled)
-        print(f"signals={'on' if enabled else 'off'}")
-        return
-    if args.trend:
-        enabled = args.trend == "on"
-        set_trend_enabled(enabled)
-        print(f"trend={'on' if enabled else 'off'}")
-        return
+def _handle_cli(args: argparse.Namespace) -> int:
     if args.status:
-        state = {
-            "signals": "on" if get_push_enabled() else "off",
-            "trend": "on" if get_trend_enabled() else "off",
-        }
-        print(state)
-        return
+        enabled = get_push_enabled()
+        state = "true" if enabled else "false"
+        print(f"PUSH_ENABLED: {state}")
+        write_runtime_status(enabled=enabled, source="cli", meta={"command": "status"})
+        return 0
+
+    if args.set is not None:
+        enabled = args.set == "on"
+        set_push_enabled(enabled, source="cli")
+        print(f"PUSH_ENABLED set to {'ON' if enabled else 'OFF'}")
+        return 0
+
+    return 1
+
+
+def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Push signals dispatcher")
+    parser.add_argument("--status", action="store_true", help="Show current PUSH_ENABLED value")
+    parser.add_argument("--set", choices=["on", "off"], help="Toggle PUSH_ENABLED state")
+    args = parser.parse_args(argv)
+    if args.status and args.set is not None:
+        parser.error("--status cannot be combined with --set")
+    args.loop = not (args.status or args.set is not None)
+    return args
+
+
+def _sleep_interval(enabled: bool, last_fetch: float, poll_interval: int) -> float:
+    since_fetch = max(0.0, time.time() - last_fetch)
+    until_next_fetch = max(0.0, poll_interval - since_fetch)
+    limit = max(1, FLAG_REFRESH_SEC)
+    if until_next_fetch <= 0:
+        return float(limit)
+    return float(max(1, min(limit, until_next_fetch)))
+
+
+def forward_loop():
+    last_flag: Optional[bool] = None
+    last_fetch = 0.0
+    poll_interval = max(1, FORWARD_POLL_SEC)
+
+    while True:
+        enabled = get_push_enabled()
+        if enabled != last_flag:
+            log_event(f"PUSH_ENABLED observed as {'ON' if enabled else 'OFF'} by forward_loop")
+            last_flag = enabled
+
+        write_runtime_status(enabled=enabled, source="forward_loop", meta={"poll_interval": poll_interval})
+
+        now = time.time()
+        if now - last_fetch >= poll_interval:
+            last_fetch = now
+            try:
+                data = _fetch_signals()
+                items = data.get("data") or []
+                for s in items:
+                    symbol = s.get("symbol")
+                    bar_ts = int(s.get("bar_ts") or 0)
+                    if not symbol or bar_ts <= 0:
+                        continue
+                    last_seen = _SENT_BARS.get(symbol)
+                    if last_seen and last_seen >= bar_ts:
+                        continue
+                    if not _should_forward(s):
+                        continue
+                    if not enabled:
+                        _SENT_BARS[symbol] = bar_ts
+                        continue
+                    # double-check state before sending to avoid race with CLI/menu updates
+                    if not get_push_enabled():
+                        enabled = False
+                        _SENT_BARS[symbol] = bar_ts
+                        continue
+                    oiz = _get_oi_z(symbol)
+                    _send_telegram(s, oiz)
+                    _SENT_BARS[symbol] = bar_ts
+            except Exception as exc:
+                log_event(f"forward_loop exception: {exc}", level="ERROR")
+
+        time.sleep(_sleep_interval(enabled, last_fetch, poll_interval))
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _parse_args(argv)
+    if not args.loop:
+        return _handle_cli(args)
 
     forward_loop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
