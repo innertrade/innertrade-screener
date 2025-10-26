@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Any
 
 from dotenv import load_dotenv
 from telegram import Message, ReplyKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+from push_state import get_push_enabled, set_push_enabled
 
 from push_state import get_push_enabled, set_push_enabled
 
@@ -18,47 +19,23 @@ MSK = timezone(timedelta(hours=3))
 
 
 def _build_keyboard(push_enabled: bool) -> ReplyKeyboardMarkup:
-    # push_enabled is kept for potential state-specific tweaks; the menu stays as ON/OFF buttons.
+    status_label = "✅ ON" if push_enabled else "⛔ OFF"
     return ReplyKeyboardMarkup(
-        [["ON", "OFF"]],
+        [
+            ["📊 Дашборд баблы", "🌡 Температура рынка"],
+            ["📰 Новости", "🧮 Калькулятор"],
+            [f"📡 Сигналы: {status_label}", "ℹ️ Команды: /on /off"],
+        ],
         resize_keyboard=True,
-        one_time_keyboard=False,
     )
 
 
-def _authorized(obj: Any) -> bool:
+def _authorized(update: Update) -> bool:
     if CHAT_ID == 0:
         return True
-    chat = None
-    if isinstance(obj, Update):
-        chat = obj.effective_chat
-    else:
-        chat = getattr(obj, "chat", None) or getattr(obj, "effective_chat", None)
-    if not chat:
+    if not update.effective_chat:
         return False
-    return chat.id == CHAT_ID
-
-
-async def _reply_not_authorized(message: Message) -> None:
-    await message.reply_text("Недостаточно прав для управления ботом.")
-
-
-async def _reply_state(message: Message, push_enabled: bool) -> None:
-    await message.reply_text(
-        f"Рассылка {'включена (ON)' if push_enabled else 'выключена (OFF)'}.",
-        reply_markup=_build_keyboard(push_enabled),
-    )
-
-
-async def _handle_toggle(message: Message | None, enable: bool) -> None:
-    if not message:
-        return
-    if not _authorized(message):
-        await _reply_not_authorized(message)
-        return
-
-    set_push_enabled(enable, source="menu_bot")
-    await _reply_state(message, enable)
+    return update.effective_chat.id == CHAT_ID
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -66,43 +43,57 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message:
         return
     if not _authorized(update):
-        await _reply_not_authorized(message)
+        await message.reply_text("Недостаточно прав для управления ботом.")
         return
     push_enabled = get_push_enabled()
     now = datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
     await message.reply_text(
-        f"Привет! Время: {now}\nРассылка сейчас {'ON' if push_enabled else 'OFF'}.",
+        f"Привет! Время: {now}",
         reply_markup=_build_keyboard(push_enabled),
     )
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
         return
-    txt = (message.text or "").strip().lower()
-    if txt == "on":
-        await _handle_toggle(message, True)
-        return
-    if txt == "off":
-        await _handle_toggle(message, False)
-        return
     if not _authorized(update):
-        await _reply_not_authorized(message)
+        await message.reply_text("Недостаточно прав для управления ботом.")
         return
     push_enabled = get_push_enabled()
+    txt = (update.message.text or "").strip()
     await message.reply_text(
-        f"Используйте кнопки ON или OFF. Текущее состояние: {'ON' if push_enabled else 'OFF'}.",
+        f"Вы нажали: {txt}\nТекущее состояние рассылки: {'ON' if push_enabled else 'OFF'}",
         reply_markup=_build_keyboard(push_enabled),
     )
 
 
 async def cmd_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _handle_toggle(update.message, True)
+    message = update.message
+    if not message:
+        return
+    if not _authorized(update):
+        await message.reply_text("Недостаточно прав для управления рассылкой.")
+        return
+    set_push_enabled(True, source="menu_bot")
+    await message.reply_text(
+        "Рассылка включена ✅",
+        reply_markup=_build_keyboard(True),
+    )
 
 
 async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _handle_toggle(update.message, False)
+    message = update.message
+    if not message:
+        return
+    if not _authorized(update):
+        await message.reply_text("Недостаточно прав для управления рассылкой.")
+        return
+    set_push_enabled(False, source="menu_bot")
+    await message.reply_text(
+        "Рассылка приостановлена ⏸️",
+        reply_markup=_build_keyboard(False),
+    )
 
 
 def main():
@@ -110,7 +101,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("on", cmd_on))
     app.add_handler(CommandHandler("off", cmd_off))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     app.run_polling()
 
 

@@ -24,6 +24,8 @@ def tg_send_http(token: str, chat_id: int, text: str, reply_markup=None):
     except Exception as e:
         print(f"[tg_send_http] post failed: {e}")
 
+from push_state import get_push_enabled, set_push_enabled, write_runtime_status, log_event
+
 load_dotenv()
 
 HOST = os.getenv("HOST", "http://127.0.0.1:8080").rstrip("/")
