@@ -43,38 +43,70 @@ FLAG_REFRESH_SEC = int(float(os.getenv("PUSH_FLAG_REFRESH_SEC", "3")))
 
 _SENT_BARS: Dict[str, int] = {}
 
+
+def tg_send_http(token: str, chat_id: int, text: str, reply_markup=None) -> bool:
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup and hasattr(reply_markup, "to_dict"):
+        payload["reply_markup"] = reply_markup.to_dict()
+    try:
+        response = _session.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json=payload,
+            timeout=FORWARD_TIMEOUT,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.error("Telegram send failed: %s", exc)
+        return False
+    return True
+
+
 def _map_symbol_to_bybit_linear(sym: str) -> str:
     s = sym.upper()
     return s if s.endswith("USDT") else f"{s}USDT"
 
-def _fetch_signals() -> Dict[str, Any]:
-    r = requests.get(f"{HOST}/signals", timeout=10)
-    r.raise_for_status()
-    return r.json()
 
-def _classify(symbol: str, z: float, volx: float, v24: float, oiz: Optional[float]) -> Dict[str,str]:
+def _fetch_signals() -> Dict[str, Any]:
+    response = _session.get(f"{HOST}/signals", timeout=FORWARD_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
+
+def _classify(symbol: str, z: float, oiz: Optional[float]) -> Dict[str, str]:
     side = "LONG" if z >= 0 else "SHORT"
-    pre = f"PRE-{side}"
-    conf = f"{side} CONFIRMED"
     if oiz is None or oiz < FORWARD_MIN_OIZ:
-        return {"tag": pre, "icon": "⬆️" if z>=0 else "⬇️", "oi_line": "⏳ Awaiting OI confirmation"}
-    return {"tag": conf, "icon": "✅", "oi_line": f"{'🟢' if oiz>=0 else '🔴'} OI Δ={abs(oiz):.2f}σ"}
+        return {
+            "tag": f"PRE-{side}",
+            "oi_line": "⏳ Awaiting OI confirmation",
+            "header": "⬆️" if z >= 0 else "⬇️",
+        }
+    return {
+        "tag": f"{side} CONFIRMED",
+        "oi_line": f"{'🟢' if oiz >= 0 else '🔴'} OI Δ={abs(oiz):.2f}σ",
+        "header": "✅",
+    }
+
 
 def _format_tv_symbol(symbol: str) -> str:
     s = symbol.upper()
     return f"{s}.P" if s.endswith("USDT") else f"{s}USDT.P"
 
+
 def _bybit_futures_link(symbol: str) -> str:
-    s = symbol.upper()
-    if not s.endswith("USDT"):
-        s += "USDT"
-    return f"https://www.bybit.com/trade/usdt/{s}"
+    return f"https://www.bybit.com/trade/usdt/{_map_symbol_to_bybit_linear(symbol)}"
+
 
 def _get_oi_z(symbol: str) -> Optional[float]:
     try:
         from oi_fallback import oi_z_score_ext
+
         return oi_z_score_ext(symbol, interval=FORWARD_OI_INTERVAL, window=FORWARD_OI_WINDOW)
-    except Exception:
+    except Exception as exc:  # pragma: no cover - best effort fallback
+        logger.debug("oi lookup failed for %s: %s", symbol, exc)
         return None
 
 def _send_telegram(sig: Dict[str, Any], oiz: Optional[float]):
@@ -84,15 +116,14 @@ def _send_telegram(sig: Dict[str, Any], oiz: Optional[float]):
     z = float(sig.get("zprice") or 0.0)
     volx = float(sig.get("vol_mult") or 0.0)
     v24 = float(sig.get("vol24h_usd") or 0.0)
-    klass = _classify(symbol, z, volx, v24, oiz)
-    icon = klass["icon"]
-    tag  = klass["tag"]
+    klass = _classify(symbol, z, oiz)
+    header = klass["header"]
     lines = [
-        f"{icon} {symbol}  ({tag})",
-        f"{'🟢' if z>=0 else '🔴'} Price Δ={abs(z):.2f}σ",
+        f"{header} {symbol}  ({klass['tag']})",
+        f"{'🟢' if z >= 0 else '🔴'} Price Δ={abs(z):.2f}σ",
         f"🟢 Volume ×{volx:.2f}",
-        klass["oi_line"] if oiz is None or oiz < FORWARD_MIN_OIZ else "",
-        f"24h Volume ≈ ${v24:,.0f}".replace(","," "),
+        klass["oi_line"],
+        f"24h Volume ≈ ${v24:,.0f}".replace(",", " "),
     ]
     text = "\n".join([ln for ln in lines if ln])
     kb = InlineKeyboardMarkup([
@@ -101,11 +132,6 @@ def _send_telegram(sig: Dict[str, Any], oiz: Optional[float]):
     ])
     tg_send_http(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, text, kb)
 
-def _should_forward(sig: Dict[str, Any]) -> bool:
-    z = abs(float(sig.get("zprice") or 0.0))
-    volx = float(sig.get("vol_mult") or 0.0)
-    v24 = float(sig.get("vol24h_usd") or 0.0)
-    return (z >= FORWARD_MIN_Z and volx >= FORWARD_MIN_VOLX and v24 >= FORWARD_MIN_VOL24H)
 
 def _handle_cli(args: argparse.Namespace) -> int:
     if args.status:

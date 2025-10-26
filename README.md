@@ -88,6 +88,22 @@ curl -s http://127.0.0.1:8088/signals | jq '.data[0]'
 * `/health` должен вернуть `{"status": "ok", ...}`.
 * `/signals` должен содержать ненулевые `oi_z` (если данные Bybit доступны).
 
+## Быстрый фикс окружения (`its_fix_stack.sh`)
+
+1. Создайте (или обновите) файл `/root/its_fix_stack.sh` c содержимым из `scripts/its_fix_stack.sh` и сделайте его исполняемым:
+
+   ```bash
+   install -m 750 scripts/its_fix_stack.sh /root/its_fix_stack.sh
+   ```
+
+2. Запустите фиксацию стека от имени `root`:
+
+   ```bash
+   bash /root/its_fix_stack.sh
+   ```
+
+Скрипт устранит процессы со статусом `cwd -> (deleted)`, выключит легаси-юниты `screener.service` и `push_trend.service`, перезапустит действующие сервисы (`innertrade-screener.service`, `menu_bot.service`, `push_signals.service`) и выполнит проверки: листенер на `127.0.0.1:8088`, `/health` и отсутствие удалённых рабочих каталогов.
+
 ## Автоматизация GitHub Actions
 
 Workflow `.github/workflows/deploy.yml` обновлён: он копирует свежий `its_wipe_sync_run.sh` на сервер и запускает его по SSH, передавая токены через переменные окружения. Таким образом GitHub Actions и ручной запуск используют один и тот же сценарий.

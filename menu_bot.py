@@ -15,6 +15,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 MSK = timezone(timedelta(hours=3))
 
 
@@ -96,7 +97,69 @@ async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def main():
+
+async def _handle_trend_toggle(update: Update) -> None:
+    new_state = toggle_trend_enabled()
+    status = "TRND-поток включён" if new_state else "TRND-поток приостановлен"
+    await _reply_with_confirmation(update, status)
+
+
+async def _set_push_state(update: Update, enabled: bool) -> None:
+    set_push_enabled(enabled)
+    status = "Рассылка включена" if enabled else "Рассылка приостановлена"
+    await _reply_with_confirmation(update, status)
+
+
+async def _set_trend_state(update: Update, enabled: bool) -> None:
+    set_trend_enabled(enabled)
+    status = "TRND-поток включён" if enabled else "TRND-поток приостановлен"
+    await _reply_with_confirmation(update, status)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    normalized = " ".join(text.upper().split())
+    push_label = _render_toggle(BTN_SIGNALS, get_push_enabled())
+    trend_label = _render_toggle(BTN_TREND, get_trend_enabled())
+
+    if text == push_label:
+        await _handle_push_toggle(update)
+        return
+    if text == trend_label:
+        await _handle_trend_toggle(update)
+        return
+
+    if normalized == CMD_ON:
+        await _set_push_state(update, True)
+        return
+    if normalized == CMD_OFF:
+        await _set_push_state(update, False)
+        return
+    if normalized == CMD_TRND:
+        await _handle_trend_toggle(update)
+        return
+    if normalized == CMD_TREND_ON:
+        await _set_trend_state(update, True)
+        return
+    if normalized == CMD_TREND_OFF:
+        await _set_trend_state(update, False)
+        return
+
+    await update.message.reply_text(
+        f"Вы нажали: {text}", reply_markup=_build_keyboard()
+    )
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    ensure_state_file()
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("on", cmd_on))
