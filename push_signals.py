@@ -1,229 +1,139 @@
-from __future__ import annotations
-import argparse
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import json
 import os
 import sys
 import time
-from typing import Optional, Dict, Any
+import logging
+from pathlib import Path
+from typing import Dict, Any, Optional
 
-import requests
 from dotenv import load_dotenv
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-
-from push_state import get_push_enabled, set_push_enabled, write_runtime_status, log_event
-
-import requests as _rq
-
-
-def tg_send_http(token: str, chat_id: int, text: str, reply_markup=None):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    if reply_markup and hasattr(reply_markup, "to_dict"):
-        payload["reply_markup"] = reply_markup.to_dict()
-    try:
-        _rq.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"[tg_send_http] post failed: {e}")
-
-from push_state import get_push_enabled, set_push_enabled, write_runtime_status, log_event
-
 load_dotenv()
 
-HOST = os.getenv("HOST", "http://127.0.0.1:8080").rstrip("/")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+# Если используется aiogram/telebot — не трогаем зависимости проекта.
+# Ниже простой интерфейс через requests к Telegram, чтобы не конфликтовать с версиями.
+import requests
 
-FORWARD_MIN_Z = float(os.getenv("FORWARD_MIN_Z", "1.8"))
-FORWARD_MIN_VOLX = float(os.getenv("FORWARD_MIN_VOLX", "1.6"))
-FORWARD_MIN_VOL24H = float(os.getenv("FORWARD_MIN_VOL24H", "20000000"))
-FORWARD_MIN_OIZ = float(os.getenv("FORWARD_MIN_OIZ", "0.8"))
-FORWARD_OI_WINDOW = int(float(os.getenv("FORWARD_OI_WINDOW", "48")))
-FORWARD_OI_INTERVAL = os.getenv("FORWARD_OI_INTERVAL", "5min")
-FORWARD_POLL_SEC = int(float(os.getenv("FORWARD_POLL_SEC", "8")))
-FLAG_REFRESH_SEC = int(float(os.getenv("PUSH_FLAG_REFRESH_SEC", "3")))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("push_signals")
 
-_SENT_BARS: Dict[str, int] = {}
+BASE_DIR = Path(__file__).resolve().parent
+STATE_FILE = BASE_DIR / "state" / "push_enabled.json"
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# предположим, что ваш сигнальный движок кладёт сюда данные,
+# либо этот модуль сам их формирует; оставляем интерфейс функции send_* гибким.
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else None
+
+DEFAULT_STATE = {"tvoi": True, "trnd": False}
 
 
-def tg_send_http(token: str, chat_id: int, text: str, reply_markup=None) -> bool:
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-    if reply_markup and hasattr(reply_markup, "to_dict"):
-        payload["reply_markup"] = reply_markup.to_dict()
+def _safe_read_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        response = _session.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json=payload,
-            timeout=FORWARD_TIMEOUT,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        logger.error("Telegram send failed: %s", exc)
+        if not path.exists():
+            return dict(default)
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, bool):
+            return {"tvoi": bool(data), "trnd": bool(data)}
+        if isinstance(data, dict):
+            if "enabled" in data and ("tvoi" not in data or "trnd" not in data):
+                en = bool(data.get("enabled"))
+                data = {"tvoi": en, "trnd": en}
+            for k, v in default.items():
+                data.setdefault(k, v)
+            return data
+        return dict(default)
+    except Exception as e:
+        logger.exception("Failed to read state: %s", e)
+        return dict(default)
+
+
+def get_state() -> Dict[str, Any]:
+    return _safe_read_json(STATE_FILE, DEFAULT_STATE)
+
+
+def _tg_send_message(text: str, parse_mode: Optional[str] = "HTML") -> bool:
+    if not TG_API or not TELEGRAM_CHAT_ID:
+        logger.error("Telegram credentials not set (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)")
         return False
-    return True
-
-
-def _map_symbol_to_bybit_linear(sym: str) -> str:
-    s = sym.upper()
-    return s if s.endswith("USDT") else f"{s}USDT"
-
-
-def _fetch_signals() -> Dict[str, Any]:
-    response = _session.get(f"{HOST}/signals", timeout=FORWARD_TIMEOUT)
-    response.raise_for_status()
-    return response.json()
-
-
-def _classify(symbol: str, z: float, oiz: Optional[float]) -> Dict[str, str]:
-    side = "LONG" if z >= 0 else "SHORT"
-    if oiz is None or oiz < FORWARD_MIN_OIZ:
-        return {
-            "tag": f"PRE-{side}",
-            "oi_line": "⏳ Awaiting OI confirmation",
-            "header": "⬆️" if z >= 0 else "⬇️",
-        }
-    return {
-        "tag": f"{side} CONFIRMED",
-        "oi_line": f"{'🟢' if oiz >= 0 else '🔴'} OI Δ={abs(oiz):.2f}σ",
-        "header": "✅",
-    }
-
-
-def _format_tv_symbol(symbol: str) -> str:
-    s = symbol.upper()
-    return f"{s}.P" if s.endswith("USDT") else f"{s}USDT.P"
-
-
-def _bybit_futures_link(symbol: str) -> str:
-    return f"https://www.bybit.com/trade/usdt/{_map_symbol_to_bybit_linear(symbol)}"
-
-
-def _get_oi_z(symbol: str) -> Optional[float]:
     try:
-        from oi_fallback import oi_z_score_ext
+        r = requests.post(
+            f"{TG_API}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True},
+            timeout=10,
+        )
+        if r.status_code == 200 and r.json().get("ok"):
+            return True
+        logger.error("TG send failed: %s", r.text)
+        return False
+    except Exception as e:
+        logger.exception("TG send exception: %s", e)
+        return False
 
-        return oi_z_score_ext(symbol, interval=FORWARD_OI_INTERVAL, window=FORWARD_OI_WINDOW)
-    except Exception as exc:  # pragma: no cover - best effort fallback
-        logger.debug("oi lookup failed for %s: %s", symbol, exc)
-        return None
 
-def _send_telegram(sig: Dict[str, Any], oiz: Optional[float]):
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID == 0:
+def send_tvoi_signal(payload: Dict[str, Any]) -> None:
+    """
+    Отправка PRE/CONFIRMED по TVOI.
+    payload ожидается формата:
+      {
+        "type": "PRE" | "CONFIRMED",
+        "symbol": "BTCUSDT",
+        "tf": "5m",
+        "price": 67890.1,
+        "link": "https://…"
+      }
+    """
+    st = get_state()
+    if not st.get("tvoi", True):
+        logger.info("TVOI disabled, skip")
         return
-    symbol = sig["symbol"]
-    z = float(sig.get("zprice") or 0.0)
-    volx = float(sig.get("vol_mult") or 0.0)
-    v24 = float(sig.get("vol24h_usd") or 0.0)
-    klass = _classify(symbol, z, oiz)
-    header = klass["header"]
-    lines = [
-        f"{header} {symbol}  ({klass['tag']})",
-        f"{'🟢' if z >= 0 else '🔴'} Price Δ={abs(z):.2f}σ",
-        f"🟢 Volume ×{volx:.2f}",
-        klass["oi_line"],
-        f"24h Volume ≈ ${v24:,.0f}".replace(",", " "),
-    ]
-    text = "\n".join([ln for ln in lines if ln])
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Bybit Futures", url=_bybit_futures_link(symbol)),
-         InlineKeyboardButton("TradingView", url=f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{_format_tv_symbol(symbol)}")]
-    ])
-    tg_send_http(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, text, kb)
+
+    t = payload.get("type", "PRE")
+    sym = payload.get("symbol", "?")
+    tf = payload.get("tf", "5m")
+    price = payload.get("price", "")
+    link = payload.get("link", "")
+    msg = f"📡 <b>TVOI {t}</b>\n• {sym} ({tf})\n• price: <code>{price}</code>\n{link}"
+    ok = _tg_send_message(msg)
+    logger.info("TVOI %s sent=%s", t, ok)
 
 
-def _handle_cli(args: argparse.Namespace) -> int:
-    if args.status:
-        enabled = get_push_enabled()
-        state = "true" if enabled else "false"
-        print(f"PUSH_ENABLED: {state}")
-        write_runtime_status(enabled=enabled, source="cli", meta={"command": "status"})
-        return 0
+def send_trnd_signal(payload: Dict[str, Any]) -> None:
+    """
+    Отправка сигналов по стратегии тренда (TRND).
+    payload аналогичен, допускается доп. поля.
+    """
+    st = get_state()
+    if not st.get("trnd", False):
+        logger.info("TRND disabled, skip")
+        return
 
-    if args.set is not None:
-        enabled = args.set == "on"
-        set_push_enabled(enabled, source="cli")
-        print(f"PUSH_ENABLED set to {'ON' if enabled else 'OFF'}")
-        return 0
-
-    return 1
-
-
-def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Push signals dispatcher")
-    parser.add_argument("--status", action="store_true", help="Show current PUSH_ENABLED value")
-    parser.add_argument("--set", choices=["on", "off"], help="Toggle PUSH_ENABLED state")
-    args = parser.parse_args(argv)
-    if args.status and args.set is not None:
-        parser.error("--status cannot be combined with --set")
-    args.loop = not (args.status or args.set is not None)
-    return args
-
-
-def _sleep_interval(enabled: bool, last_fetch: float, poll_interval: int) -> float:
-    since_fetch = max(0.0, time.time() - last_fetch)
-    until_next_fetch = max(0.0, poll_interval - since_fetch)
-    limit = max(1, FLAG_REFRESH_SEC)
-    if until_next_fetch <= 0:
-        return float(limit)
-    return float(max(1, min(limit, until_next_fetch)))
-
-
-def forward_loop():
-    last_flag: Optional[bool] = None
-    last_fetch = 0.0
-    poll_interval = max(1, FORWARD_POLL_SEC)
-
-    while True:
-        enabled = get_push_enabled()
-        if enabled != last_flag:
-            log_event(f"PUSH_ENABLED observed as {'ON' if enabled else 'OFF'} by forward_loop")
-            last_flag = enabled
-
-        write_runtime_status(enabled=enabled, source="forward_loop", meta={"poll_interval": poll_interval})
-
-        now = time.time()
-        if now - last_fetch >= poll_interval:
-            last_fetch = now
-            try:
-                data = _fetch_signals()
-                items = data.get("data") or []
-                for s in items:
-                    symbol = s.get("symbol")
-                    bar_ts = int(s.get("bar_ts") or 0)
-                    if not symbol or bar_ts <= 0:
-                        continue
-                    last_seen = _SENT_BARS.get(symbol)
-                    if last_seen and last_seen >= bar_ts:
-                        continue
-                    if not _should_forward(s):
-                        continue
-                    if not enabled:
-                        _SENT_BARS[symbol] = bar_ts
-                        continue
-                    # double-check state before sending to avoid race with CLI/menu updates
-                    if not get_push_enabled():
-                        enabled = False
-                        _SENT_BARS[symbol] = bar_ts
-                        continue
-                    oiz = _get_oi_z(symbol)
-                    _send_telegram(s, oiz)
-                    _SENT_BARS[symbol] = bar_ts
-            except Exception as exc:
-                log_event(f"forward_loop exception: {exc}", level="ERROR")
-
-        time.sleep(_sleep_interval(enabled, last_fetch, poll_interval))
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    args = _parse_args(argv)
-    if not args.loop:
-        return _handle_cli(args)
-
-    forward_loop()
-    return 0
+    t = payload.get("type", "SIGNAL")
+    sym = payload.get("symbol", "?")
+    tf = payload.get("tf", "5m")
+    price = payload.get("price", "")
+    link = payload.get("link", "")
+    msg = f"📈 <b>TRND {t}</b>\n• {sym} ({tf})\n• price: <code>{price}</code>\n{link}"
+    ok = _tg_send_message(msg)
+    logger.info("TRND %s sent=%s", t, ok)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    logger.info("push_signals boot")
+    st = get_state()
+    logger.info("Active flags at start: TVOI=%s, TRND=%s", st.get("tvoi"), st.get("trnd"))
+
+    # Пример тестового пинга (не мешает продакшен-логике, можно закомментировать):
+    if os.getenv("PUSH_TEST", "0") == "1":
+        send_tvoi_signal({"type": "PRE", "symbol": "BTCUSDT", "tf": "5m", "price": 123, "link": "https://example.com"})
+        send_trnd_signal({"type": "SIGNAL", "symbol": "ETHUSDT", "tf": "5m", "price": 456, "link": "https://example.com"})
