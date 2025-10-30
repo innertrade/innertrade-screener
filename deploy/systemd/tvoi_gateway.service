@@ -1,0 +1,16 @@
+[Unit]
+Description=InnerTrade TVOI HTTP gateway (POST /tvoi -> queue file)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment="APP=/home/deploy/apps/innertrade-screener"
+# слушает 127.0.0.1:8787, принимает POST /tvoi и кладёт JSON в $APP/inbox
+ExecStart=/usr/bin/python3 /usr/local/bin/tvoi_gateway.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
