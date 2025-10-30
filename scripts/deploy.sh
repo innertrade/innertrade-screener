@@ -1,41 +1,123 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="/home/deploy/apps/innertrade-screener"
+APP="${APP:-/home/deploy/apps/innertrade-screener}"
+APP_USER="${APP_USER:-deploy}"
+APP_GROUP="${APP_GROUP:-deploy}"
+VENV="${VENV:-${APP}/.venv}"
+QUEUE_DIRS=(inbox processed failed)
+SERVICES=(innertrade-api tvoi_gateway tvoi_consumer pre_forwarder)
 
-# 0) Код/зависимости (по желанию)
-# git pull --rebase || true
-# "${APP}/.venv/bin/pip" install -r "${APP}/requirements.txt"
+log() {
+  printf '%s | %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"
+}
 
-# 1) Нормализуем окружение (если есть)
-if [ -x "${APP}/scripts/its_normalize_env.sh" ]; then
-  bash "${APP}/scripts/its_normalize_env.sh"
+trap 'log "deploy failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    log "missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+for cmd in install systemctl curl python3; do
+  require_cmd "$cmd"
+done
+
+if [ ! -x "${VENV}/bin/python" ]; then
+  log "virtualenv not found at ${VENV}; create it before deploying" >&2
+  exit 1
 fi
 
-# 2) Ставим/обновляем systemd-юниты тонкого контура
-install -m 0644 -D "${APP}/deploy/systemd/tvoi_gateway.service"   /etc/systemd/system/tvoi_gateway.service
-install -m 0644 -D "${APP}/deploy/systemd/tvoi_consumer.service"  /etc/systemd/system/tvoi_consumer.service
-install -m 0644 -D "${APP}/deploy/systemd/pre_forwarder.service"  /etc/systemd/system/pre_forwarder.service
-# innertrade-api.service предполагается уже установлен (как и раньше).
+log "ensuring queue directories"
+for dir in "${QUEUE_DIRS[@]}"; do
+  install -o "${APP_USER}" -g "${APP_GROUP}" -m 0775 -d "${APP}/${dir}"
+  if [[ "$dir" == inbox ]]; then
+    install -o "${APP_USER}" -g "${APP_GROUP}" -m 0775 -d "${APP}/${dir}/.tmp"
+  fi
+done
+
+log "installing systemd units"
+install -m 0644 -D "${APP}/deploy/systemd/innertrade-api.service" /etc/systemd/system/innertrade-api.service
+install -m 0644 -D "${APP}/deploy/systemd/tvoi_gateway.service" /etc/systemd/system/tvoi_gateway.service
+install -m 0644 -D "${APP}/deploy/systemd/tvoi_consumer.service" /etc/systemd/system/tvoi_consumer.service
+install -m 0644 -D "${APP}/deploy/systemd/pre_forwarder.service" /etc/systemd/system/pre_forwarder.service
 systemctl daemon-reload
 
-# 3) Глушим «толстый» на всякий случай
+log "disabling legacy screener.service"
 systemctl disable --now screener.service 2>/dev/null || true
 systemctl mask screener.service 2>/dev/null || true
-rm -f /etc/systemd/system/screener.service || true
+rm -f /etc/systemd/system/screener.service 2>/dev/null || true
 
-# 4) Запускаем нужные сервисы (тонкий контур)
-systemctl enable --now innertrade-api.service
-systemctl enable --now tvoi_gateway.service
-systemctl enable --now tvoi_consumer.service
-systemctl enable --now pre_forwarder.service
+log "stopping managed services before restart"
+for svc in "${SERVICES[@]}"; do
+  systemctl stop "${svc}.service" 2>/dev/null || true
+done
 
-# 5) Смоук-чек
-echo "--- smoke ---"
-curl -fsS http://127.0.0.1:8088/health || true
-curl -fsS http://127.0.0.1:8088/signals | head -c 300; echo || true
-echo '{"type":"PRE","symbol":"TESTUSDT","tf":"5m","price":123,"link":"http://x"}' \
- | curl -sS -X POST http://127.0.0.1/tvoi -H 'Content-Type: application/json' -d @- || true
+log "freeing TCP port 8088"
+fuser -k 8088/tcp 2>/dev/null || true
+sleep 1
 
-echo "--- statuses ---"
+log "enabling and starting services in order"
+for svc in "${SERVICES[@]}"; do
+  systemctl enable "${svc}.service"
+  systemctl start "${svc}.service"
+  systemctl is-active --quiet "${svc}.service" || {
+    log "service ${svc}.service failed to start" >&2
+    systemctl --no-pager --full status "${svc}.service" || true
+    exit 1
+  }
+  log "service ${svc}.service is active"
+  sleep 1
+done
+
+log "smoke: checking API"
+curl -fsS http://127.0.0.1:8088/health >/tmp/innertrade-health.json
+curl -fsS http://127.0.0.1:8088/signals | head -c 300 >/tmp/innertrade-signals.txt
+
+log "smoke: pushing synthetic TVOI signal"
+SAMPLE='{"type":"PRE","symbol":"TESTUSDT","tf":"5m","price":123,"link":"http://example.com"}'
+RESPONSE=$(echo "${SAMPLE}" | curl -fsS -X POST http://127.0.0.1:8787/tvoi -H 'Content-Type: application/json' -d @-)
+log "gateway response: ${RESPONSE}"
+
+FILENAME=$(printf '%s' "${RESPONSE}" | python3 - <<'PY'
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+except Exception:
+    data = {}
+print(data.get('file', ''))
+PY
+)
+
+if [ -z "${FILENAME}" ]; then
+  log "gateway did not return file name" >&2
+  exit 1
+fi
+
+log "waiting for consumer to process ${FILENAME}"
+max_wait=20
+while (( max_wait > 0 )); do
+  if [ -f "${APP}/processed/${FILENAME}" ]; then
+    log "processed/${FILENAME} present"
+    break
+  fi
+  if [ -f "${APP}/failed/${FILENAME}" ]; then
+    log "file moved to failed/${FILENAME}" >&2
+    exit 1
+  fi
+  sleep 1
+  ((max_wait--))
+done
+
+if (( max_wait == 0 )); then
+  log "timeout waiting for processed file" >&2
+  exit 1
+fi
+
+log "smoke check complete"
+log "services status summary"
 systemctl --no-pager --full status innertrade-api tvoi_gateway tvoi_consumer pre_forwarder | sed -n '1,120p' || true
+
+log "deploy complete"
