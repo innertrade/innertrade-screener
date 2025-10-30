@@ -2,32 +2,32 @@
 set -euo pipefail
 
 APP="/home/deploy/apps/innertrade-screener"
-PY="${APP}/.venv/bin/python"
 
-# === 1) API, который отдаёт /signals (слушает 127.0.0.1:8088) ===
-# ВАЖНО: это не «толстый» screener.service, это именно API.
-# Толстый сервис не создаём и не трогаем.
 cat >/etc/systemd/system/innertrade-api.service <<'UNIT'
 [Unit]
-Description=InnerTrade API (/signals via gunicorn)
-After=network.target
+Description=InnerTrade API (/health, /signals)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=deploy
 Group=deploy
 WorkingDirectory=/home/deploy/apps/innertrade-screener
+Environment="APP_ROOT=/home/deploy/apps/innertrade-screener"
 Environment="PORT=8088"
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/gunicorn -b 127.0.0.1:8088 main:app
+ExecStartPre=/usr/bin/env bash -c 'fuser -k 8088/tcp 2>/dev/null || true'
+ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8088 --pid /run/innertrade-api/gunicorn.pid --access-logfile - --error-logfile - main:app
 Restart=always
 RestartSec=2
+KillSignal=SIGINT
+RuntimeDirectory=innertrade-api
+RuntimeDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-# === 2) HTTP-шлюз /tvoi (127.0.0.1:80/nginx -> 127.0.0.1:8787) ===
-# Сам скрипт tvoi_gateway.py уже положили в /usr/local/bin ранее.
 cat >/etc/systemd/system/tvoi_gateway.service <<'UNIT'
 [Unit]
 Description=InnerTrade TVOI HTTP gateway (POST /tvoi -> queue file)
@@ -35,10 +35,12 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-Group=root
-Environment=APP=/home/deploy/apps/innertrade-screener
-ExecStart=/usr/bin/env python3 /usr/local/bin/tvoi_gateway.py
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/apps/innertrade-screener
+Environment="APP_ROOT=/home/deploy/apps/innertrade-screener"
+Environment="QUEUE_DIR=/home/deploy/apps/innertrade-screener/inbox"
+ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8787 --access-logfile - --error-logfile - services.tvoi_gateway:app
 Restart=always
 RestartSec=2
 
@@ -46,7 +48,6 @@ RestartSec=2
 WantedBy=multi-user.target
 UNIT
 
-# === 3) Консюмер очереди (читает APP/inbox и шлёт в Telegram) ===
 cat >/etc/systemd/system/tvoi_consumer.service <<'UNIT'
 [Unit]
 Description=InnerTrade TVOI consumer (file inbox -> Telegram)
@@ -57,18 +58,39 @@ Type=simple
 User=deploy
 Group=deploy
 WorkingDirectory=/home/deploy/apps/innertrade-screener
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python /home/deploy/apps/innertrade-screener/consumers/tvoi_consumer.py
+Environment="APP_ROOT=/home/deploy/apps/innertrade-screener"
+ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python -u consumers/tvoi_consumer.py
 Restart=always
-RestartSec=1
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-# === 4) Страховка: если где-то остался старый screener.service — выключаем ===
-# (Мы его больше НЕ создаём.)
+cat >/etc/systemd/system/pre_forwarder.service <<'UNIT'
+[Unit]
+Description=InnerTrade PRE forwarder (/signals -> /tvoi)
+After=network.target innertrade-api.service tvoi_gateway.service
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/apps/innertrade-screener
+Environment="HOST=http://127.0.0.1:8088"
+Environment="TVOI_URL=http://127.0.0.1:8787/tvoi"
+Environment="MIN_Z=2.0"
+Environment="MIN_VOL_X=1.5"
+Environment="MIN_V24_USD=15000000"
+Environment="MIN_OI_Z=0.5"
+ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python /home/deploy/apps/innertrade-screener/pre_forwarder.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
 systemctl disable --now screener.service 2>/dev/null || true
 systemctl mask screener.service 2>/dev/null || true
-
-# Применяем
-systemctl daemon-reload

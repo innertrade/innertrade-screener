@@ -8,8 +8,7 @@ User=deploy
 Group=deploy
 WorkingDirectory=/home/deploy/apps/innertrade-screener
 Environment="HOST=http://127.0.0.1:8088"
-Environment="TVOI_URL=http://127.0.0.1/tvoi"
-# Пороги фильтра — при необходимости подстроим:
+Environment="TVOI_URL=http://127.0.0.1:8787/tvoi"
 Environment="MIN_Z=2.0"
 Environment="MIN_VOL_X=1.5"
 Environment="MIN_V24_USD=15000000"

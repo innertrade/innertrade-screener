@@ -1,0 +1,22 @@
+[Unit]
+Description=InnerTrade API (/health, /signals)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/apps/innertrade-screener
+Environment="APP_ROOT=/home/deploy/apps/innertrade-screener"
+Environment="PORT=8088"
+ExecStartPre=/usr/bin/env bash -c 'fuser -k 8088/tcp 2>/dev/null || true'
+ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8088 --pid /run/innertrade-api/gunicorn.pid --access-logfile - --error-logfile - main:app
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+RuntimeDirectory=innertrade-api
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

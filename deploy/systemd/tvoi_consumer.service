@@ -7,8 +7,8 @@ Type=simple
 User=deploy
 Group=deploy
 WorkingDirectory=/home/deploy/apps/innertrade-screener
-# читает файлы из ./inbox, шлёт в TG, перекладывает в processed/failed
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python /home/deploy/apps/innertrade-screener/consumers/tvoi_consumer.py
+Environment="APP_ROOT=/home/deploy/apps/innertrade-screener"
+ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python -u consumers/tvoi_consumer.py
 Restart=always
 RestartSec=2
 

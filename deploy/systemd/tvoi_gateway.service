@@ -4,11 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-Group=root
-Environment="APP=/home/deploy/apps/innertrade-screener"
-# слушает 127.0.0.1:8787, принимает POST /tvoi и кладёт JSON в $APP/inbox
-ExecStart=/usr/bin/python3 /usr/local/bin/tvoi_gateway.py
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/apps/innertrade-screener
+Environment="APP_ROOT=/home/deploy/apps/innertrade-screener"
+Environment="QUEUE_DIR=/home/deploy/apps/innertrade-screener/inbox"
+ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8787 --access-logfile - --error-logfile - services.tvoi_gateway:app
 Restart=always
 RestartSec=2
 
