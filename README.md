@@ -20,6 +20,38 @@ FLASK_ENV=production python main.py
 
 Приложение поднимется на `HTTP_PORT` (по умолчанию `8088`).
 
+## Минимальный деплой на VPS
+
+1. Обновите рабочую копию и удалите локальные артефакты:
+   ```bash
+   git reset --hard origin/main
+   git clean -fdx
+   ```
+2. Соберите виртуальное окружение и установите зависимости (если окружение отсутствует):
+   ```bash
+   python3 -m venv .venv
+   ./.venv/bin/pip install -r requirements.txt
+   cp -n .env.example .env  # заполните TELEGRAM_*
+   ```
+3. Запустите деплой от root (или пользователя с sudo) из корня репозитория:
+   ```bash
+   sudo bash scripts/deploy.sh
+   ```
+4. Скрипт автоматически:
+   - останавливает и маскирует `screener.service`;
+   - устанавливает systemd-юниты из каталога `systemd/`;
+   - создаёт каталоги `inbox/`, `processed/`, `failed/` и `inbox/.tmp` с владельцем `deploy:deploy`;
+   - перезапускает `innertrade-api`, `tvoi_gateway`, `tvoi_consumer`, `pre_forwarder`;
+   - выполняет смоук: `GET /health`, `GET /signals`, `POST /tvoi` и проверяет перемещение файла в `processed/` без ошибок.
+5. После успешного деплоя дополнительно убедитесь вручную:
+   ```bash
+   ss -ltnp | grep -E '127.0.0.1:(8088|8787)'
+   curl -fsS http://127.0.0.1:8088/health | jq
+   curl -fsS http://127.0.0.1:8088/signals | jq '.[0]'
+   ```
+   На сервере должны слушать gunicorn (`8088`) и gateway (`8787`), `screener.service` должен отсутствовать в `systemctl list-units`.
+
+
 ## Полная переинициализация VPS
 
 Скрипт `scripts/its_wipe_sync_run.sh` предназначен для запуска из `root` (или другого пользователя с sudo) и выполняет:
@@ -123,6 +155,8 @@ Workflow `.github/workflows/deploy.yml` обновлён: он копирует 
 * обновляет и перезапускает `innertrade-api`, `tvoi_gateway`, `tvoi_consumer`, `pre_forwarder`;
 * глушит исторический `screener.service` и освобождает порт `8088` перед запуском API;
 * выполняет смоук-проверку `/health` и прогоняет тестовый сигнал по цепочке `gateway → consumer`.
+
+Для ручной отправки проверочного события можно воспользоваться CLI-утилитой `./tools/tvoi_gateway.py`.
 
 Все входящие запросы направляются на `http://127.0.0.1:8787/tvoi`. Nginx больше не используется в качестве прокси для `/tvoi`.
 Если требуется изменить пользователя/группу или каталоги, достаточно переопределить переменные окружения `APP`, `APP_USER`,

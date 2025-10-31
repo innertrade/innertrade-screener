@@ -1,0 +1,22 @@
+[Unit]
+Description=InnerTrade PRE forwarder (/signals -> /tvoi)
+After=network.target innertrade-api.service tvoi_gateway.service
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@APP_ROOT@
+Environment="APP_ROOT=@APP_ROOT@"
+Environment="HOST=http://127.0.0.1:8088"
+Environment="TVOI_URL=http://127.0.0.1:8787/tvoi"
+Environment="MIN_Z=2.0"
+Environment="MIN_VOL_X=1.5"
+Environment="MIN_V24_USD=15000000"
+Environment="MIN_OI_Z=0.5"
+ExecStart=@APP_ROOT@/.venv/bin/python @APP_ROOT@/pre_forwarder.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
