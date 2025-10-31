@@ -1,0 +1,17 @@
+[Unit]
+Description=InnerTrade TVOI HTTP gateway (POST /tvoi -> queue file)
+After=network.target
+
+[Service]
+Type=simple
+User=@APP_USER@
+Group=@APP_GROUP@
+WorkingDirectory=@APP_ROOT@
+Environment="APP_ROOT=@APP_ROOT@"
+Environment="QUEUE_DIR=@APP_ROOT@/inbox"
+ExecStart=@APP_ROOT@/.venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8787 --access-logfile - --error-logfile - services.tvoi_gateway:app
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

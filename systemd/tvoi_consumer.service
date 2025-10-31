@@ -1,0 +1,16 @@
+[Unit]
+Description=InnerTrade TVOI consumer (file inbox -> Telegram)
+After=network.target
+
+[Service]
+Type=simple
+User=@APP_USER@
+Group=@APP_GROUP@
+WorkingDirectory=@APP_ROOT@
+Environment="APP_ROOT=@APP_ROOT@"
+ExecStart=@APP_ROOT@/.venv/bin/python -u consumers/tvoi_consumer.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

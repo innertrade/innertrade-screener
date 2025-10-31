@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=deploy
-Group=deploy
-WorkingDirectory=/home/deploy/apps/innertrade-screener
+User=@APP_USER@
+Group=@APP_GROUP@
+WorkingDirectory=@APP_ROOT@
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python -u menu_bot.py
+ExecStart=@APP_ROOT@/.venv/bin/python -u menu_bot.py
 Restart=always
 RestartSec=2
 KillSignal=SIGINT

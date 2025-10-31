@@ -4,16 +4,16 @@ After=network.target innertrade-api.service tvoi_gateway.service
 
 [Service]
 Type=simple
-User=deploy
-Group=deploy
-WorkingDirectory=/home/deploy/apps/innertrade-screener
+User=@APP_USER@
+Group=@APP_GROUP@
+WorkingDirectory=@APP_ROOT@
 Environment="HOST=http://127.0.0.1:8088"
 Environment="TVOI_URL=http://127.0.0.1:8787/tvoi"
 Environment="MIN_Z=2.0"
 Environment="MIN_VOL_X=1.5"
 Environment="MIN_V24_USD=15000000"
 Environment="MIN_OI_Z=0.5"
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python /home/deploy/apps/innertrade-screener/pre_forwarder.py
+ExecStart=@APP_ROOT@/.venv/bin/python -u pre_forwarder.py
 Restart=always
 RestartSec=3
 

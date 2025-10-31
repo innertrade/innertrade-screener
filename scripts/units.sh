@@ -1,96 +1,57 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="/home/deploy/apps/innertrade-screener"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SYSTEMD_DIR="${REPO_ROOT}/systemd"
+INSTALL_ROOT="/etc/systemd/system"
+LEGACY_SERVICE="screener.service"
+APP_ROOT="${APP_ROOT:-${REPO_ROOT}}"
+APP_USER="${APP_USER:-deploy}"
+APP_GROUP="${APP_GROUP:-${APP_USER}}"
 
-cat >/etc/systemd/system/innertrade-api.service <<'UNIT'
-[Unit]
-Description=InnerTrade API (/health, /signals)
-After=network-online.target
-Wants=network-online.target
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "scripts/units.sh must be executed as root" >&2
+  exit 1
+fi
 
-[Service]
-Type=simple
-User=deploy
-Group=deploy
-WorkingDirectory=/home/deploy/apps/innertrade-screener
-Environment="APP_ROOT=/home/deploy/apps/innertrade-screener"
-Environment="PORT=8088"
-ExecStartPre=/usr/bin/env bash -c 'fuser -k 8088/tcp 2>/dev/null || true'
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8088 --pid /run/innertrade-api/gunicorn.pid --access-logfile - --error-logfile - main:app
-Restart=always
-RestartSec=2
-KillSignal=SIGINT
-RuntimeDirectory=innertrade-api
-RuntimeDirectoryMode=0750
+if [[ ! -d "${SYSTEMD_DIR}" ]]; then
+  echo "systemd directory not found at ${SYSTEMD_DIR}" >&2
+  exit 1
+fi
 
-[Install]
-WantedBy=multi-user.target
-UNIT
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required to render unit templates" >&2
+  exit 1
+fi
 
-cat >/etc/systemd/system/tvoi_gateway.service <<'UNIT'
-[Unit]
-Description=InnerTrade TVOI HTTP gateway (POST /tvoi -> queue file)
-After=network.target
+install -d -m 0755 "${INSTALL_ROOT}"
 
-[Service]
-Type=simple
-User=deploy
-Group=deploy
-WorkingDirectory=/home/deploy/apps/innertrade-screener
-Environment="APP_ROOT=/home/deploy/apps/innertrade-screener"
-Environment="QUEUE_DIR=/home/deploy/apps/innertrade-screener/inbox"
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8787 --access-logfile - --error-logfile - services.tvoi_gateway:app
-Restart=always
-RestartSec=2
+for unit in "${SYSTEMD_DIR}"/*.service; do
+  base="$(basename "${unit}")"
+  tmp_file="$(mktemp)"
+  UNIT_SRC="${unit}" UNIT_TMP="${tmp_file}" APP_ROOT="${APP_ROOT}" APP_USER="${APP_USER}" APP_GROUP="${APP_GROUP}" python3 - <<'PY'
+import os
+from pathlib import Path
 
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-cat >/etc/systemd/system/tvoi_consumer.service <<'UNIT'
-[Unit]
-Description=InnerTrade TVOI consumer (file inbox -> Telegram)
-After=network.target
-
-[Service]
-Type=simple
-User=deploy
-Group=deploy
-WorkingDirectory=/home/deploy/apps/innertrade-screener
-Environment="APP_ROOT=/home/deploy/apps/innertrade-screener"
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python -u consumers/tvoi_consumer.py
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-cat >/etc/systemd/system/pre_forwarder.service <<'UNIT'
-[Unit]
-Description=InnerTrade PRE forwarder (/signals -> /tvoi)
-After=network.target innertrade-api.service tvoi_gateway.service
-
-[Service]
-Type=simple
-User=deploy
-Group=deploy
-WorkingDirectory=/home/deploy/apps/innertrade-screener
-Environment="HOST=http://127.0.0.1:8088"
-Environment="TVOI_URL=http://127.0.0.1:8787/tvoi"
-Environment="MIN_Z=2.0"
-Environment="MIN_VOL_X=1.5"
-Environment="MIN_V24_USD=15000000"
-Environment="MIN_OI_Z=0.5"
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/python /home/deploy/apps/innertrade-screener/pre_forwarder.py
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-UNIT
+template = Path(os.environ['UNIT_SRC']).read_text(encoding='utf-8')
+for key, value in {
+    '@APP_ROOT@': os.environ['APP_ROOT'],
+    '@APP_USER@': os.environ['APP_USER'],
+    '@APP_GROUP@': os.environ['APP_GROUP'],
+}.items():
+    template = template.replace(key, value)
+Path(os.environ['UNIT_TMP']).write_text(template, encoding='utf-8')
+PY
+  install -m 0644 -o root -g root "${tmp_file}" "${INSTALL_ROOT}/${base}"
+  rm -f "${tmp_file}"
+  echo "installed ${base}"
+done
 
 systemctl daemon-reload
-systemctl disable --now screener.service 2>/dev/null || true
-systemctl mask screener.service 2>/dev/null || true
+
+if systemctl list-unit-files | grep -q "^${LEGACY_SERVICE}"; then
+  systemctl disable --now "${LEGACY_SERVICE}" 2>/dev/null || true
+  systemctl mask "${LEGACY_SERVICE}" 2>/dev/null || true
+fi
+
+rm -f "${INSTALL_ROOT}/${LEGACY_SERVICE}" 2>/dev/null || true
