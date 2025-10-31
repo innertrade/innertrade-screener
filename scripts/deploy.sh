@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="${APP:-/home/deploy/apps/innertrade-screener}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_APP="$(cd "${SCRIPT_DIR}/.." && pwd)"
+APP="${APP:-${DEFAULT_APP}}"
 APP_USER="${APP_USER:-deploy}"
-APP_GROUP="${APP_GROUP:-deploy}"
+APP_GROUP="${APP_GROUP:-${APP_USER}}"
 VENV="${VENV:-${APP}/.venv}"
 QUEUE_DIRS=(inbox processed failed)
 SERVICES=(innertrade-api tvoi_gateway tvoi_consumer pre_forwarder)
@@ -30,29 +32,20 @@ if [ ! -x "${VENV}/bin/python" ]; then
   exit 1
 fi
 
-log "ensuring queue directories"
-for dir in "${QUEUE_DIRS[@]}"; do
-  install -o "${APP_USER}" -g "${APP_GROUP}" -m 0775 -d "${APP}/${dir}"
-  if [[ "$dir" == inbox ]]; then
-    install -o "${APP_USER}" -g "${APP_GROUP}" -m 0775 -d "${APP}/${dir}/.tmp"
-  fi
-done
-
-log "installing systemd units"
-install -m 0644 -D "${APP}/deploy/systemd/innertrade-api.service" /etc/systemd/system/innertrade-api.service
-install -m 0644 -D "${APP}/deploy/systemd/tvoi_gateway.service" /etc/systemd/system/tvoi_gateway.service
-install -m 0644 -D "${APP}/deploy/systemd/tvoi_consumer.service" /etc/systemd/system/tvoi_consumer.service
-install -m 0644 -D "${APP}/deploy/systemd/pre_forwarder.service" /etc/systemd/system/pre_forwarder.service
-systemctl daemon-reload
-
-log "disabling legacy screener.service"
-systemctl disable --now screener.service 2>/dev/null || true
-systemctl mask screener.service 2>/dev/null || true
-rm -f /etc/systemd/system/screener.service 2>/dev/null || true
-
 log "stopping managed services before restart"
 for svc in "${SERVICES[@]}"; do
   systemctl stop "${svc}.service" 2>/dev/null || true
+done
+
+log "installing systemd units"
+APP_ROOT="${APP}" APP_USER="${APP_USER}" APP_GROUP="${APP_GROUP}" "${APP}/scripts/units.sh"
+
+log "ensuring queue directories"
+for dir in "${QUEUE_DIRS[@]}"; do
+  install -o "${APP_USER}" -g "${APP_GROUP}" -m 0770 -d "${APP}/${dir}"
+  if [[ "$dir" == inbox ]]; then
+    install -o "${APP_USER}" -g "${APP_GROUP}" -m 0770 -d "${APP}/${dir}/.tmp"
+  fi
 done
 
 log "freeing TCP port 8088"

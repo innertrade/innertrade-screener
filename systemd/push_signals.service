@@ -1,0 +1,20 @@
+[Unit]
+Description=InnerTrade push signals cron
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@APP_USER@
+Group=@APP_GROUP@
+WorkingDirectory=@APP_ROOT@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@APP_ROOT@/.venv/bin/python -u push_signals.py
+Restart=always
+RestartSec=60
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

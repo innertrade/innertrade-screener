@@ -5,13 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=deploy
-Group=deploy
-WorkingDirectory=/home/deploy/apps/innertrade-screener
-Environment="APP_ROOT=/home/deploy/apps/innertrade-screener"
+User=@APP_USER@
+Group=@APP_GROUP@
+WorkingDirectory=@APP_ROOT@
+Environment="APP_ROOT=@APP_ROOT@"
 Environment="PORT=8088"
 ExecStartPre=/usr/bin/env bash -c 'fuser -k 8088/tcp 2>/dev/null || true'
-ExecStart=/home/deploy/apps/innertrade-screener/.venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8088 --pid /run/innertrade-api/gunicorn.pid --access-logfile - --error-logfile - main:app
+ExecStart=@APP_ROOT@/.venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8088 --pid /run/innertrade-api/gunicorn.pid --access-logfile - --error-logfile - main:app
 Restart=always
 RestartSec=2
 KillSignal=SIGINT

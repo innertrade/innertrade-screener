@@ -20,6 +20,36 @@ FLASK_ENV=production python main.py
 
 Приложение поднимется на `HTTP_PORT` (по умолчанию `8088`).
 
+## Минимальный деплой на VPS
+
+```bash
+git reset --hard origin/main
+git clean -fdx
+bash scripts/deploy.sh
+```
+
+Скрипт автоматически:
+
+1. Останавливает активные юниты `innertrade-api`, `tvoi_gateway`, `tvoi_consumer`, `pre_forwarder` и глушит легаси `screener.service`.
+2. Переустанавливает unit-файлы из каталога `systemd/` в `/etc/systemd/system/`.
+3. Создаёт очереди `inbox/`, `processed/`, `failed/` (и `inbox/.tmp`) с владельцем `deploy:deploy` и правами `0770`.
+4. Перезапускает сервисы и выполняет смоук-проверку: `GET /health`, `GET /signals`, `POST /tvoi`.
+5. Ожидает перемещения тестового файла из `inbox/` в `processed/`.
+
+После успешного запуска проверьте окружение:
+
+```bash
+ss -ltnp | grep -E '127.0.0.1:(8088|8787)'
+curl -fsS http://127.0.0.1:8088/health
+curl -fsS http://127.0.0.1:8088/signals | head
+```
+
+Для ручной отправки тестового сигнала можно воспользоваться утилитой `tools/tvoi_gateway.py`:
+
+```bash
+./tools/tvoi_gateway.py send
+```
+
 ## Полная переинициализация VPS
 
 Скрипт `scripts/its_wipe_sync_run.sh` предназначен для запуска из `root` (или другого пользователя с sudo) и выполняет:

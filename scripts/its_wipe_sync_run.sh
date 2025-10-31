@@ -136,7 +136,7 @@ run_as_deploy "cd $APP_DIR && ./.venv/bin/python scripts/detect_main_drift.py --
 run_as_deploy "cd $APP_DIR && ./.venv/bin/python -m compileall main.py"
 
 log "[7/8] installing systemd units"
-sudo install -m 644 "$APP_DIR"/deploy/systemd/*.service /etc/systemd/system/
+sudo APP_ROOT="$APP_DIR" APP_USER="$DEPLOY_USER" APP_GROUP="$DEPLOY_USER" "$APP_DIR"/scripts/units.sh
 
 log "[8/8] starting service(s) and smoke-check"
 sudo systemctl daemon-reload
