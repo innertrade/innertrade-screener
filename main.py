@@ -7,6 +7,7 @@ Screener Engine (stable 5m)
 - Mode: signals_5m
 - Source: Bybit v5
 - Фильтрации по порогам нет — только расчёт метрик (фильтрует push_signals.py)
+  ✱ Опционально: можно включить локальную фильтрацию через ENV FILTER_IN_API=1
 Зависимости: Flask, requests
 """
 
@@ -15,7 +16,7 @@ import time
 import math
 import logging
 import threading
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify
@@ -30,7 +31,20 @@ WINDOW              = int(os.getenv("WINDOW", "48"))                 # глуб�
 UNIVERSE_ENV        = os.getenv("UNIVERSE", "").strip()              # пусто => авто по Bybit linear USDT
 POLL_SEC            = int(os.getenv("POLL_SEC", "8"))                # как часто обновлять кеш
 HTTP_TIMEOUT        = float(os.getenv("HTTP_TIMEOUT", "8.0"))        # таймаут HTTP
+HTTP_RETRIES        = int(os.getenv("HTTP_RETRIES", "2"))            # число повторов при сбое
 ADAPTIVE            = os.getenv("ADAPTIVE", "1") == "1"              # просто флаг для /health
+
+# --- Опциональная встроенная фильтрация (для тестов или автономного режима) ---
+FILTER_IN_API       = os.getenv("FILTER_IN_API", "0") in ("1", "true", "True", "YES", "yes")
+
+ZPRICE_MIN          = float(os.getenv("ZPRICE_MIN", "1.8"))
+VOL_MULT_MIN        = float(os.getenv("VOL_MULT_MIN", "1.6"))
+V24H_USD_MIN        = float(os.getenv("V24H_USD_MIN", "20000000"))
+
+# Flat-only по OI: по умолчанию узкий коридор [-0.3; +0.3]
+FLAT_ONLY           = os.getenv("FLAT_ONLY", "true").lower() in ("1", "true", "yes")
+OI_Z_MIN            = float(os.getenv("OI_Z_MIN", "-0.3"))
+OI_Z_MAX            = float(os.getenv("OI_Z_MAX", "0.3"))
 
 # -------------------- LOG --------------------
 
@@ -55,15 +69,45 @@ _STATE: Dict[str, Any] = {
 
 BYBIT_BASE = "https://api.bybit.com"
 
+_DEFAULT_HEADERS = {
+    "User-Agent": f"innertrade-screener/1.0 (+engine; interval={INTERVAL_MIN}m; window={WINDOW})",
+    "Accept": "application/json",
+}
+
+
+def _http_get_with_retries(url: str, params: Dict[str, Any], timeout: float, retries: int) -> Optional[requests.Response]:
+    """
+    Неблокирующие ретраи с экспоненциальной задержкой: 0.5s, 1s, 2s...
+    """
+    attempt = 0
+    delay = 0.5
+    last_exc: Optional[Exception] = None
+    while attempt <= retries:
+        try:
+            r = requests.get(url, params=params, timeout=timeout, headers=_DEFAULT_HEADERS)
+            return r
+        except Exception as e:
+            last_exc = e
+            if attempt == retries:
+                break
+            time.sleep(delay)
+            delay *= 2
+            attempt += 1
+    logging.warning(f"HTTP GET fail {url} params={params} err={last_exc}")
+    return None
+
 
 def _get(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    try:
-        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-        if r.ok:
+    r = _http_get_with_retries(url, params, timeout=HTTP_TIMEOUT, retries=max(0, HTTP_RETRIES))
+    if r is None:
+        return None
+    if r.ok:
+        try:
             return r.json()
-        logging.warning(f"HTTP {r.status_code} for {url} params={params} body={r.text[:200]}")
-    except Exception as e:
-        logging.warning(f"HTTP GET fail {url}: {e}")
+        except Exception as e:
+            logging.warning(f"HTTP JSON decode fail {url}: {e} body={r.text[:200]}")
+            return None
+    logging.warning(f"HTTP {r.status_code} for {url} params={params} body={r.text[:200]}")
     return None
 
 
@@ -137,9 +181,10 @@ def _tickers24h_bybit(symbols: List[str]) -> Dict[str, float]:
     j = _get(url, params)
     out: Dict[str, float] = {}
     if j and j.get("retCode") == 0 and j.get("result", {}).get("list"):
+        symset = set(symbols)
         for it in j["result"]["list"]:
             sym = str(it.get("symbol", "")).upper()
-            if sym in symbols:
+            if sym in symset:
                 try:
                     out[sym] = float(it.get("turnover24h") or 0.0)
                 except Exception:
@@ -175,7 +220,7 @@ def _oi_series_bybit(symbol: str, interval_min: int, limit: int) -> Optional[Lis
 
 # ==================== Math ====================
 
-def _mean_std(vals: List[float]) -> (float, float):
+def _mean_std(vals: List[float]) -> Tuple[float, float]:
     n = len(vals)
     if n == 0:
         return 0.0, 0.0
@@ -242,9 +287,39 @@ def _calc_metrics_for_symbol(sym: str, interval_min: int, window: int,
     }
 
 
+def _passes_thresholds(rec: Dict[str, Any]) -> bool:
+    """
+    Применяет ENV-пороги, если включён FILTER_IN_API.
+    """
+    try:
+        # price Z
+        if rec.get("zprice") is None or rec["zprice"] < ZPRICE_MIN:
+            return False
+        # turnover mult
+        if rec.get("vol_mult") is None or rec["vol_mult"] < VOL_MULT_MIN:
+            return False
+        # 24h volume (USD)
+        if float(rec.get("vol24h_usd", 0.0)) < V24H_USD_MIN:
+            return False
+        # OI flat-only или диапазон
+        oi = rec.get("oi_z")
+        if FLAT_ONLY:
+            # если oi_z отсутствует, считаем что не проходит flat-фильтр
+            if oi is None or not (OI_Z_MIN <= oi <= OI_Z_MAX):
+                return False
+        else:
+            # если заданы диапазоны — проверим, но пропускаем None
+            if (oi is not None) and not (OI_Z_MIN <= oi <= OI_Z_MAX):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _rebuild_signals():
     """
-    Пересчитывает кешированный список сигналов. НИКАКИХ порогов тут нет.
+    Пересчитывает кешированный список сигналов. По умолчанию — БЕЗ порогов.
+    Если FILTER_IN_API=1 — применяет ENV-фильтры.
     """
     start = time.time()
     universe = _STATE["universe"]
@@ -253,15 +328,20 @@ def _rebuild_signals():
 
     vol24h_map = _tickers24h_bybit(universe)
 
-    res: List[Dict[str, Any]] = []
+    res_all: List[Dict[str, Any]] = []
     n = 0
     for sym in universe:
         m = _calc_metrics_for_symbol(sym, INTERVAL_MIN, WINDOW, vol24h_map)
         if m:
-            res.append(m)
+            res_all.append(m)
         n += 1
         if n % 10 == 0:
             time.sleep(0.2)  # не долбим API
+
+    if FILTER_IN_API:
+        res = [r for r in res_all if _passes_thresholds(r)]
+    else:
+        res = res_all
 
     _STATE["signals"] = res
     _STATE["last_update"] = int(time.time())
@@ -310,6 +390,16 @@ def health():
         "interval_min": INTERVAL_MIN,
         "window": WINDOW,
         "source": {"kline": KLINE_SOURCE, "oi": OI_SOURCE},
+        "http": {"timeout": HTTP_TIMEOUT, "retries": HTTP_RETRIES},
+        "filter": {
+            "enabled": FILTER_IN_API,
+            "zprice_min": ZPRICE_MIN,
+            "vol_mult_min": VOL_MULT_MIN,
+            "v24h_usd_min": V24H_USD_MIN,
+            "flat_only": FLAT_ONLY,
+            "oi_z_min": OI_Z_MIN,
+            "oi_z_max": OI_Z_MAX,
+        },
     })
 
 
@@ -321,6 +411,7 @@ def signals():
         "last_update": _STATE["last_update"],
         "interval_min": INTERVAL_MIN,
         "window": WINDOW,
+        "filtered": FILTER_IN_API,
     })
 
 
