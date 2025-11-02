@@ -7,9 +7,11 @@ on:
     paths:
       - 'main.py'
       - 'push_signals.py'
-      - 'menu_bot.py'
-      - 'requirements.txt'
+      - 'services/**'
+      - 'consumers/**'
+      - 'scripts/**'
       - 'deploy/systemd/**'
+      - 'requirements.txt'
       - '.github/workflows/deploy.yml'
 
 jobs:

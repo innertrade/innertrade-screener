@@ -9,7 +9,8 @@ log() {
 REPO_URL=${REPO_URL:-"https://github.com/innertrade/innertrade-screener.git"}
 BRANCH=${BRANCH:-"main"}
 APP_DIR=${APP_DIR:-"/home/deploy/apps/innertrade-screener"}
-SERVICES=${SERVICES:-"screener.service push_signals.service menu_bot.service"}
+SERVICES=${SERVICES:-"innertrade-api.service tvoi_gateway.service tvoi_consumer.service push_signals.service"}
+LEGACY_SERVICES=${LEGACY_SERVICES:-"screener.service pre_forwarder.service menu_bot.service"}
 PYTHON_BIN=${PYTHON_BIN:-"python3"}
 PORT=${PORT:-"8088"}
 DEPLOY_USER=${DEPLOY_USER:-"deploy"}
@@ -97,7 +98,7 @@ run_as_deploy() {
 }
 
 log "[1/8] stopping systemd service(s) if running"
-for svc in $SERVICES; do
+for svc in $SERVICES $LEGACY_SERVICES; do
   if systemctl list-units --full --all | grep -Fq "$svc"; then
     systemctl stop "$svc" || true
   else

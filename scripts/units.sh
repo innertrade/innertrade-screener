@@ -8,7 +8,7 @@ APP_ROOT=${APP_ROOT:-${REPO_ROOT}}
 SERVICE_USER=${SERVICE_USER:-${APP_USER:-deploy}}
 SERVICE_GROUP=${SERVICE_GROUP:-${APP_GROUP:-${SERVICE_USER}}}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
-UNITS=(innertrade-api tvoi_gateway tvoi_consumer pre_forwarder)
+UNITS=(innertrade-api tvoi_gateway tvoi_consumer push_signals)
 
 if [[ ! -d "${APP_ROOT}" ]]; then
   echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') | APP_ROOT not found: ${APP_ROOT}" >&2
@@ -21,7 +21,7 @@ log() {
 
 install_unit() {
   local unit_name=$1
-  local src="${REPO_ROOT}/systemd/${unit_name}.service"
+  local src="${REPO_ROOT}/deploy/systemd/${unit_name}.service"
   local dst="${SYSTEMD_DIR}/${unit_name}.service"
 
   if [[ ! -f "${src}" ]]; then
