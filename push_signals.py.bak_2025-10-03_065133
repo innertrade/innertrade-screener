@@ -1,52 +1,0 @@
-import os, time, json, requests
-from datetime import datetime
-
-HOST      = os.getenv("HOST", "http://127.0.0.1:8080")
-TG_TOKEN  = os.getenv("telegram_bot_token".upper())  or os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT   = os.getenv("Telegram_chat_id")             or os.getenv("TELEGRAM_CHAT_ID")
-
-# Ð¡Ð¿Ð¸ÑÑ‚Ð¸ (Ð¢ÑÐ»Ð°ÐºÐ° â„” íŒ–è®¡ .env)
-MIN_Z        = float(os.getenv("FORWARD_MIN_Z",       "2.0"))        # |zprice| Ð¼Ð¾Ð´Ð¸Ð½ 
-MIN_VOLX     = float(os.getenv("FORWARD_MIN_VOLX",     "1.8"))     # Ð¿ÑƒÐ±Ñ€Ð³Ð¾Ð¹ Õ‚Ñ‡ÐµÑÑ‚Ð°
-MIN_OI_Z       = float(os.getenv("FORWARD_MIN_OIZ",      "1.0"))    # z-score OI
-MIN_VOLH›Ø]
-ÜË™Ù][Š‘“Ô•ÐT‘ÓRS—Õ“Ó‹ŒLŠJHÈH	LH\Ù„ÓÔÑPÈH[
-ÜË™Ù][Š‘“Ô•ÐT‘ÔÓÔÑPÈ‹ŽŠJB‚ˆÈ4't,4,ô-t/t.4cÈ4/t-H4`´,4.´,4`
-žXš]
-B“ÒWÕÒS‘ÕÈH[
-ÜË™Ù][Š‘“Ô•ÐT‘ÓÒWÕÒS‘ÕÈ‹ŠJHÈ0¨s¨8 %1.‚“ÒWÒS•T•SHÜË™Ù][Š‘“Ô•ÐT‘ÓÒWÒS•T•S‹[Z[ˆŠHÈ[Z[‹ÌM[Z[‹ÌÌZ[‹ÌZ‚ˆÈ4.´/´`´/t/´.H4(´bô.H4/´/ô/´-4/´.H4/ô/´/4/´`t`tcÂ•QSÕUÐÓÓ“‘PÕH[
-ÜË™Ù][Š‘“Ô•ÐT‘ÕSQSÕUÐÓÓ“‘PÕ‹HŠJB•QSÕUÔ‘PQH[
-ÜË™Ù][Š‘“Ô•ÐT‘ÕSQSÕUÔ‘PQ‹ŒŒŠJB“PVÔ‘U’QTÈH[
-ÜË™Ù][Š‘“Ô•ÐT‘ÓPVÔ‘U’QTÈ‹ŒÈŠJB”‘U–WÔÓQTÔÑPÈH›Ø]
-ÜË™Ù][Š‘“Ô•ÐT‘Ô‘U–WÔÓQT‹ŒKŒŠJB‚œÈH™\]Y\ÝË”Ù\ÜÚ[ÛŠ
-BœÙY[ˆHÙ]
-
-HÈ4&4/4/´.ô.4`´`È4/´/ô`4/´-ˆ
-Þ[X›Û˜\—ÝÊB‚™Yˆ›]Û[Û™^J
-N‚ˆžN‚ˆˆH›Ø]
-Üˆ
-BˆYˆˆHLˆ™]\›ˆˆ‰ÞÎ‹ÌK™ŸPˆ‹™›Ü›X]
-‹ÌL
-BˆYˆˆHLˆ™]\›ˆˆ›ÉÞÎ‹ÌK™ŸSH‹™›Ü›X]
-‹ÌL
-BˆYˆˆHLˆ™]\›ˆˆ‰ÞÎ‹ÌK™ŸRÈ‹™›Ü›X]
-‹ÌL
-Bˆ™]\›ˆˆ‰ÞÎ‹ÌH‹™›Ü›X]
-ŠBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆÝŠ
-B‚‚™YˆZ[ÛX\šÝ\
-Þ[NˆÝŠN‚ˆÈ4'4.4-ô,4`t/ô.4`t`´c4,´,4b4-t,È4,4-4/Bˆ\›ÝˆHˆšÎ‹ËÝÝÝË˜Y[™ÝšY]Ë˜ÛÛKØÚ\ÏÜÞ[X›ÛP–P’UˆžÏÞ[OŸK”	š[\˜[MH‚ˆžXš]ÝÙXˆHˆšÎ‹ËÝÝÝË˜žXš]˜ÛÛKÝ˜YKÝ\ÙÞÜÞ[_H‚ˆ™]\›ˆÈš[›[™WÚÙ^X›Ø\™ŽˆÖÂˆÈ^Žˆ¸¢mÜ[ˆÛˆžXš]‹\›ŽˆžXš]ÝÙXˆKˆÈ^Žˆ¸¢m˜Y[™ÕšY]È‹\›Žˆ\›ÝˆKˆW_B‚™Yˆ™]ÚÛÚWÜÝ]ÊÞ[NˆÝŠN‚ˆˆˆ•­ô,4`4-t-4.4`´-t/t.4-H4`t`´`4/´.´,
-]KÚYÛXJNÈÚWÞˆ8 %‹\ØÛÜ™H[ˆÚ[™ÝËˆ‚ˆžN‚ˆˆHË™Ù]
-ˆšÎ‹ËØ\K˜žXš]˜ÛÛKÝKÛX\šÙ]ÛÜ[‹Z[\™\Ý‹ˆ\˜[\Ï^È˜Ø]YÛÜžHŽˆ›[™X\ˆ‹œÞ[X›ÛŽœÞ[Kš[\˜[Ž“ÒWÒS•T•SKˆ[Y[Ý]JQSÕUÐÓÓ“‘PÕQSÕUÔ‘PQ
-Kˆ
-BˆˆH‹šœÛÛŠ
-Bˆ\œˆH
-‹™Ù]
-œ™\Ý[‹ßJHÜˆßJK™Ù]
-›\Ý‹×JHÜˆ×Bˆ˜[ÈH×Bˆ›Üˆ][ˆ\œŽ‚ˆˆH]™Ù]
-›Ü[’[\™\ÝŠHÜˆ]™Ù]
-›Ü[’[\™\Ý˜[YHŠBˆYˆˆ\È›Û™N‚ˆÛÛ[YBˆžN‚ˆ˜[Ë˜\[™
-›Ø]
-ŠJBˆ^Ù\^Ù\[ÛŽ‚ˆÛÛ[YBˆYˆ[Š˜[ÊHL‚ˆ™]\›ˆ
-›Û™K›Û™JBˆÙ\šY\ÈH˜[ÖËSÒWÕÒS‘Õ×N‚ˆ]HHÝ[JÙ\šY\ÊKÛ[ŠÙ\šY\ÊBˆ˜\ˆHÝ[J
-[]JJŠÌˆ›Üˆ[ˆÙ\šY\ÊKÛ[ŠÙ\šY\ÊBˆÚYÛXHH
-˜\Š
