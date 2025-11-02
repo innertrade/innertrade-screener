@@ -11,13 +11,21 @@ SERVICES=(
   innertrade-api.service
   tvoi_gateway.service
   tvoi_consumer.service
-  pre_forwarder.service
+  push_signals.service
 )
 
 # 0) выключаем и выпиливаем легаси
 log "stopping legacy screener.service"
 systemctl disable --now screener.service 2>/dev/null || true
 rm -f /etc/systemd/system/screener.service || true
+
+log "stopping legacy pre_forwarder.service"
+systemctl disable --now pre_forwarder.service 2>/dev/null || true
+rm -f /etc/systemd/system/pre_forwarder.service || true
+
+log "stopping legacy menu_bot.service"
+systemctl disable --now menu_bot.service 2>/dev/null || true
+rm -f /etc/systemd/system/menu_bot.service || true
 
 # 1) останавливаем наши юниты
 log "stopping managed services"
@@ -28,9 +36,9 @@ done
 # 2) ставим systemd-юниты из корня репозитория (если лежат рядом)
 log "installing systemd units from repository"
 for s in "${SERVICES[@]}"; do
-  if [ -f "$APP/$s" ]; then
+  if [ -f "$APP/deploy/systemd/$s" ]; then
     log "installing $s -> /etc/systemd/system/$s"
-    install -m 0644 "$APP/$s" "/etc/systemd/system/$s"
+    install -m 0644 "$APP/deploy/systemd/$s" "/etc/systemd/system/$s"
   fi
 done
 

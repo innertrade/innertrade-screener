@@ -12,12 +12,7 @@ PY="./.venv/bin/python"
 # helper: проверка наличия файла
 has() { [[ -f "$1" ]]; }
 
-# если явно включён PRE и есть соответствующий файл — запускаем его
-if [[ "${FORWARD_PRE_ENABLED:-false}" == "true" ]] && has "pre_forwarder.py"; then
-  exec "$PY" -u pre_forwarder.py
-fi
-
-# иначе — confirmed/основной воркер
+# основной воркер
 if has "forwarder.py"; then
   exec "$PY" -u forwarder.py
 elif has "main.py"; then

@@ -57,9 +57,6 @@ echo "$(ts) Current state:"
 cat "$STATE_FILE" || true
 
 # 3) sanity for tokens (только предупреждаем)
-if [ -z "${MENU_BOT_TOKEN:-}" ]; then
-  echo "$(ts) WARN: MENU_BOT_TOKEN is not set"
-fi
 if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
   echo "$(ts) WARN: TELEGRAM_BOT_TOKEN is not set"
 fi
@@ -80,7 +77,9 @@ reload_if_exists() {
   fi
 }
 
-reload_if_exists "menu_bot.service"
+reload_if_exists "innertrade-api.service"
+reload_if_exists "tvoi_gateway.service"
+reload_if_exists "tvoi_consumer.service"
 reload_if_exists "push_signals.service"
 
 echo "$(ts) === its_normalize_env.sh done ==="

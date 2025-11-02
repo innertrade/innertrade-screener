@@ -146,9 +146,12 @@ main() {
 
     disable_legacy_unit "screener.service"
     disable_legacy_unit "push_trend.service"
+    disable_legacy_unit "menu_bot.service"
+    disable_legacy_unit "pre_forwarder.service"
 
-    restart_unit "innertrade-screener.service"
-    restart_unit "menu_bot.service"
+    restart_unit "innertrade-api.service"
+    restart_unit "tvoi_gateway.service"
+    restart_unit "tvoi_consumer.service"
     restart_unit "push_signals.service"
 
     check_listener

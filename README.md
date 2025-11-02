@@ -38,10 +38,10 @@ FLASK_ENV=production python main.py
    sudo bash scripts/deploy.sh
    ```
 4. Скрипт автоматически:
-   - останавливает и маскирует `screener.service`;
-   - устанавливает systemd-юниты из каталога `systemd/`;
+   - останавливает и маскирует `screener.service` и другие легаси-юниты (`pre_forwarder.service`, `menu_bot.service`);
+   - устанавливает systemd-юниты из каталога `deploy/systemd/`;
    - создаёт каталоги `inbox/`, `processed/`, `failed/` и `inbox/.tmp` с владельцем `deploy:deploy`;
-   - перезапускает `innertrade-api`, `tvoi_gateway`, `tvoi_consumer`, `pre_forwarder`;
+   - перезапускает `innertrade-api`, `tvoi_gateway`, `tvoi_consumer`, `push_signals`;
    - выполняет смоук: `GET /health`, `GET /signals`, `POST /tvoi` и проверяет перемещение файла в `processed/` без ошибок.
 5. После успешного деплоя дополнительно убедитесь вручную:
    ```bash
@@ -61,7 +61,7 @@ FLASK_ENV=production python main.py
 3. Сохранение (при наличии) и восстановление `.env` с токенами, обновление значений из переменных окружения `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`.
 4. Создание нового виртуального окружения `.venv`, установка зависимостей и фиксация `cacert.pem` для TLS.
 5. Проверку целостности `main.py` (`scripts/detect_main_drift.py`).
-6. Перезапуск systemd-сервисов (скринер, push_signals, menu_bot) и smoke-проверку `/health` и `/signals` на порту `8088`.
+6. Перезапуск systemd-сервисов (`innertrade-api`, `tvoi_gateway`, `tvoi_consumer`, `push_signals`) и smoke-проверку `/health` и `/signals` на порту `8088`.
 
 Файл располагается в `/root/its_wipe_sync_run.sh` и может быть вызван одной командой:
 
@@ -73,14 +73,14 @@ bash /root/its_wipe_sync_run.sh
 
 ## Нормализация серверного окружения
 
-Если на сервере остаются процессы со статусом `cwd -> (deleted)` или активны легаси-сервисы `screener.service` / `push_trend.service`, используйте сценарий `its_fix_stack.sh`.
+Если на сервере остаются процессы со статусом `cwd -> (deleted)` или активны легаси-сервисы (`screener.service`, `push_trend.service`, `menu_bot.service`, `pre_forwarder.service`), используйте сценарий `scripts/its_fix_stack.sh`.
 
 **Двухшаговый запуск:**
 
 1. Создайте (или обновите) файл и выставьте права:
 
    ```bash
-   sudo install -Dm755 its_fix_stack.sh /root/its_fix_stack.sh
+   sudo install -Dm755 scripts/its_fix_stack.sh /root/its_fix_stack.sh
    ```
 
 2. Выполните сценарий от `root`:
@@ -92,8 +92,8 @@ bash /root/its_wipe_sync_run.sh
 Скрипт сам:
 
 * завершит процессы `python`/`gunicorn`/`push_trend` со сброшенным рабочим каталогом;
-* отключит `screener.service` и `push_trend.service`;
-* перезапустит `innertrade-screener.service`, `menu_bot.service`, `push_signals.service`;
+* отключит `screener.service`, `push_trend.service`, `menu_bot.service`, `pre_forwarder.service`;
+* перезапустит `innertrade-api.service`, `tvoi_gateway.service`, `tvoi_consumer.service`, `push_signals.service`;
 * проверит, что `127.0.0.1:8088` слушает gunicorn и `/health` отвечает `status: "ok"`.
 
 После выполнения убедитесь, что повторный запуск не приводит к ошибкам, а `systemctl list-unit-files | grep -E 'screener|push_trend'` показывает состояние `disabled`.
@@ -120,22 +120,6 @@ curl -s http://127.0.0.1:8088/signals | jq '.data[0]'
 * `/health` должен вернуть `{"status": "ok", ...}`.
 * `/signals` должен содержать ненулевые `oi_z` (если данные Bybit доступны).
 
-## Быстрый фикс окружения (`its_fix_stack.sh`)
-
-1. Создайте (или обновите) файл `/root/its_fix_stack.sh` c содержимым из `scripts/its_fix_stack.sh` и сделайте его исполняемым:
-
-   ```bash
-   install -m 750 scripts/its_fix_stack.sh /root/its_fix_stack.sh
-   ```
-
-2. Запустите фиксацию стека от имени `root`:
-
-   ```bash
-   bash /root/its_fix_stack.sh
-   ```
-
-Скрипт устранит процессы со статусом `cwd -> (deleted)`, выключит легаси-юниты `screener.service` и `push_trend.service`, перезапустит действующие сервисы (`innertrade-screener.service`, `menu_bot.service`, `push_signals.service`) и выполнит проверки: листенер на `127.0.0.1:8088`, `/health` и отсутствие удалённых рабочих каталогов.
-
 ## Автоматизация GitHub Actions
 
 Workflow `.github/workflows/deploy.yml` обновлён: он копирует свежий `its_wipe_sync_run.sh` на сервер и запускает его по SSH, передавая токены через переменные окружения. Таким образом GitHub Actions и ручной запуск используют один и тот же сценарий.
@@ -152,8 +136,8 @@ Workflow `.github/workflows/deploy.yml` обновлён: он копирует 
 скриптом `scripts/deploy.sh`. Скрипт:
 
 * создаёт каталоги `inbox/`, `processed/`, `failed/` (и `inbox/.tmp`) с владельцем `deploy:deploy`;
-* обновляет и перезапускает `innertrade-api`, `tvoi_gateway`, `tvoi_consumer`, `pre_forwarder`;
-* глушит исторический `screener.service` и освобождает порт `8088` перед запуском API;
+* обновляет и перезапускает `innertrade-api`, `tvoi_gateway`, `tvoi_consumer`, `push_signals`;
+* глушит исторические `screener.service`, `pre_forwarder.service`, `menu_bot.service` и освобождает порт `8088` перед запуском API;
 * выполняет смоук-проверку `/health` и прогоняет тестовый сигнал по цепочке `gateway → consumer`.
 
 Для ручной отправки проверочного события можно воспользоваться CLI-утилитой `./tools/tvoi_gateway.py`.
