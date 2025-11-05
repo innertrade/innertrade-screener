@@ -2,6 +2,14 @@ Innertrade Screener
 
 Этот репозиторий содержит HTTP-сервис c вычислением метрик по рынку деривативов Bybit и вспомогательные утилиты деплоя.
 
+### Deploy & ENV
+
+- Скопируйте `.env.example` в `.env` и заполните значения, не коммитя рабочий файл.
+- Основные переменные: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `MENU_BOT_TOKEN`, `ADMINS`, `QUEUE_DIR`, `PROCESSED_DIR`, `FAILED_DIR`, `PUSH_STATE_FILE`, `PUSH_STATUS_FILE`, `PUSH_LOG_FILE`, `PORT`, `HTTP_PORT`, `KLINE_SOURCE`, `OI_SOURCE`, `INTERVAL_MIN`, `WINDOW`, `POLL_SEC`, `HTTP_TIMEOUT`, `ADAPTIVE`, `SLEEP_BETWEEN_CALLS`, `LOG_LEVEL`, `FORWARD_TIMEOUT_CONNECT`, `FORWARD_TIMEOUT_READ`, `FORWARD_MAX_RETRIES`, `FORWARD_RETRY_SLEEP`, `TG_RESPECT_RETRY_AFTER`, `TG_THROTTLE_RPS`, `TG_THROTTLE_BURST`, `TG_TOKEN`, `TG_CHAT_ID`, `PUSH_TEST`.
+- Пути очередей (`QUEUE_DIR`, `PROCESSED_DIR`, `FAILED_DIR`) по умолчанию указывают на `/home/deploy/apps/innertrade-screener/...`; при деплое на другое место переопределите их в `.env`.
+- `PUSH_STATE_FILE`, `PUSH_STATUS_FILE` и `PUSH_LOG_FILE` должны оставаться внутри репозитория или в каталогах с правами записи сервиса.
+- Телеграм токены и chat_id заполняются вручную, остальные параметры уже имеют безопасные значения по умолчанию и корректируются при необходимости.
+
 Основные цели
 
 Единый эталонный источник кода — ветка main на GitHub.
